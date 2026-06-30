@@ -1,14 +1,16 @@
 services:
   soundpull:
+    # Use the published image, or `docker compose build` to build locally.
+    image: ghcr.io/rocho-el-locho/soundpull:latest
     build: .
     container_name: soundpull
     restart: unless-stopped
     env_file: .env
+    # Named volumes inherit the image's nonroot ownership (uid 65532), so the
+    # distroless non-root user can write to them. (/downloads is just staging.)
     volumes:
-      - ./data:/data            # SQLite DB (DATABASE_URL=sqlite:////data/app.db)
-      # Temp/staging area for downloads (ZIPs + work dir). A volume keeps it off
-      # the container layer; point at fast local storage if you like.
-      - ./downloads:/downloads  # LOCAL_MUSIC_ROOT=/downloads
+      - soundpull-data:/data            # SQLite DB (DATABASE_URL=sqlite:////data/app.db)
+      - soundpull-downloads:/downloads  # ZIP packaging / WebDAV work dir
     networks:
       - proxy
     labels:
@@ -25,3 +27,7 @@ services:
 networks:
   proxy:
     external: true
+
+volumes:
+  soundpull-data:
+  soundpull-downloads:

@@ -1,25 +1,35 @@
-FROM python:3.12-slim
+# syntax=docker/dockerfile:1
 
-ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
-
-# ffmpeg is required by yt-dlp for audio extraction / metadata / thumbnails.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
+# ─── Stage 1: builder — install Python deps + app into a portable target dir ──
+# Python 3.11 to match the distroless runtime (debian12 ships CPython 3.11).
+FROM python:3.11-slim-bookworm AS builder
+ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+WORKDIR /src
 COPY pyproject.toml ./
 COPY app ./app
-RUN pip install .
+# Install into /install (no venv) so it can be copied into distroless as-is.
+RUN pip install --target=/install .
+# Pre-create writable runtime dirs owned by the distroless nonroot uid (65532).
+RUN mkdir -p /runtime/data /runtime/downloads && chown -R 65532:65532 /runtime
 
-RUN useradd -m appuser \
-    && mkdir -p /data /downloads \
-    && chown -R appuser /data /downloads /app
-USER appuser
+# ─── Stage 2: static ffmpeg/ffprobe (yt-dlp needs them at runtime) ────────────
+FROM mwader/static-ffmpeg:7.1 AS ffmpeg
+
+# ─── Stage 3: distroless runtime ──────────────────────────────────────────────
+FROM gcr.io/distroless/python3-debian12:nonroot
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/install \
+    PATH=/usr/bin:/bin
+
+# Python dependencies + the app package
+COPY --from=builder /install /install
+# Static ffmpeg + ffprobe on PATH
+COPY --from=ffmpeg /ffmpeg /usr/bin/ffmpeg
+COPY --from=ffmpeg /ffprobe /usr/bin/ffprobe
+# Writable data + staging dirs, owned by nonroot
+COPY --from=builder --chown=65532:65532 /runtime/data /data
+COPY --from=builder --chown=65532:65532 /runtime/downloads /downloads
 
 EXPOSE 8080
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/healthz').status==200 else 1)"
-
-CMD ["python", "-m", "app.main"]
+# The distroless python3 image's entrypoint IS the interpreter, so CMD = args.
+CMD ["-m", "app.main"]
