@@ -14,6 +14,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlparse
 
 import httpx
 import yt_dlp
@@ -22,6 +23,40 @@ from app import fix_music_tags
 from app.config import settings
 
 log = logging.getLogger("pipeline")
+
+# Staging area for downloads (ZIP packaging + WebDAV work tree). In-memory job
+# state does not survive a restart, so anything left here is orphaned — see
+# purge_work_root(), called once at startup.
+_WORK_ROOT = Path(settings.local_music_root) / ".work"
+
+# YouTube hosts we accept; everything else is rejected before yt-dlp runs.
+_YOUTUBE_HOSTS = {
+    "youtube.com", "www.youtube.com", "m.youtube.com",
+    "music.youtube.com", "youtu.be",
+}
+
+
+def purge_work_root() -> None:
+    """Delete leftover staging dirs/ZIPs from previous runs (call at startup)."""
+    shutil.rmtree(_WORK_ROOT, ignore_errors=True)
+
+
+def is_supported_url(raw: str) -> bool:
+    """True only for http(s) URLs on a known YouTube host."""
+    try:
+        parsed = urlparse((raw or "").strip())
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").lower()
+    return host in _YOUTUBE_HOSTS or host.endswith(".youtube.com")
+
+
+def _safe_segment(name: str) -> str:
+    """Make a metadata string safe as a single path segment (no traversal)."""
+    seg = name.replace("/", "_").replace("\\", "_").replace("\x00", "").strip()
+    return "Unbekannt" if seg in ("", ".", "..") else seg
 
 # Verbatim from download_album.sh / download_single.sh.
 EXTRACTOR_ARGS = "youtube:player_client=ios,web,android;-android_sdkless"
@@ -220,70 +255,74 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
     reporter.on_meta(primary_artist, album)
 
     # 2) Always stage into a temp work dir; the delivery step then packages a
-    #    ZIP (browser) or uploads the tree (webdav).
-    work_base = Path(settings.local_music_root) / ".work" / job_id
+    #    ZIP (browser) or uploads the tree (webdav). The work dir is removed in
+    #    `finally` so failed jobs don't leak it; the browser ZIP lives outside it.
+    work_base = _WORK_ROOT / job_id
     work_base.mkdir(parents=True, exist_ok=True)
+    try:
+        # `primary_artist` is interpolated literally (not a yt-dlp `%(...)s` field),
+        # so sanitise it ourselves to keep it a single, traversal-safe path segment.
+        subfolder = "%(album)s" if is_album else "Singles"
+        out_tmpl = str(work_base / _safe_segment(primary_artist) / subfolder / "%(title)s.%(ext)s")
 
-    subfolder = "%(album)s" if is_album else "Singles"
-    out_tmpl = str(work_base / primary_artist / subfolder / "%(title)s.%(ext)s")
+        # 3) Download (parity-safe opts from parse_options + our hooks).
+        flags = list(_ALBUM_FLAGS if is_album else _SINGLE_FLAGS)
+        flags += ["--postprocessor-args", f"ffmpeg:-metadata genre={genre}", "-o", out_tmpl]
+        opts = _build_ydl_opts(flags)
+        opts.update({"quiet": True, "no_warnings": True, "noprogress": True, "logger": _QuietLogger()})
 
-    # 3) Download (parity-safe opts from parse_options + our hooks).
-    flags = list(_ALBUM_FLAGS if is_album else _SINGLE_FLAGS)
-    flags += ["--postprocessor-args", f"ffmpeg:-metadata genre={genre}", "-o", out_tmpl]
-    opts = _build_ydl_opts(flags)
-    opts.update({"quiet": True, "no_warnings": True, "noprogress": True, "logger": _QuietLogger()})
+        finished_dirs: Counter[str] = Counter()
 
-    finished_dirs: Counter[str] = Counter()
+        def progress_hook(d: dict) -> None:
+            status = d.get("status")
+            if status == "downloading":
+                info = d.get("info_dict") or {}
+                idx = info.get("playlist_index")
+                total = info.get("n_entries") or info.get("playlist_count") or 0
+                reporter.on_phase("download")
+                if idx:
+                    reporter.on_track(int(idx), int(total or 0))
+            elif status == "finished":
+                name = d.get("filename") or (d.get("info_dict") or {}).get("filepath")
+                if name:
+                    finished_dirs[str(Path(name).parent)] += 1
 
-    def progress_hook(d: dict) -> None:
-        status = d.get("status")
-        if status == "downloading":
-            info = d.get("info_dict") or {}
-            idx = info.get("playlist_index")
-            total = info.get("n_entries") or info.get("playlist_count") or 0
-            reporter.on_phase("download")
-            if idx:
-                reporter.on_track(int(idx), int(total or 0))
-        elif status == "finished":
-            name = d.get("filename") or (d.get("info_dict") or {}).get("filepath")
-            if name:
-                finished_dirs[str(Path(name).parent)] += 1
+        opts["progress_hooks"] = [progress_hook]
 
-    opts["progress_hooks"] = [progress_hook]
+        reporter.on_phase("download")
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
 
-    reporter.on_phase("download")
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([url])
+        if not finished_dirs:
+            raise RuntimeError("Download lieferte keine Dateien (siehe Logs).")
+        album_dir = Path(finished_dirs.most_common(1)[0][0])
+        if not album_dir.is_dir():
+            # Defensive: keeps fix_music_tags' sys.exit path (BaseException) unreachable.
+            raise RuntimeError(f"Album-Verzeichnis fehlt: {album_dir}")
 
-    if not finished_dirs:
-        raise RuntimeError("Download lieferte keine Dateien (siehe Logs).")
-    album_dir = Path(finished_dirs.most_common(1)[0][0])
+        # 4) Square cover.
+        cover_path = _fetch_cover(url, is_album, album_dir / "cover.jpg")
 
-    # 4) Square cover.
-    cover_path = _fetch_cover(url, is_album, album_dir / "cover.jpg")
+        # 5) Navidrome tag correction (unchanged logic from fix_music_tags.py).
+        reporter.on_phase("tags")
+        fix_music_tags.process_directory(
+            str(album_dir),
+            str(cover_path) if cover_path else None,
+            album,
+            primary_artist,
+        )
 
-    # 5) Navidrome tag correction (unchanged logic from fix_music_tags.py).
-    reporter.on_phase("tags")
-    fix_music_tags.process_directory(
-        str(album_dir),
-        str(cover_path) if cover_path else None,
-        album,
-        primary_artist,
-    )
-
-    # 6) Deliver.
-    if destination.type == "webdav":
-        reporter.on_phase("upload")
-        try:
+        # 6) Deliver.
+        if destination.type == "webdav":
+            reporter.on_phase("upload")
             _upload_tree(destination, work_base)
-        finally:
-            shutil.rmtree(work_base, ignore_errors=True)
-        return Result(summary=f"WebDAV: {primary_artist}/{album}")
+            return Result(summary=f"WebDAV: {primary_artist}/{album}")
 
-    # browser → package the tagged album folder as a ZIP for download
-    reporter.on_phase("packaging")
-    root_name = f"{primary_artist} - {album}"
-    zip_path = Path(settings.local_music_root) / ".work" / f"{job_id}.zip"
-    _zip_dir(album_dir, zip_path, root_name)
-    shutil.rmtree(work_base, ignore_errors=True)
-    return Result(summary=f"{root_name}.zip", zip_path=str(zip_path), zip_name=f"{root_name}.zip")
+        # browser → package the tagged album folder as a ZIP for download
+        reporter.on_phase("packaging")
+        root_name = f"{primary_artist} - {album}"
+        zip_path = _WORK_ROOT / f"{job_id}.zip"
+        _zip_dir(album_dir, zip_path, root_name)
+        return Result(summary=f"{root_name}.zip", zip_path=str(zip_path), zip_name=f"{root_name}.zip")
+    finally:
+        shutil.rmtree(work_base, ignore_errors=True)

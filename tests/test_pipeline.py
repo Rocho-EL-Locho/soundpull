@@ -5,6 +5,8 @@ from app.pipeline import (
     _SINGLE_FLAGS,
     _build_ydl_opts,
     _primary_artist,
+    _safe_segment,
+    is_supported_url,
     pick_square_cover,
 )
 
@@ -52,3 +54,24 @@ def test_pick_square_cover_prefers_signed_then_largest():
     ]
     assert pick_square_cover(thumbs) == "u/b?sqp=x"   # signed wins over larger unsigned
     assert pick_square_cover([]) is None
+
+
+def test_is_supported_url_accepts_youtube_hosts():
+    assert is_supported_url("https://music.youtube.com/watch?v=abc")
+    assert is_supported_url("https://www.youtube.com/playlist?list=x")
+    assert is_supported_url("https://youtu.be/abc")
+
+
+def test_is_supported_url_rejects_lookalikes_and_non_http():
+    assert not is_supported_url("https://youtube.com.evil.com/x")  # not a youtube host
+    assert not is_supported_url("https://evil.com/youtube.com")     # substring only
+    assert not is_supported_url("file:///etc/passwd")               # wrong scheme
+    assert not is_supported_url("")
+
+
+def test_safe_segment_blocks_traversal():
+    assert _safe_segment("AC/DC") == "AC_DC"
+    assert _safe_segment("..") == "Unbekannt"
+    assert _safe_segment("../../etc") == ".._.._etc"
+    assert _safe_segment("  ") == "Unbekannt"
+    assert _safe_segment("Drake") == "Drake"          # legitimate names untouched
