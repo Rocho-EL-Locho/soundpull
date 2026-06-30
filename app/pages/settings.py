@@ -60,10 +60,14 @@ def settings_page() -> None:
                               placeholder="https://cloud.example.org/remote.php/dav/files/<user>/") \
                 .props("outlined dense dark").classes("w-full")
             wd_user = ui.input("Benutzername", value=snap["wd_user"]) \
-                .props("outlined dense dark").classes("w-full")
+                .props("outlined dense dark autocomplete=off").classes("w-full")
             pw_placeholder = "•••••••• (gesetzt — leer lassen zum Behalten)" if snap["has_pw"] else "Passwort"
+            # autocomplete=new-password marks this as a field for *setting* a credential, not
+            # logging in — stops the browser from proactively offering saved passwords on load
+            # (see issue #6). Pairs with autocomplete=off on the username so the two aren't
+            # detected as a login form.
             wd_pass = ui.input("Passwort", password=True, placeholder=pw_placeholder) \
-                .props("outlined dense dark").classes("w-full")
+                .props("outlined dense dark autocomplete=new-password").classes("w-full")
 
             folder_state = {"path": snap["wd_folder"]}
 
