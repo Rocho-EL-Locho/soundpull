@@ -90,6 +90,69 @@ _SINGLE_FLAGS = [
     "-f", "bestaudio/best",
 ]
 
+# Selectable audio quality / format (issue #10). Single source of truth.
+#   key -> (yt-dlp --audio-format codec | None, --audio-quality value | None)
+#
+# YouTube serves lossy audio (~128-160 kbps Opus/AAC), which is the real quality
+# ceiling. We therefore expose only the tiers that add distinct value:
+#   - original : copy the source stream (Opus/M4A) without re-encoding — best
+#                fidelity AND smallest file; the right choice unless a device
+#                can't play Opus.
+#   - mp3_320  : transparent transcode for maximum compatibility; also the
+#                historical default, so its flag list is a no-op transform on
+#                the lists above → output stays byte-identical (metadata parity).
+#   - mp3_192  : compatible like 320 but ~40% smaller; still near-transparent
+#                for a ~160 kbps source.
+# Deliberately omitted: mp3_256 (redundant between 320/192) and mp3_128 (below
+# the source bitrate → audibly worse for little gain — "original" covers small).
+DEFAULT_AUDIO_FORMAT = "mp3_320"
+AUDIO_FORMATS: dict[str, tuple[str | None, str | None]] = {
+    "mp3_320": ("mp3", "320K"),
+    "mp3_192": ("mp3", "192K"),
+    "original": (None, None),
+}
+# Labels for the UI selects (kept here so pages share one source of truth).
+AUDIO_FORMAT_LABELS: dict[str, str] = {
+    "mp3_320": "MP3 320 kbps · max. Kompatibilität (Standard)",
+    "mp3_192": "MP3 192 kbps · kompatibel & kleiner",
+    "original": "Original (Opus/M4A) · beste Qualität, kleinste Datei",
+}
+
+
+def normalize_audio_format(value: str | None) -> str:
+    """Return a known audio-format key, falling back to the default."""
+    return value if value in AUDIO_FORMATS else DEFAULT_AUDIO_FORMAT
+
+
+def audio_format_short(value: str | None) -> str:
+    """Compact label for lists/history, e.g. 'MP3 320' or 'Original'."""
+    codec, quality = AUDIO_FORMATS[normalize_audio_format(value)]
+    return "Original" if codec is None else f"{codec.upper()} {(quality or '').rstrip('K')}"
+
+
+def _apply_audio_format(flags: list[str], audio_format: str) -> list[str]:
+    """Return a copy of `flags` with codec/quality set per `audio_format`.
+
+    For the default (`mp3_320`) this is a no-op — same codec, same bitrate —
+    so the produced flag list (and thus tag output) is unchanged.
+    """
+    codec, quality = AUDIO_FORMATS[normalize_audio_format(audio_format)]
+    out = list(flags)
+
+    qi = out.index("--audio-quality")
+    if quality is not None:
+        out[qi + 1] = quality
+    else:
+        del out[qi:qi + 2]
+
+    fi = out.index("--audio-format")
+    if codec is not None:
+        out[fi + 1] = codec
+    else:
+        del out[fi:fi + 2]
+
+    return out
+
 
 @dataclass
 class Destination:
@@ -239,7 +302,8 @@ def _upload_tree(dest: Destination, local_root: Path) -> None:
 
 
 def run_download(*, job_id: str, url: str, genre: str, mode: str,
-                 destination: Destination, reporter: Reporter) -> Result:
+                 destination: Destination, reporter: Reporter,
+                 audio_format: str = DEFAULT_AUDIO_FORMAT) -> Result:
     """Execute one download end-to-end and return a Result.
 
     Both destinations stage into a temp work dir; then either a ZIP is packaged
@@ -266,7 +330,7 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
         out_tmpl = str(work_base / _safe_segment(primary_artist) / subfolder / "%(title)s.%(ext)s")
 
         # 3) Download (parity-safe opts from parse_options + our hooks).
-        flags = list(_ALBUM_FLAGS if is_album else _SINGLE_FLAGS)
+        flags = _apply_audio_format(_ALBUM_FLAGS if is_album else _SINGLE_FLAGS, audio_format)
         flags += ["--postprocessor-args", f"ffmpeg:-metadata genre={genre}", "-o", out_tmpl]
         opts = _build_ydl_opts(flags)
         opts.update({"quiet": True, "no_warnings": True, "noprogress": True, "logger": _QuietLogger()})

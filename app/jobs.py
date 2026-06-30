@@ -20,7 +20,7 @@ from sqlmodel import select
 from app.config import settings
 from app.db import session_scope
 from app.models import DownloadHistory, UserSettings
-from app.pipeline import Destination, Reporter, run_download
+from app.pipeline import DEFAULT_AUDIO_FORMAT, Destination, Reporter, normalize_audio_format, run_download
 from app.security import decrypt_secret
 
 log = logging.getLogger("jobs")
@@ -40,6 +40,7 @@ class JobState:
     genre: str
     mode: str
     destination_type: str
+    audio_format: str = DEFAULT_AUDIO_FORMAT
     phase: str = "queued"
     artist: str | None = None
     album: str | None = None
@@ -72,7 +73,8 @@ def _persist(job_id: str, **fields) -> None:
         session.add(row)
 
 
-def _run(job_id: str, url: str, genre: str, mode: str, destination: Destination) -> None:
+def _run(job_id: str, url: str, genre: str, mode: str, destination: Destination,
+         audio_format: str) -> None:
     js = _registry[job_id]
 
     def on_phase(phase: str) -> None:
@@ -95,7 +97,8 @@ def _run(job_id: str, url: str, genre: str, mode: str, destination: Destination)
 
     try:
         result = run_download(job_id=job_id, url=url, genre=genre, mode=mode,
-                              destination=destination, reporter=reporter)
+                              destination=destination, reporter=reporter,
+                              audio_format=audio_format)
         with _lock:
             js.phase, js.finished_at = "done", _utcnow()
             js.result_path = result.zip_path
@@ -111,9 +114,11 @@ def _run(job_id: str, url: str, genre: str, mode: str, destination: Destination)
         _persist(job_id, phase="error", error=str(exc), finished_at=js.finished_at)
 
 
-def start_job(*, user_id: int, url: str, genre: str, mode: str, destination_type: str) -> str:
+def start_job(*, user_id: int, url: str, genre: str, mode: str, destination_type: str,
+              audio_format: str = DEFAULT_AUDIO_FORMAT) -> str:
     """Queue a download for a user. Returns the job id. Raises on bad config."""
     job_id = uuid.uuid4().hex
+    audio_format = normalize_audio_format(audio_format)
 
     with session_scope() as session:
         us = session.exec(select(UserSettings).where(UserSettings.user_id == user_id)).first()
@@ -129,14 +134,14 @@ def start_job(*, user_id: int, url: str, genre: str, mode: str, destination_type
             )
         session.add(DownloadHistory(
             id=job_id, user_id=user_id, url=url, genre=genre, mode=mode,
-            destination_type=destination_type, phase="queued",
+            audio_format=audio_format, destination_type=destination_type, phase="queued",
         ))
 
     js = JobState(id=job_id, user_id=user_id, url=url, genre=genre, mode=mode,
-                  destination_type=destination_type)
+                  destination_type=destination_type, audio_format=audio_format)
     with _lock:
         _registry[job_id] = js
-    _executor.submit(_run, job_id, url, genre, mode, destination)
+    _executor.submit(_run, job_id, url, genre, mode, destination, audio_format)
     return job_id
 
 

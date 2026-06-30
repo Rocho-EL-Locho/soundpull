@@ -12,6 +12,7 @@ from app.config import settings as app_settings
 from app.db import session_scope
 from app.genres import ALLOWED_GENRES
 from app.models import UserSettings
+from app.pipeline import AUDIO_FORMAT_LABELS, normalize_audio_format
 from app.security import decrypt_secret, encrypt_secret
 from app.theme import frame
 from app.webdav_util import list_dirs, make_client
@@ -34,6 +35,7 @@ def settings_page() -> None:
             dest = us.destination_type if us.destination_type in ("browser", "webdav") else "browser"
             snap = {
                 "genre": us.default_genre, "mode": us.default_mode, "dest": dest,
+                "audio": normalize_audio_format(us.default_audio_format),
                 "wd_url": us.webdav_url or "", "wd_user": us.webdav_username or "",
                 "wd_folder": us.webdav_folder or "", "has_pw": us.has_webdav_password,
             }
@@ -47,6 +49,9 @@ def settings_page() -> None:
                     ui.label("Standard-Modus").classes("text-xs text-white/50")
                     mode_tgl = ui.toggle({"album": "Album", "single": "Single"}, value=snap["mode"]) \
                         .props("toggle-color=primary unelevated no-caps").classes("glass rounded-lg")
+            audio_sel = ui.select(AUDIO_FORMAT_LABELS, value=snap["audio"],
+                                  label="Standard-Qualität / Format") \
+                .props("outlined dense dark").classes("w-full")
             dest_sel = ui.select({"browser": "Im Browser (ZIP)", "webdav": "WebDAV"},
                                  value=snap["dest"], label="Standard-Ziel") \
                 .props("outlined dense dark").classes("w-full")
@@ -162,6 +167,7 @@ def settings_page() -> None:
                         session.add(row)
                     row.default_genre = genre_sel.value
                     row.default_mode = mode_tgl.value
+                    row.default_audio_format = audio_sel.value
                     row.destination_type = dest_sel.value
                     row.webdav_url = (wd_url.value or "").strip() or None
                     row.webdav_folder = folder_state["path"] or None
