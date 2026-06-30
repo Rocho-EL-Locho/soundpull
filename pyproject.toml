@@ -1,0 +1,24 @@
+[project]
+name = "soundpull"
+version = "0.1.0"
+description = "Soundpull — multi-user web app to download YouTube Music as Navidrome-tagged MP3s"
+requires-python = ">=3.11"
+dependencies = [
+    "nicegui>=2.0",
+    "authlib>=1.3",
+    "httpx>=0.27",
+    "itsdangerous>=2.1",
+    "sqlmodel>=0.0.21",
+    "pydantic-settings>=2.2",
+    "cryptography>=42.0",
+    "yt-dlp>=2024.8.6",
+    "mutagen>=1.47",
+    "webdav4>=0.10",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]

@@ -1,0 +1,72 @@
+"""Shared visual theme (Vibrant / Glass, dark) and app shell."""
+from __future__ import annotations
+
+from contextlib import contextmanager
+
+from nicegui import ui
+
+from app.auth import current_display_name
+
+_HEAD_CSS = """
+<style>
+  body, .body--dark, .q-page-container {
+    background:
+      radial-gradient(1200px 800px at 18% -10%, #241b54 0%, transparent 58%),
+      radial-gradient(1000px 700px at 100% 0%, #07303f 0%, transparent 52%),
+      #0a0a14 !important;
+    background-attachment: fixed !important;
+  }
+  .glass {
+    background: rgba(255,255,255,0.055);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid rgba(255,255,255,0.10);
+  }
+  .accent-grad { background-image: linear-gradient(135deg,#7c3aed 0%,#06b6d4 100%); }
+  .accent-text {
+    background: linear-gradient(135deg,#a78bfa,#22d3ee);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .hover-glow:hover { box-shadow: 0 0 24px rgba(124,58,237,0.45); }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 8px; }
+</style>
+"""
+
+
+def apply_base_style() -> None:
+    ui.dark_mode(True)
+    ui.colors(primary="#7c3aed", secondary="#06b6d4", accent="#22d3ee",
+              dark="#0a0a14", dark_page="#0a0a14")
+    ui.add_head_html(_HEAD_CSS)
+
+
+def _nav_link(label: str, target: str, key: str, active: str) -> None:
+    cls = "px-3 py-1.5 rounded-lg text-sm transition no-underline"
+    if key == active:
+        cls += " accent-grad text-white shadow"
+    else:
+        cls += " text-white/80 hover:text-white hover:bg-white/10"
+    ui.link(label, target).classes(cls).style("text-decoration:none")
+
+
+@contextmanager
+def frame(active: str = "download"):
+    """Render the app shell and yield the page content container."""
+    apply_base_style()
+    with ui.element("div").classes("glass sticky top-0 z-50 w-full"):
+        with ui.row().classes("w-full max-w-5xl mx-auto items-center justify-between px-6 py-3"):
+            with ui.row().classes("items-center gap-2"):
+                ui.icon("graphic_eq").classes("text-2xl accent-text")
+                ui.label("Soundpull").classes("text-lg font-semibold")
+            with ui.row().classes("items-center gap-1"):
+                _nav_link("Download", "/", "download", active)
+                _nav_link("Verlauf", "/history", "history", active)
+                _nav_link("Einstellungen", "/settings", "settings", active)
+                ui.element("div").classes("w-px h-6 bg-white/15 mx-2")
+                ui.label(current_display_name()).classes("text-sm text-white/70")
+                ui.button(icon="logout", on_click=lambda: ui.navigate.to("/logout")) \
+                    .props("flat round dense").classes("text-white/80")
+
+    with ui.column().classes("w-full max-w-3xl mx-auto px-6 py-6 gap-4") as content:
+        yield content

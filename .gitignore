@@ -1,0 +1,20 @@
+# Secrets & runtime data
+.env
+data/
+downloads/
+.nicegui/
+
+# Legacy reference implementation — not part of Soundpull
+/yt-dlp/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# OS / editor
+.DS_Store

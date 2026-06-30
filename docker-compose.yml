@@ -1,0 +1,27 @@
+services:
+  soundpull:
+    build: .
+    container_name: soundpull
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/data            # SQLite DB (DATABASE_URL=sqlite:////data/app.db)
+      # Temp/staging area for downloads (ZIPs + work dir). A volume keeps it off
+      # the container layer; point at fast local storage if you like.
+      - ./downloads:/downloads  # LOCAL_MUSIC_ROOT=/downloads
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      # Replace the host and certresolver with your real values.
+      - "traefik.http.routers.soundpull.rule=Host(`soundpull.example.org`)"
+      - "traefik.http.routers.soundpull.entrypoints=websecure"
+      - "traefik.http.routers.soundpull.tls=true"
+      - "traefik.http.routers.soundpull.tls.certresolver=letsencrypt"
+      - "traefik.http.services.soundpull.loadbalancer.server.port=8080"
+
+# Traefik provides TLS termination and routing; OIDC auth happens inside the app.
+# NiceGUI uses WebSockets — Traefik forwards these by default, no extra config needed.
+networks:
+  proxy:
+    external: true
