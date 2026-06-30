@@ -111,12 +111,8 @@ AUDIO_FORMATS: dict[str, tuple[str | None, str | None]] = {
     "mp3_192": ("mp3", "192K"),
     "original": (None, None),
 }
-# Labels for the UI selects (kept here so pages share one source of truth).
-AUDIO_FORMAT_LABELS: dict[str, str] = {
-    "mp3_320": "MP3 320 kbps · max. Kompatibilität (Standard)",
-    "mp3_192": "MP3 192 kbps · kompatibel & kleiner",
-    "original": "Original (Opus/M4A) · beste Qualität, kleinste Datei",
-}
+# Localized labels for the UI selects live in app.i18n (keys "audio.<format>"),
+# built from these keys via app.i18n.audio_format_labels().
 
 
 def normalize_audio_format(value: str | None) -> str:
