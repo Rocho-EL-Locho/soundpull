@@ -37,6 +37,16 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "audio.mp3_320": "MP3 320 kbps · max. Kompatibilität (Standard)",
         "audio.mp3_192": "MP3 192 kbps · kompatibel & kleiner",
         "audio.original": "Original (Opus/M4A) · beste Qualität, kleinste Datei",
+        # metadata field toggles (keys = app.fix_music_tags.TAG_OPTION_FIELDS)
+        "meta.heading": "Metadaten-Felder",
+        "meta.desc": "Wähle, welche Felder Soundpull in die Dateien schreibt. "
+                     "Standard: alle an — abgeschaltete Felder werden nicht geschrieben.",
+        "meta.genre": "Genre",
+        "meta.album_artist": "Album-Interpret",
+        "meta.cover": "Cover-Bild",
+        "meta.track_number": "Titelnummer",
+        "meta.feat_artist": "Feat.-Bereinigung (Titel & Interpret)",
+        "meta.comments": "Kommentare",
         # download phases
         "phase.queued": "Warteschlange",
         "phase.metadata": "Metadaten",
@@ -127,6 +137,16 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "audio.mp3_320": "MP3 320 kbps · max. compatibility (default)",
         "audio.mp3_192": "MP3 192 kbps · compatible & smaller",
         "audio.original": "Original (Opus/M4A) · best quality, smallest file",
+        # metadata field toggles (keys = app.fix_music_tags.TAG_OPTION_FIELDS)
+        "meta.heading": "Metadata fields",
+        "meta.desc": "Choose which fields Soundpull writes to the files. "
+                     "Default: all on — fields you turn off are not written.",
+        "meta.genre": "Genre",
+        "meta.album_artist": "Album artist",
+        "meta.cover": "Cover art",
+        "meta.track_number": "Track number",
+        "meta.feat_artist": "Feat. cleanup (title & artist)",
+        "meta.comments": "Comments",
         # download phases
         "phase.queued": "Queued",
         "phase.metadata": "Metadata",

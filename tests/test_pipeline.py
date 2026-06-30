@@ -1,10 +1,12 @@
 """Guards metadata parity: parse_options must turn the original flag lists into
 the exact yt-dlp options the bash scripts produced."""
+from app.fix_music_tags import TagOptions
 from app.pipeline import (
     DEFAULT_AUDIO_FORMAT,
     _ALBUM_FLAGS,
     _SINGLE_FLAGS,
     _apply_audio_format,
+    _apply_tag_options,
     _build_ydl_opts,
     _primary_artist,
     _safe_segment,
@@ -63,6 +65,29 @@ def test_original_drops_format_and_quality_so_source_is_remuxed():
     extract = next(pp for pp in _build_ydl_opts(flags + _OUT)["postprocessors"]
                    if pp["key"] == "FFmpegExtractAudio")
     assert extract["preferredcodec"] == "best"   # 'best' = copy the source stream
+
+
+def test_tag_options_all_on_is_noop_parity():
+    # All fields on (default) must not alter the flag lists → byte-identical tags.
+    assert _apply_tag_options(_ALBUM_FLAGS, TagOptions()) == _ALBUM_FLAGS
+    assert _apply_tag_options(_SINGLE_FLAGS, TagOptions()) == _SINGLE_FLAGS
+
+
+def test_cover_off_drops_thumbnail_flags():
+    flags = _apply_tag_options(_ALBUM_FLAGS, TagOptions(cover=False))
+    assert "--embed-thumbnail" not in flags
+    assert "--convert-thumbnails" not in flags
+    assert "jpg" not in flags                       # the orphaned value is removed too
+    assert "EmbedThumbnail" not in _pp_keys(_build_ydl_opts(flags + _OUT))
+
+
+def test_track_off_drops_playlist_remap_album_only():
+    album = _apply_tag_options(_ALBUM_FLAGS, TagOptions(track_number=False))
+    assert "--parse-metadata" not in album
+    assert "playlist_index:%(track_number)s" not in album
+    assert "MetadataParser" not in _pp_keys(_build_ydl_opts(album + _OUT))
+    # singles never had the playlist→track remap, so the flag list is untouched.
+    assert _apply_tag_options(_SINGLE_FLAGS, TagOptions(track_number=False)) == _SINGLE_FLAGS
 
 
 def test_normalize_audio_format_clamps_unknown_to_default():
