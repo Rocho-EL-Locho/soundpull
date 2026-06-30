@@ -1,12 +1,16 @@
 """Guards metadata parity: parse_options must turn the original flag lists into
 the exact yt-dlp options the bash scripts produced."""
 from app.pipeline import (
+    DEFAULT_AUDIO_FORMAT,
     _ALBUM_FLAGS,
     _SINGLE_FLAGS,
+    _apply_audio_format,
     _build_ydl_opts,
     _primary_artist,
     _safe_segment,
+    audio_format_short,
     is_supported_url,
+    normalize_audio_format,
     pick_square_cover,
 )
 
@@ -36,6 +40,42 @@ def test_single_has_no_playlist_track_remap():
     assert "MetadataParser" not in keys           # singles keep their own track no.
     assert "FFmpegExtractAudio" in keys           # but still mp3 extraction
     assert "EmbedThumbnail" in keys
+
+
+def test_default_audio_format_is_noop_parity():
+    # The default (mp3_320) must not alter the original flag lists at all —
+    # byte-identical flags → byte-identical tags (the parity invariant).
+    assert _apply_audio_format(_ALBUM_FLAGS, DEFAULT_AUDIO_FORMAT) == _ALBUM_FLAGS
+    assert _apply_audio_format(_SINGLE_FLAGS, DEFAULT_AUDIO_FORMAT) == _SINGLE_FLAGS
+
+
+def test_mp3_192_changes_only_the_bitrate():
+    opts = _build_ydl_opts(_apply_audio_format(_ALBUM_FLAGS, "mp3_192") + _OUT)
+    extract = next(pp for pp in opts["postprocessors"] if pp["key"] == "FFmpegExtractAudio")
+    assert extract["preferredcodec"] == "mp3"
+    assert extract["preferredquality"] == "192"
+
+
+def test_original_drops_format_and_quality_so_source_is_remuxed():
+    flags = _apply_audio_format(_ALBUM_FLAGS, "original")
+    assert "--audio-format" not in flags    # no codec target → keep source (no re-encode)
+    assert "--audio-quality" not in flags
+    extract = next(pp for pp in _build_ydl_opts(flags + _OUT)["postprocessors"]
+                   if pp["key"] == "FFmpegExtractAudio")
+    assert extract["preferredcodec"] == "best"   # 'best' = copy the source stream
+
+
+def test_normalize_audio_format_clamps_unknown_to_default():
+    assert normalize_audio_format("bogus") == DEFAULT_AUDIO_FORMAT
+    assert normalize_audio_format(None) == DEFAULT_AUDIO_FORMAT
+    assert normalize_audio_format("mp3_128") == DEFAULT_AUDIO_FORMAT   # retired tier
+    assert normalize_audio_format("original") == "original"
+
+
+def test_audio_format_short_labels():
+    assert audio_format_short("mp3_320") == "MP3 320"
+    assert audio_format_short("mp3_192") == "MP3 192"
+    assert audio_format_short("original") == "Original"
 
 
 def test_primary_artist_extraction():

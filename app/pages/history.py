@@ -8,6 +8,7 @@ from nicegui import ui
 from app.auth import get_current_user
 from app.db import session_scope
 from app.models import DownloadHistory
+from app.pipeline import audio_format_short
 from app.theme import frame
 
 _STATUS = {
@@ -37,6 +38,7 @@ def history_page() -> None:
             items = [{
                 "album": r.album, "artist": r.artist, "phase": r.phase, "mode": r.mode,
                 "genre": r.genre, "dest": r.destination_type, "url": r.url,
+                "audio": audio_format_short(r.audio_format),
                 "created": r.created_at, "error": r.error,
             } for r in rows]
 
@@ -55,6 +57,6 @@ def history_page() -> None:
                     ui.label(label).classes(f"text-sm {color}")
                 with ui.row().classes("items-center gap-3 text-xs text-white/45 flex-wrap"):
                     ui.label(it["created"].strftime("%d.%m.%Y %H:%M"))
-                    ui.label(f"{it['mode']} · {it['genre']} · {it['dest']}")
+                    ui.label(f"{it['mode']} · {it['genre']} · {it['audio']} · {it['dest']}")
                 if it["error"]:
                     ui.label(it["error"]).classes("text-red-400 text-xs")

@@ -1,19 +1,30 @@
 #!/usr/bin/env python3
 """
-fix_music_tags.py — Korrigiert Featured Artist Metadaten in MP3-Dateien
+fix_music_tags.py — Korrigiert Featured Artist Metadaten in Musikdateien
 
-Navidrome-konforme Regeln (ID3v2.3 / MP3):
+Navidrome-konforme Regeln:
   - ARTIST:      "Primärkünstler / Featured Artist"  (Trennzeichen: " / ")
   - ALBUMARTIST: Nur Primärkünstler (unverändert)
   - TITLE:       Ohne "(feat. ...)" Anteil
 
+Die Normalisierungs-Regeln (parse_featured_artists / split_artists / FEAT_PATTERNS)
+sind unverändert vom Original übernommen und gelten für alle Formate gleich. Der
+MP3-Pfad (process_file → ID3v2.3) ist bit-identisch zum Original; M4A/MP4 und
+Opus/OGG werden zusätzlich unterstützt, damit auch der "Original-Codec"-Download
+(yt-dlp ohne Re-Encode, siehe issue #10) die volle Navidrome-Behandlung erhält.
+
 Aufruf: python3 fix_music_tags.py <Verzeichnis>
 """
 
+import base64
 import os
 import re
 import sys
+from mutagen.flac import Picture
 from mutagen.id3 import ID3, TPE1, TPE2, TIT2, TALB, APIC, ID3NoHeaderError
+from mutagen.mp4 import MP4, MP4Cover
+from mutagen.oggopus import OggOpus
+from mutagen.oggvorbis import OggVorbis
 
 
 # Regex-Muster für Featured Artists im Titel
@@ -172,19 +183,148 @@ def process_file(filepath: str, cover_data: bytes | None = None, album_name: str
         return False
 
 
+def _normalized_tags(title: str, artist: str, albumartist: str, album_artist: str | None):
+    """Gemeinsame Logik: Titel/Artist/AlbumArtist nach Navidrome-Regeln.
+
+    Liefert (clean_title, new_artist, correct_albumartist) oder None, wenn
+    Titel/Artist fehlen (dann Datei überspringen — wie beim MP3-Pfad).
+    """
+    if not title or not artist:
+        return None
+    clean_title, new_artist, _ = parse_featured_artists(title, artist)
+    correct_albumartist = album_artist if album_artist else artist.split(" / ")[0]
+    return clean_title, new_artist, correct_albumartist
+
+
+def process_file_mp4(filepath: str, cover_data: bytes | None = None, album_name: str | None = None, album_artist: str | None = None) -> bool:
+    """Verarbeitet eine MP4/M4A-Datei (AAC/ALAC, iTunes-Atome)."""
+    try:
+        audio = MP4(filepath)
+
+        def first(key):
+            val = audio.tags.get(key) if audio.tags else None
+            return str(val[0]).strip() if val else ""
+
+        title, artist, albumartist = first("\xa9nam"), first("\xa9ART"), first("aART")
+        norm = _normalized_tags(title, artist, albumartist, album_artist)
+        if norm is None:
+            print(f"  [SKIP] Kein Titel/Artist-Tag: {os.path.basename(filepath)}")
+            return False
+        clean_title, new_artist, correct_albumartist = norm
+
+        changed = False
+        if clean_title != title:
+            print(f"  Titel:       '{title}' → '{clean_title}'")
+            audio["\xa9nam"] = [clean_title]; changed = True
+        if new_artist != artist:
+            print(f"  Artist:      '{artist}' → '{new_artist}'")
+            audio["\xa9ART"] = [new_artist]; changed = True
+        if albumartist != correct_albumartist:
+            label = "(leer)" if not albumartist else f"'{albumartist}'"
+            print(f"  AlbumArtist: {label} → '{correct_albumartist}'")
+            audio["aART"] = [correct_albumartist]; changed = True
+        cur_album = first("\xa9alb")
+        if album_name and cur_album != album_name:
+            print(f"  Album:       '{cur_album}' → '{album_name}'")
+            audio["\xa9alb"] = [album_name]; changed = True
+        if cover_data is not None:
+            audio["covr"] = [MP4Cover(cover_data, imageformat=MP4Cover.FORMAT_JPEG)]
+            changed = True
+
+        if changed:
+            audio.save()
+            return True
+        print(f"  [OK] {os.path.basename(filepath)}")
+        return False
+    except Exception as e:
+        print(f"  [FEHLER] {os.path.basename(filepath)}: {e}")
+        return False
+
+
+def _vorbis_cover(cover_data: bytes) -> str:
+    """Base64-kodierter FLAC-Picture-Block (Front Cover) für Vorbis-Comments."""
+    pic = Picture()
+    pic.type = 3  # Front Cover
+    pic.mime = "image/jpeg"
+    pic.desc = "Cover"
+    pic.data = cover_data
+    return base64.b64encode(pic.write()).decode("ascii")
+
+
+def process_file_ogg(filepath: str, opener, cover_data: bytes | None = None, album_name: str | None = None, album_artist: str | None = None) -> bool:
+    """Verarbeitet eine Opus-/Ogg-Datei (Vorbis-Comments, case-insensitive)."""
+    try:
+        audio = opener(filepath)
+
+        def first(key):
+            val = audio.get(key)
+            return str(val[0]).strip() if val else ""
+
+        title, artist, albumartist = first("title"), first("artist"), first("albumartist")
+        norm = _normalized_tags(title, artist, albumartist, album_artist)
+        if norm is None:
+            print(f"  [SKIP] Kein Titel/Artist-Tag: {os.path.basename(filepath)}")
+            return False
+        clean_title, new_artist, correct_albumartist = norm
+
+        changed = False
+        if clean_title != title:
+            print(f"  Titel:       '{title}' → '{clean_title}'")
+            audio["title"] = [clean_title]; changed = True
+        if new_artist != artist:
+            print(f"  Artist:      '{artist}' → '{new_artist}'")
+            audio["artist"] = [new_artist]; changed = True
+        if albumartist != correct_albumartist:
+            label = "(leer)" if not albumartist else f"'{albumartist}'"
+            print(f"  AlbumArtist: {label} → '{correct_albumartist}'")
+            audio["albumartist"] = [correct_albumartist]; changed = True
+        cur_album = first("album")
+        if album_name and cur_album != album_name:
+            print(f"  Album:       '{cur_album}' → '{album_name}'")
+            audio["album"] = [album_name]; changed = True
+        if cover_data is not None:
+            audio["metadata_block_picture"] = [_vorbis_cover(cover_data)]
+            audio.pop("coverart", None)  # älteres, nicht-standard Cover-Feld entfernen
+            changed = True
+
+        if changed:
+            audio.save()
+            return True
+        print(f"  [OK] {os.path.basename(filepath)}")
+        return False
+    except Exception as e:
+        print(f"  [FEHLER] {os.path.basename(filepath)}: {e}")
+        return False
+
+
+# Extension → Handler. MP3 bleibt der unveränderte ID3-Pfad.
+_SUPPORTED_EXTS = (".mp3", ".m4a", ".mp4", ".opus", ".ogg", ".oga")
+
+
+def _process_any(filepath: str, cover_data: bytes | None, album_name: str | None, album_artist: str | None) -> bool:
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext == ".mp3":
+        return process_file(filepath, cover_data, album_name, album_artist)
+    if ext in (".m4a", ".mp4"):
+        return process_file_mp4(filepath, cover_data, album_name, album_artist)
+    if ext == ".opus":
+        return process_file_ogg(filepath, OggOpus, cover_data, album_name, album_artist)
+    return process_file_ogg(filepath, OggVorbis, cover_data, album_name, album_artist)
+
+
 def process_directory(directory: str, cover_path: str | None = None, album_name: str | None = None, album_artist: str | None = None) -> None:
-    """Verarbeitet alle MP3-Dateien in einem Verzeichnis (nicht rekursiv)."""
+    """Verarbeitet alle unterstützten Audiodateien in einem Verzeichnis (nicht rekursiv)."""
     if not os.path.isdir(directory):
         print(f"Verzeichnis nicht gefunden: {directory}")
         sys.exit(1)
 
     mp3_files = sorted([
         f for f in os.listdir(directory)
-        if f.lower().endswith(".mp3")
+        if f.lower().endswith(_SUPPORTED_EXTS)
     ])
 
     if not mp3_files:
-        print(f"Keine MP3-Dateien in: {directory}")
+        print(f"Keine Audiodateien in: {directory}")
         return
 
     # Cover-Datei einlesen
@@ -205,7 +345,7 @@ def process_directory(directory: str, cover_path: str | None = None, album_name:
     for filename in mp3_files:
         filepath = os.path.join(directory, filename)
         print(f"→ {filename}")
-        if process_file(filepath, cover_data, album_name, album_artist):
+        if _process_any(filepath, cover_data, album_name, album_artist):
             changed_count += 1
 
     print(f"\n{changed_count} von {len(mp3_files)} Dateien aktualisiert.")

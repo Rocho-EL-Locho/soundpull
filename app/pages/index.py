@@ -9,7 +9,9 @@ from app.auth import get_current_user
 from app.db import session_scope
 from app.genres import ALLOWED_GENRES, DEFAULT_GENRE
 from app.jobs import JobState, get_user_jobs, start_job
-from app.pipeline import is_supported_url
+from app.pipeline import (
+    AUDIO_FORMAT_LABELS, DEFAULT_AUDIO_FORMAT, is_supported_url, normalize_audio_format,
+)
 from app.theme import frame
 
 PHASE_LABELS = {
@@ -96,6 +98,7 @@ def index_page(url: str = "") -> None:
             us = user.settings
             d_genre = us.default_genre if us else DEFAULT_GENRE
             d_mode = us.default_mode if us else "album"
+            d_audio = normalize_audio_format(us.default_audio_format if us else None)
             d_dest = us.destination_type if us else "browser"
             if d_dest not in ("browser", "webdav"):
                 d_dest = "browser"
@@ -124,6 +127,8 @@ def index_page(url: str = "") -> None:
                     ui.label("Modus").classes("text-xs text-white/50")
                     mode_tgl = ui.toggle({"album": "Album", "single": "Single"}, value=d_mode) \
                         .props("toggle-color=primary unelevated no-caps").classes("glass rounded-lg")
+            audio_sel = ui.select(AUDIO_FORMAT_LABELS, value=d_audio, label="Qualität / Format") \
+                .props("outlined dense dark").classes("w-full")
             dest_label = "WebDAV" if has_webdav else "WebDAV (nicht konfiguriert)"
             dest_sel = ui.select({"browser": "Im Browser (ZIP)", "webdav": dest_label}, value=d_dest,
                                  label="Ziel").props("outlined dense dark").classes("w-full")
@@ -138,7 +143,8 @@ def index_page(url: str = "") -> None:
                     return
                 try:
                     start_job(user_id=uid, url=target, genre=genre_sel.value,
-                              mode=mode_tgl.value, destination_type=dest_sel.value)
+                              mode=mode_tgl.value, destination_type=dest_sel.value,
+                              audio_format=audio_sel.value)
                     ui.notify("Download gestartet", type="positive")
                     url_in.value = ""
                     render_jobs.refresh()
