@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from sqlalchemy import event
 from sqlmodel import Session, SQLModel, create_engine
 
 from app.config import settings
@@ -25,6 +26,17 @@ def _make_engine():
 
 
 engine = _make_engine()
+
+if settings.database_url.startswith("sqlite"):
+    @event.listens_for(engine, "connect")
+    def _sqlite_pragmas(dbapi_conn, _record) -> None:
+        # WAL + a busy timeout keep concurrent worker/UI writes from hitting
+        # "database is locked" (check_same_thread=False shares connections).
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA busy_timeout=5000")
+        cur.execute("PRAGMA synchronous=NORMAL")
+        cur.close()
 
 
 def init_db() -> None:
