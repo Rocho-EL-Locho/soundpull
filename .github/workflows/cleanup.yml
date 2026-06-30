@@ -1,0 +1,24 @@
+name: Cleanup container images
+
+# Removes orphaned (untagged) image versions from GHCR to keep the package tidy.
+# Tagged versions (latest, semver, sha-…) are never touched.
+on:
+  schedule:
+    - cron: "0 4 * * 0" # weekly, Sunday 04:00 UTC
+  workflow_dispatch:
+
+permissions:
+  packages: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete untagged versions
+        uses: dataaxiom/ghcr-cleanup-action@v1
+        with:
+          owner: Rocho-EL-Locho
+          packages: soundpull
+          token: ${{ secrets.GITHUB_TOKEN }}
+          delete-untagged: true
+          dry-run: false

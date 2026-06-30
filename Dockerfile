@@ -7,12 +7,16 @@ ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /src
 COPY pyproject.toml ./
 COPY app ./app
-# Install into /install (no venv) so it can be copied into distroless as-is.
-RUN pip install --target=/install .
+# --no-compile + pruning bytecode keeps /install lean.
+RUN pip install --no-compile --target=/install . \
+ && find /install -name '__pycache__' -type d -prune -exec rm -rf {} + \
+ && find /install -name '*.pyc' -delete
 # Pre-create writable runtime dirs owned by the distroless nonroot uid (65532).
 RUN mkdir -p /runtime/data /runtime/downloads && chown -R 65532:65532 /runtime
 
 # ─── Stage 2: static ffmpeg/ffprobe (yt-dlp needs them at runtime) ────────────
+# Self-contained static binaries with full codec support — robust, no shared-lib
+# or glibc-overlay concerns in the distroless runtime.
 FROM mwader/static-ffmpeg:7.1 AS ffmpeg
 
 # ─── Stage 3: distroless runtime ──────────────────────────────────────────────
