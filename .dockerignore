@@ -1,0 +1,19 @@
+# Build context only needs pyproject.toml + app/ (see Dockerfile)
+.git
+.gitignore
+.github
+.venv
+venv
+__pycache__
+*.py[cod]
+*.egg-info
+data
+downloads
+.nicegui
+.env
+docs
+tests
+yt-dlp
+*.md
+CLAUDE.md
+docker-compose.yml

@@ -1,5 +1,10 @@
 # Soundpull
 
+[![Tests](https://github.com/Rocho-EL-Locho/soundpull/actions/workflows/ci.yml/badge.svg)](https://github.com/Rocho-EL-Locho/soundpull/actions/workflows/ci.yml)
+[![Build & publish](https://github.com/Rocho-EL-Locho/soundpull/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/Rocho-EL-Locho/soundpull/actions/workflows/docker-publish.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
+
 **Soundpull turns YouTube Music links into properly tagged MP3s.**
 
 Paste a link to an album or a single, and Soundpull downloads it in high quality,
@@ -11,6 +16,12 @@ to your own WebDAV storage**.
 It's a small, self-hosted web app meant to run on your own server. Access is protected
 by **single sign-on (authentik / OIDC)**, and every user gets their own profile, default
 settings and download history.
+
+## Screenshots
+
+| Download | Settings |
+|:--:|:--:|
+| ![Download page](docs/screenshots/download.png) | ![Settings page](docs/screenshots/settings.png) |
 
 ## Features
 
