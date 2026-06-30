@@ -7,8 +7,9 @@ downloads/
 # Legacy reference implementation — not part of Soundpull
 /yt-dlp/
 
-# Local-only project notes (intentionally not shared)
+# Local-only Claude config & notes (intentionally not shared)
 /CLAUDE.md
+/.claude/
 
 # Python
 __pycache__/
