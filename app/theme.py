@@ -3,9 +3,11 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
-from nicegui import ui
+from nicegui import app, ui
 
-from app.auth import current_display_name
+from app.auth import current_display_name, load_user_language, set_user_language
+from app.db import session_scope
+from app.i18n import SUPPORTED_LANGUAGES, current_language, t
 
 _HEAD_CSS = """
 <style>
@@ -50,23 +52,43 @@ def _nav_link(label: str, target: str, key: str, active: str) -> None:
     ui.link(label, target).classes(cls).style("text-decoration:none")
 
 
+def _language_selector() -> None:
+    """Top-bar language switcher; persists the choice and reloads the page."""
+    def _on_change(e) -> None:
+        set_user_language(e.value)
+        ui.navigate.reload()  # re-render every string in the new language
+
+    with ui.row().classes("items-center gap-1"):
+        ui.icon("language").classes("text-white/60")
+        ui.select(SUPPORTED_LANGUAGES, value=current_language(), on_change=_on_change) \
+            .props("dense borderless dark options-dense").classes("text-sm text-white/80") \
+            .tooltip(t("nav.language"))
+
+
 @contextmanager
 def frame(active: str = "download"):
     """Render the app shell and yield the page content container."""
     apply_base_style()
+    # Hydrate the session language from the user's stored preference once.
+    if "lang" not in app.storage.user:
+        with session_scope() as session:
+            app.storage.user["lang"] = load_user_language(session)
+
     with ui.element("div").classes("glass sticky top-0 z-50 w-full"):
         with ui.row().classes("w-full max-w-5xl mx-auto items-center justify-between px-6 py-3"):
             with ui.row().classes("items-center gap-2"):
                 ui.icon("graphic_eq").classes("text-2xl accent-text")
                 ui.label("Soundpull").classes("text-lg font-semibold")
             with ui.row().classes("items-center gap-1"):
-                _nav_link("Download", "/", "download", active)
-                _nav_link("Verlauf", "/history", "history", active)
-                _nav_link("Einstellungen", "/settings", "settings", active)
+                _nav_link(t("nav.download"), "/", "download", active)
+                _nav_link(t("nav.history"), "/history", "history", active)
+                _nav_link(t("nav.settings"), "/settings", "settings", active)
+                ui.element("div").classes("w-px h-6 bg-white/15 mx-2")
+                _language_selector()
                 ui.element("div").classes("w-px h-6 bg-white/15 mx-2")
                 ui.label(current_display_name()).classes("text-sm text-white/70")
                 ui.button(icon="logout", on_click=lambda: ui.navigate.to("/logout")) \
-                    .props("flat round dense").classes("text-white/80")
+                    .props("flat round dense").classes("text-white/80").tooltip(t("nav.logout"))
 
     with ui.column().classes("w-full max-w-3xl mx-auto px-6 py-6 gap-4") as content:
         yield content

@@ -11,8 +11,9 @@ from app.auth import get_current_user
 from app.config import settings as app_settings
 from app.db import session_scope
 from app.genres import ALLOWED_GENRES
+from app.i18n import audio_format_labels, t
 from app.models import UserSettings
-from app.pipeline import AUDIO_FORMAT_LABELS, normalize_audio_format
+from app.pipeline import normalize_audio_format
 from app.security import decrypt_secret, encrypt_secret
 from app.theme import frame
 from app.webdav_util import list_dirs, make_client
@@ -41,44 +42,45 @@ def settings_page() -> None:
             }
 
         with ui.card().classes("glass w-full rounded-2xl p-6 gap-4"):
-            ui.label("Profil & Standardwerte").classes("text-xl font-semibold accent-text")
+            ui.label(t("settings.profile_heading")).classes("text-xl font-semibold accent-text")
             with ui.row().classes("w-full gap-3 items-end"):
-                genre_sel = ui.select(ALLOWED_GENRES, value=snap["genre"], label="Standard-Genre") \
+                genre_sel = ui.select(ALLOWED_GENRES, value=snap["genre"],
+                                      label=t("settings.default_genre")) \
                     .props("outlined dense dark").classes("flex-1 min-w-32")
                 with ui.column().classes("gap-1"):
-                    ui.label("Standard-Modus").classes("text-xs text-white/50")
-                    mode_tgl = ui.toggle({"album": "Album", "single": "Single"}, value=snap["mode"]) \
+                    ui.label(t("settings.default_mode")).classes("text-xs text-white/50")
+                    mode_tgl = ui.toggle({"album": t("common.album"), "single": t("common.single")},
+                                         value=snap["mode"]) \
                         .props("toggle-color=primary unelevated no-caps").classes("glass rounded-lg")
-            audio_sel = ui.select(AUDIO_FORMAT_LABELS, value=snap["audio"],
-                                  label="Standard-Qualität / Format") \
+            audio_sel = ui.select(audio_format_labels(), value=snap["audio"],
+                                  label=t("settings.default_audio")) \
                 .props("outlined dense dark").classes("w-full")
-            dest_sel = ui.select({"browser": "Im Browser (ZIP)", "webdav": "WebDAV"},
-                                 value=snap["dest"], label="Standard-Ziel") \
+            dest_sel = ui.select({"browser": t("dest.browser"), "webdav": t("dest.webdav")},
+                                 value=snap["dest"], label=t("settings.default_dest")) \
                 .props("outlined dense dark").classes("w-full")
 
         with ui.card().classes("glass w-full rounded-2xl p-6 gap-3"):
-            ui.label("WebDAV-Ziel").classes("text-lg font-semibold")
-            ui.label("Basis-URL + Zugangsdaten eingeben, dann verbinden und einen Zielordner "
-                     "auswählen. Das Passwort wird verschlüsselt gespeichert.") \
-                .classes("text-xs text-white/50")
-            wd_url = ui.input("WebDAV-URL (Basis)", value=snap["wd_url"],
+            ui.label(t("settings.webdav_heading")).classes("text-lg font-semibold")
+            ui.label(t("settings.webdav_desc")).classes("text-xs text-white/50")
+            wd_url = ui.input(t("settings.webdav_url_label"), value=snap["wd_url"],
                               placeholder="https://cloud.example.org/remote.php/dav/files/<user>/") \
                 .props("outlined dense dark").classes("w-full")
-            wd_user = ui.input("Benutzername", value=snap["wd_user"]) \
+            wd_user = ui.input(t("settings.username"), value=snap["wd_user"]) \
                 .props("outlined dense dark autocomplete=off").classes("w-full")
-            pw_placeholder = "•••••••• (gesetzt — leer lassen zum Behalten)" if snap["has_pw"] else "Passwort"
+            pw_placeholder = t("settings.password_placeholder_set") if snap["has_pw"] \
+                else t("settings.password")
             # autocomplete=new-password marks this as a field for *setting* a credential, not
             # logging in — stops the browser from proactively offering saved passwords on load
             # (see issue #6). Pairs with autocomplete=off on the username so the two aren't
             # detected as a login form.
-            wd_pass = ui.input("Passwort", password=True, placeholder=pw_placeholder) \
+            wd_pass = ui.input(t("settings.password"), password=True, placeholder=pw_placeholder) \
                 .props("outlined dense dark autocomplete=new-password").classes("w-full")
 
             folder_state = {"path": snap["wd_folder"]}
 
             def _folder_text() -> str:
                 p = folder_state["path"]
-                return f"Zielordner: /{p}" if p else "Zielordner: / (Wurzel)"
+                return t("settings.folder_label", path=p) if p else t("settings.folder_root")
 
             async def _resolve_password() -> str:
                 if (wd_pass.value or "").strip():
@@ -93,7 +95,7 @@ def settings_page() -> None:
                 cur = {"path": folder_state["path"] or ""}
                 dialog = ui.dialog()
                 with dialog, ui.card().classes("glass w-full max-w-md rounded-2xl p-4 gap-2"):
-                    ui.label("WebDAV-Ordner wählen").classes("font-semibold")
+                    ui.label(t("settings.picker_heading")).classes("font-semibold")
                     crumb = ui.label().classes("text-xs text-white/60")
                     lst = ui.column().classes("w-full gap-1 max-h-72 overflow-auto")
 
@@ -112,14 +114,14 @@ def settings_page() -> None:
                             dirs = await run.io_bound(list_dirs, client, cur["path"])
                         except Exception as exc:  # noqa: BLE001
                             with lst:
-                                ui.label(f"Fehler: {exc}").classes("text-red-400 text-sm")
+                                ui.label(t("settings.picker_error", error=exc)).classes("text-red-400 text-sm")
                             return
                         with lst:
                             if cur["path"]:
-                                ui.button("⬑ zurück", on_click=go_up).props("flat dense no-caps") \
-                                    .classes("text-white/80")
+                                ui.button(t("settings.picker_back"), on_click=go_up) \
+                                    .props("flat dense no-caps").classes("text-white/80")
                             if not dirs:
-                                ui.label("(keine Unterordner)").classes("text-white/40 text-sm")
+                                ui.label(t("settings.picker_no_sub")).classes("text-white/40 text-sm")
                             for name, full in dirs:
                                 ui.button(f"📁 {name}", on_click=lambda f=full: enter(f)) \
                                     .props("flat dense no-caps align=left").classes("w-full text-white/90")
@@ -128,11 +130,11 @@ def settings_page() -> None:
                         folder_state["path"] = cur["path"]
                         folder_lbl.text = _folder_text()
                         dialog.close()
-                        ui.notify(f"Ordner gewählt: /{cur['path']}", type="positive")
+                        ui.notify(t("settings.folder_chosen", path=cur["path"]), type="positive")
 
                     with ui.row().classes("w-full justify-end gap-2 pt-2"):
-                        ui.button("Abbrechen", on_click=dialog.close).props("flat")
-                        ui.button("Diesen Ordner wählen", icon="check", on_click=choose) \
+                        ui.button(t("settings.cancel"), on_click=dialog.close).props("flat")
+                        ui.button(t("settings.picker_choose"), icon="check", on_click=choose) \
                             .classes("accent-grad text-white")
                 await load()
                 dialog.open()
@@ -140,22 +142,22 @@ def settings_page() -> None:
             async def browse() -> None:
                 url = (wd_url.value or "").strip()
                 if not url:
-                    ui.notify("Bitte WebDAV-URL angeben", type="warning")
+                    ui.notify(t("settings.notify_need_url"), type="warning")
                     return
                 pw = await _resolve_password()
                 if not pw:
-                    ui.notify("Bitte Passwort angeben", type="warning")
+                    ui.notify(t("settings.notify_need_pw"), type="warning")
                     return
                 try:
                     client = make_client(url, (wd_user.value or "").strip(), pw)
                     await run.io_bound(client.ls, "")
                 except Exception as exc:  # noqa: BLE001
-                    ui.notify(f"Verbindung fehlgeschlagen: {exc}", type="negative")
+                    ui.notify(t("settings.notify_conn_failed", error=exc), type="negative")
                     return
                 await _open_picker(client)
 
             with ui.row().classes("items-center gap-3 flex-wrap"):
-                ui.button("Verbinden & Ordner wählen", icon="folder_open", on_click=browse) \
+                ui.button(t("settings.connect_button"), icon="folder_open", on_click=browse) \
                     .props("unelevated").classes("accent-grad text-white")
                 folder_lbl = ui.label(_folder_text()).classes("text-sm text-white/70")
 
@@ -176,9 +178,9 @@ def settings_page() -> None:
                         row.webdav_password_enc = encrypt_secret(wd_pass.value.strip())
                     row.updated_at = datetime.now(timezone.utc)
                     session.add(row)
-                ui.notify("Einstellungen gespeichert", type="positive")
+                ui.notify(t("settings.saved"), type="positive")
 
-            ui.button("Speichern", icon="save", on_click=save) \
+            ui.button(t("settings.save_button"), icon="save", on_click=save) \
                 .props("unelevated").classes("accent-grad text-white hover-glow self-end px-6")
 
         # Bookmarklet — dragging a javascript: link is blocked in many browsers,
@@ -186,19 +188,19 @@ def settings_page() -> None:
         bm = ("javascript:(()=>{window.open('" + app_settings.app_base_url +
               "/?url='+encodeURIComponent(location.href),'_blank')})()")
         with ui.card().classes("glass w-full rounded-2xl p-6 gap-3"):
-            ui.label("Bookmarklet").classes("text-lg font-semibold")
+            ui.label(t("settings.bookmarklet_heading")).classes("text-lg font-semibold")
             with ui.column().classes("gap-1 text-xs text-white/60"):
-                ui.label("Einmalig einrichten:")
-                ui.label("1. Code unten mit „Code kopieren“ kopieren.")
-                ui.label("2. Neues Lesezeichen anlegen (z. B. Lesezeichen-Manager → Hinzufügen).")
-                ui.label("3. Als Adresse/URL den Code einfügen, Name z. B. „YT Music laden“.")
-                ui.label("4. Auf music.youtube.com das Lesezeichen klicken — öffnet diese App mit der URL.")
+                ui.label(t("settings.bm_setup"))
+                ui.label(t("settings.bm_step1"))
+                ui.label(t("settings.bm_step2"))
+                ui.label(t("settings.bm_step3"))
+                ui.label(t("settings.bm_step4"))
 
             def copy_bm() -> None:
                 ui.clipboard.write(bm)
-                ui.notify("Bookmarklet-Code kopiert", type="positive")
+                ui.notify(t("settings.bm_copied"), type="positive")
 
-            ui.button("Code kopieren", icon="content_copy", on_click=copy_bm) \
+            ui.button(t("settings.bm_copy_button"), icon="content_copy", on_click=copy_bm) \
                 .props("unelevated").classes("accent-grad text-white self-start")
-            ui.textarea("Bookmarklet-Code", value=bm) \
+            ui.textarea(t("settings.bm_code_label"), value=bm) \
                 .props("outlined dense dark readonly autogrow").classes("w-full")

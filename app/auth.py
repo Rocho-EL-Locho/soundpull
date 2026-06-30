@@ -19,6 +19,7 @@ from starlette.responses import RedirectResponse, Response
 
 from app.config import settings
 from app.db import session_scope
+from app.i18n import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES
 from app.models import User, UserSettings
 
 # Routes reachable without authentication.
@@ -74,6 +75,37 @@ def get_current_user(session: Session) -> User | None:
 
 def current_display_name() -> str:
     return app.storage.user.get("name") or app.storage.user.get("email") or "Account"
+
+
+# ─── UI language (per-user, durable in UserSettings.language) ─────────────────
+
+def load_user_language(session: Session) -> str:
+    """The logged-in user's stored UI language, or the default."""
+    user = get_current_user(session)
+    lang = user.settings.language if (user and user.settings) else DEFAULT_LANGUAGE
+    return lang if lang in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
+
+
+def set_user_language(lang: str) -> None:
+    """Persist the chosen UI language for the current user (DB + session).
+
+    The session mirror is set only after the DB write commits, so a failed
+    persist can't leave the session and DB showing different languages.
+    """
+    if lang not in SUPPORTED_LANGUAGES:
+        lang = DEFAULT_LANGUAGE
+    with session_scope() as session:
+        user = get_current_user(session)
+        if user is None:
+            return
+        row = session.exec(select(UserSettings).where(UserSettings.user_id == user.id)).first()
+        if row is None:
+            row = UserSettings(user_id=user.id)
+            session.add(row)
+        row.language = lang
+        row.updated_at = datetime.now(timezone.utc)
+        session.add(row)
+    app.storage.user["lang"] = lang
 
 
 def _safe_redirect_target(raw: str | None) -> str:

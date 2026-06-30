@@ -7,18 +7,20 @@ from nicegui import ui
 
 from app.auth import get_current_user
 from app.db import session_scope
+from app.i18n import t
 from app.models import DownloadHistory
 from app.pipeline import audio_format_short
 from app.theme import frame
 
+# phase → (translation key, color); label resolved per request via t().
 _STATUS = {
-    "done": ("Fertig", "text-emerald-400"),
-    "error": ("Fehler", "text-red-400"),
-    "queued": ("Warteschlange", "text-white/60"),
-    "metadata": ("Läuft", "text-cyan-300"),
-    "download": ("Läuft", "text-cyan-300"),
-    "tags": ("Läuft", "text-cyan-300"),
-    "upload": ("Läuft", "text-cyan-300"),
+    "done": ("history.status_done", "text-emerald-400"),
+    "error": ("history.status_error", "text-red-400"),
+    "queued": ("history.status_queued", "text-white/60"),
+    "metadata": ("history.status_running", "text-cyan-300"),
+    "download": ("history.status_running", "text-cyan-300"),
+    "tags": ("history.status_running", "text-cyan-300"),
+    "upload": ("history.status_running", "text-cyan-300"),
 }
 
 
@@ -42,13 +44,14 @@ def history_page() -> None:
                 "created": r.created_at, "error": r.error,
             } for r in rows]
 
-        ui.label("Verlauf").classes("text-xl font-semibold accent-text")
+        ui.label(t("history.heading")).classes("text-xl font-semibold accent-text")
         if not items:
-            ui.label("Noch keine Downloads.").classes("text-white/40 text-sm")
+            ui.label(t("history.empty")).classes("text-white/40 text-sm")
             return
 
         for it in items:
-            label, color = _STATUS.get(it["phase"], ("?", "text-white/60"))
+            key, color = _STATUS.get(it["phase"], ("history.status_unknown", "text-white/60"))
+            label = t(key)
             with ui.card().classes("glass w-full rounded-xl p-4 gap-1"):
                 with ui.row().classes("w-full items-center justify-between"):
                     with ui.column().classes("gap-0 min-w-0"):

@@ -40,6 +40,7 @@ class UserSettings(SQLModel, table=True):
     # Audio quality/format key (validated in app.pipeline.AUDIO_FORMATS).
     default_audio_format: str = "mp3_320"
     destination_type: str = "browser"  # browser (ZIP download) | webdav (direct upload)
+    language: str = "de"  # UI language code ("de" | "en"); see app.i18n.SUPPORTED_LANGUAGES
 
     webdav_url: str | None = None          # connection base URL
     webdav_folder: str | None = None       # chosen target sub-folder (relative to base)

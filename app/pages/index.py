@@ -8,22 +8,10 @@ from nicegui import ui
 from app.auth import get_current_user
 from app.db import session_scope
 from app.genres import ALLOWED_GENRES, DEFAULT_GENRE
+from app.i18n import audio_format_labels, t
 from app.jobs import JobState, get_user_jobs, start_job
-from app.pipeline import (
-    AUDIO_FORMAT_LABELS, DEFAULT_AUDIO_FORMAT, is_supported_url, normalize_audio_format,
-)
+from app.pipeline import is_supported_url, normalize_audio_format
 from app.theme import frame
-
-PHASE_LABELS = {
-    "queued": "Warteschlange",
-    "metadata": "Metadaten",
-    "download": "Download",
-    "tags": "Tags & Cover",
-    "packaging": "ZIP packen",
-    "upload": "WebDAV-Upload",
-    "done": "Fertig",
-    "error": "Fehler",
-}
 
 
 def _phase_order(js: JobState) -> list[str]:
@@ -58,22 +46,23 @@ def _job_card(js: JobState, delivered: set[str]) -> None:
                     with ui.row().classes("items-center gap-1"):
                         ui.icon(icon).classes(f"{color} text-base")
                         text_color = "text-white/80" if i <= cur_idx else "text-white/40"
-                        ui.label(PHASE_LABELS[p]).classes(f"text-xs {text_color}")
+                        ui.label(t(f"phase.{p}")).classes(f"text-xs {text_color}")
                     if i < len(order) - 1:
                         ui.element("div").classes("w-4 h-px bg-white/15")
 
         if js.phase == "download" and js.total_tracks:
             ui.linear_progress(value=js.current_track / js.total_tracks, show_value=False) \
                 .props("rounded color=primary").classes("w-full")
-            ui.label(f"Track {js.current_track} / {js.total_tracks}").classes("text-xs text-white/60")
+            ui.label(t("index.track", current=js.current_track, total=js.total_tracks)) \
+                .classes("text-xs text-white/60")
 
         if js.phase == "error":
-            ui.label(js.error or "Unbekannter Fehler").classes("text-red-400 text-sm")
+            ui.label(js.error or t("index.unknown_error")).classes("text-red-400 text-sm")
         elif js.phase == "done":
             with ui.row().classes("items-center gap-3"):
-                ui.label("Abgeschlossen ✓").classes("text-emerald-400 text-sm")
+                ui.label(t("index.completed")).classes("text-emerald-400 text-sm")
                 if js.result_path:
-                    ui.button("ZIP herunterladen", icon="download",
+                    ui.button(t("index.download_zip"), icon="download",
                               on_click=lambda p=js.result_path, n=js.result_name: ui.download.file(p, n)) \
                         .props("unelevated dense").classes("accent-grad text-white")
                 elif js.destination_type == "webdav" and js.summary:
@@ -110,50 +99,51 @@ def index_page(url: str = "") -> None:
         def render_jobs() -> None:
             jobs = get_user_jobs(uid)
             if not jobs:
-                ui.label("Keine aktiven Downloads.").classes("text-white/40 text-sm")
+                ui.label(t("index.no_active")).classes("text-white/40 text-sm")
                 return
             for js in jobs:
                 _job_card(js, delivered)
 
         with ui.card().classes("glass w-full rounded-2xl p-6 gap-4"):
-            ui.label("Neuer Download").classes("text-xl font-semibold accent-text")
-            url_in = ui.input("YouTube Music URL", value=url,
+            ui.label(t("index.heading_new")).classes("text-xl font-semibold accent-text")
+            url_in = ui.input(t("index.url_label"), value=url,
                               placeholder="https://music.youtube.com/...") \
                 .props("outlined dense dark").classes("w-full")
             with ui.row().classes("w-full gap-3 items-end"):
-                genre_sel = ui.select(ALLOWED_GENRES, value=d_genre, label="Genre") \
+                genre_sel = ui.select(ALLOWED_GENRES, value=d_genre, label=t("index.genre_label")) \
                     .props("outlined dense dark").classes("flex-1 min-w-32")
                 with ui.column().classes("gap-1"):
-                    ui.label("Modus").classes("text-xs text-white/50")
-                    mode_tgl = ui.toggle({"album": "Album", "single": "Single"}, value=d_mode) \
+                    ui.label(t("index.mode_label")).classes("text-xs text-white/50")
+                    mode_tgl = ui.toggle({"album": t("common.album"), "single": t("common.single")},
+                                         value=d_mode) \
                         .props("toggle-color=primary unelevated no-caps").classes("glass rounded-lg")
-            audio_sel = ui.select(AUDIO_FORMAT_LABELS, value=d_audio, label="Qualität / Format") \
+            audio_sel = ui.select(audio_format_labels(), value=d_audio, label=t("index.audio_label")) \
                 .props("outlined dense dark").classes("w-full")
-            dest_label = "WebDAV" if has_webdav else "WebDAV (nicht konfiguriert)"
-            dest_sel = ui.select({"browser": "Im Browser (ZIP)", "webdav": dest_label}, value=d_dest,
-                                 label="Ziel").props("outlined dense dark").classes("w-full")
+            dest_label = t("dest.webdav") if has_webdav else t("dest.webdav_unconfigured")
+            dest_sel = ui.select({"browser": t("dest.browser"), "webdav": dest_label}, value=d_dest,
+                                 label=t("index.dest_label")).props("outlined dense dark").classes("w-full")
 
             def start() -> None:
                 target = (url_in.value or "").strip()
                 if not target:
-                    ui.notify("Bitte eine URL angeben", type="warning")
+                    ui.notify(t("index.notify_need_url"), type="warning")
                     return
                 if not is_supported_url(target):
-                    ui.notify("Keine gültige YouTube-(Music-)URL", type="warning")
+                    ui.notify(t("index.notify_bad_url"), type="warning")
                     return
                 try:
                     start_job(user_id=uid, url=target, genre=genre_sel.value,
                               mode=mode_tgl.value, destination_type=dest_sel.value,
                               audio_format=audio_sel.value)
-                    ui.notify("Download gestartet", type="positive")
+                    ui.notify(t("index.notify_started"), type="positive")
                     url_in.value = ""
                     render_jobs.refresh()
                 except Exception as exc:  # noqa: BLE001 - show config/validation errors
                     ui.notify(str(exc), type="negative")
 
-            ui.button("Download starten", icon="download", on_click=start) \
+            ui.button(t("index.start_button"), icon="download", on_click=start) \
                 .props("unelevated").classes("accent-grad text-white hover-glow self-end px-6")
 
-        ui.label("Aktive Downloads").classes("text-xs uppercase tracking-widest text-white/50 mt-2")
+        ui.label(t("index.active_heading")).classes("text-xs uppercase tracking-widest text-white/50 mt-2")
         render_jobs()
         ui.timer(1.0, render_jobs.refresh)
