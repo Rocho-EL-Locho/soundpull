@@ -1,8 +1,8 @@
 name: Build and publish Docker image
 
 on:
+  # Build/publish only on a version tag (vX.Y.Z) — i.e. a new release.
   push:
-    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -11,7 +11,21 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install
+        run: pip install ".[test]"
+      - name: Run tests
+        run: pytest -q
+
   build-and-push:
+    needs: test          # only build/publish once the tests are green
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -35,12 +49,13 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # latest=auto → a (non-prerelease) version tag also re-points :latest.
+          flavor: |
+            latest=auto
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,format=short
-            type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
 
       - name: Build and push
         uses: docker/build-push-action@v7
