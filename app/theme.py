@@ -65,6 +65,24 @@ def _language_selector() -> None:
             .tooltip(t("nav.language"))
 
 
+def tag_option_switches(values) -> dict:
+    """Render the six metadata-field switches (issue #7), prefilled from `values`
+    (a `fix_music_tags.TagOptions`). Returns ``{field_name: ui.switch}``.
+
+    Shared by the settings and download pages so the two can't drift; iterates
+    `TAG_OPTION_FIELDS`, labelling each via the ``meta.<field>`` i18n key.
+    """
+    from app.fix_music_tags import TAG_OPTION_FIELDS  # lazy: keep mutagen off theme import
+
+    switches: dict = {}
+    ui.label(t("meta.desc")).classes("text-xs text-white/50")
+    with ui.row().classes("w-full gap-x-8 gap-y-1 flex-wrap"):
+        for f in TAG_OPTION_FIELDS:
+            switches[f] = ui.switch(t(f"meta.{f}"), value=bool(getattr(values, f))) \
+                .props("dense color=primary").classes("text-sm")
+    return switches
+
+
 @contextmanager
 def frame(active: str = "download"):
     """Render the app shell and yield the page content container."""

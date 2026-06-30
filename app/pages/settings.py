@@ -10,12 +10,13 @@ from nicegui import run, ui
 from app.auth import get_current_user
 from app.config import settings as app_settings
 from app.db import session_scope
+from app.fix_music_tags import TAG_OPTION_FIELDS, TagOptions
 from app.genres import ALLOWED_GENRES
 from app.i18n import audio_format_labels, t
 from app.models import UserSettings
 from app.pipeline import normalize_audio_format
 from app.security import decrypt_secret, encrypt_secret
-from app.theme import frame
+from app.theme import frame, tag_option_switches
 from app.webdav_util import list_dirs, make_client
 
 
@@ -37,6 +38,7 @@ def settings_page() -> None:
             snap = {
                 "genre": us.default_genre, "mode": us.default_mode, "dest": dest,
                 "audio": normalize_audio_format(us.default_audio_format),
+                "tags": {f: bool(getattr(us, f"tag_{f}")) for f in TAG_OPTION_FIELDS},
                 "wd_url": us.webdav_url or "", "wd_user": us.webdav_username or "",
                 "wd_folder": us.webdav_folder or "", "has_pw": us.has_webdav_password,
             }
@@ -58,6 +60,10 @@ def settings_page() -> None:
             dest_sel = ui.select({"browser": t("dest.browser"), "webdav": t("dest.webdav")},
                                  value=snap["dest"], label=t("settings.default_dest")) \
                 .props("outlined dense dark").classes("w-full")
+
+        with ui.card().classes("glass w-full rounded-2xl p-6 gap-3"):
+            ui.label(t("meta.heading")).classes("text-lg font-semibold")
+            tag_switches = tag_option_switches(TagOptions(**snap["tags"]))
 
         with ui.card().classes("glass w-full rounded-2xl p-6 gap-3"):
             ui.label(t("settings.webdav_heading")).classes("text-lg font-semibold")
@@ -171,6 +177,8 @@ def settings_page() -> None:
                     row.default_mode = mode_tgl.value
                     row.default_audio_format = audio_sel.value
                     row.destination_type = dest_sel.value
+                    for field, switch in tag_switches.items():
+                        setattr(row, f"tag_{field}", bool(switch.value))
                     row.webdav_url = (wd_url.value or "").strip() or None
                     row.webdav_folder = folder_state["path"] or None
                     row.webdav_username = (wd_user.value or "").strip() or None

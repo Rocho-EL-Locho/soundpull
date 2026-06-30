@@ -7,11 +7,12 @@ from nicegui import ui
 
 from app.auth import get_current_user
 from app.db import session_scope
+from app.fix_music_tags import TagOptions
 from app.genres import ALLOWED_GENRES, DEFAULT_GENRE
 from app.i18n import audio_format_labels, t
-from app.jobs import JobState, get_user_jobs, start_job
+from app.jobs import JobState, get_user_jobs, start_job, tag_options_from_settings
 from app.pipeline import is_supported_url, normalize_audio_format
-from app.theme import frame
+from app.theme import frame, tag_option_switches
 
 
 def _phase_order(js: JobState) -> list[str]:
@@ -88,6 +89,7 @@ def index_page(url: str = "") -> None:
             d_genre = us.default_genre if us else DEFAULT_GENRE
             d_mode = us.default_mode if us else "album"
             d_audio = normalize_audio_format(us.default_audio_format if us else None)
+            d_tags = tag_options_from_settings(us)
             d_dest = us.destination_type if us else "browser"
             if d_dest not in ("browser", "webdav"):
                 d_dest = "browser"
@@ -123,6 +125,11 @@ def index_page(url: str = "") -> None:
             dest_sel = ui.select({"browser": t("dest.browser"), "webdav": dest_label}, value=d_dest,
                                  label=t("index.dest_label")).props("outlined dense dark").classes("w-full")
 
+            with ui.expansion(t("meta.heading"), icon="tune").classes("w-full glass rounded-lg") \
+                    .props("dense"):
+                with ui.column().classes("w-full gap-1 p-2"):
+                    tag_switches = tag_option_switches(d_tags)
+
             def start() -> None:
                 target = (url_in.value or "").strip()
                 if not target:
@@ -132,9 +139,10 @@ def index_page(url: str = "") -> None:
                     ui.notify(t("index.notify_bad_url"), type="warning")
                     return
                 try:
+                    chosen_tags = TagOptions(**{f: bool(sw.value) for f, sw in tag_switches.items()})
                     start_job(user_id=uid, url=target, genre=genre_sel.value,
                               mode=mode_tgl.value, destination_type=dest_sel.value,
-                              audio_format=audio_sel.value)
+                              audio_format=audio_sel.value, tag_options=chosen_tags)
                     ui.notify(t("index.notify_started"), type="positive")
                     url_in.value = ""
                     render_jobs.refresh()
