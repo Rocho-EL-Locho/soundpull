@@ -9,6 +9,7 @@ from app.auth import get_current_user
 from app.db import session_scope
 from app.genres import ALLOWED_GENRES, DEFAULT_GENRE
 from app.jobs import JobState, get_user_jobs, start_job
+from app.pipeline import is_supported_url
 from app.theme import frame
 
 PHASE_LABELS = {
@@ -132,7 +133,7 @@ def index_page(url: str = "") -> None:
                 if not target:
                     ui.notify("Bitte eine URL angeben", type="warning")
                     return
-                if "youtube.com" not in target:
+                if not is_supported_url(target):
                     ui.notify("Keine gültige YouTube-(Music-)URL", type="warning")
                     return
                 try:

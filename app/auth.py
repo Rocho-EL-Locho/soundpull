@@ -8,7 +8,7 @@ routes, middleware and pages.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlparse
 
 from authlib.integrations.starlette_client import OAuth, OAuthError
 from nicegui import app
@@ -77,10 +77,20 @@ def current_display_name() -> str:
 
 
 def _safe_redirect_target(raw: str | None) -> str:
-    """Only allow local relative paths (open-redirect guard)."""
-    if raw and raw.startswith("/") and not raw.startswith("//"):
-        return raw
-    return "/"
+    """Only allow local relative paths (open-redirect guard).
+
+    Rejects protocol-relative (`//host`) and backslash variants (`/\\host`, which
+    several browsers normalise to `//host`), plus anything carrying a scheme/host
+    or control characters.
+    """
+    if not raw or not raw.startswith("/") or raw.startswith("//"):
+        return "/"
+    if any(c in raw for c in "\\\t\n\r"):
+        return "/"
+    parsed = urlparse(raw)
+    if parsed.scheme or parsed.netloc:
+        return "/"
+    return raw
 
 
 # ─── Route handlers (registered on the NiceGUI FastAPI app) ──────────────────
@@ -95,8 +105,14 @@ def init_auth() -> None:
         )
 
         # Dev fallback: no OIDC configured → log in a local dev user so the UI
-        # can be exercised without an authentik instance.
+        # can be exercised without an authentik instance. Only ever on a local
+        # deployment — otherwise this would be an open door (see config.py).
         if not settings.oidc_configured:
+            if not settings.dev_login_allowed:
+                return Response(
+                    "Server-Fehlkonfiguration: OIDC ist nicht eingerichtet.",
+                    status_code=503,
+                )
             with session_scope() as session:
                 user = upsert_user(session, {"sub": "dev-user", "name": "Dev User",
                                              "email": "dev@example.org",

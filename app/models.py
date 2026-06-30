@@ -61,7 +61,7 @@ class DownloadHistory(SQLModel, table=True):
     url: str
     genre: str
     mode: str  # album | single
-    destination_type: str  # local | webdav
+    destination_type: str  # browser | webdav
 
     artist: str | None = None
     album: str | None = None

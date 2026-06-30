@@ -137,8 +137,8 @@ def settings_page() -> None:
                 if not pw:
                     ui.notify("Bitte Passwort angeben", type="warning")
                     return
-                client = make_client(url, (wd_user.value or "").strip(), pw)
                 try:
+                    client = make_client(url, (wd_user.value or "").strip(), pw)
                     await run.io_bound(client.ls, "")
                 except Exception as exc:  # noqa: BLE001
                     ui.notify(f"Verbindung fehlgeschlagen: {exc}", type="negative")

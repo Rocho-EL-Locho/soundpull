@@ -35,5 +35,9 @@ COPY --from=builder --chown=65532:65532 /runtime/data /data
 COPY --from=builder --chown=65532:65532 /runtime/downloads /downloads
 
 EXPOSE 8080
+# Liveness probe. Distroless has no shell, so call the interpreter directly
+# (HEALTHCHECK's exec form does not go through ENTRYPOINT).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD ["/usr/bin/python3.11", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status==200 else 1)"]
 # The distroless python3 image's entrypoint IS the interpreter, so CMD = args.
 CMD ["-m", "app.main"]
