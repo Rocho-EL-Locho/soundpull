@@ -11,12 +11,14 @@
 
 **Soundpull turns YouTube Music links into properly tagged audio — MP3 or the original Opus/M4A.**
 
-Paste a link to an album or a single, and Soundpull downloads it in the quality and format
-you choose (MP3 320 / 192 kbps, or the original Opus/M4A stream with no re-encode), cleans up
-the metadata (artist, album artist, title, track number, genre, square cover art) so it looks
-right in music servers like [Navidrome](https://www.navidrome.org/) — and you decide which of
-those fields it actually writes. It then hands the result to you either as a **ZIP download in
-your browser** or by uploading it **straight to your own WebDAV storage**.
+Paste a link to an album, single or playlist, and Soundpull downloads it in the quality and
+format you choose (MP3 320 / 192 kbps, or the original Opus/M4A stream with no re-encode),
+cleans up the metadata (artist, album artist, title, track number, genre, square cover art)
+so it looks right in music servers like [Navidrome](https://www.navidrome.org/) — and you
+decide which of those fields it actually writes. It then hands the result to you either as a
+**ZIP download in your browser** or by uploading it **straight to your own WebDAV storage**.
+Playlists can even be **subscribed** so Soundpull re-syncs them on a schedule, pulling in
+only the tracks you don't already have.
 
 It's a small, self-hosted web app meant to run on your own server. Access is protected
 by **single sign-on (authentik / OIDC)**, and every user gets their own profile, default
@@ -31,6 +33,10 @@ settings and download history.
 ## Features
 
 - 🎵 **Albums & singles** — paste any YouTube Music URL
+- 📃 **Playlists** — download a whole playlist as a Navidrome-importable `.m3u8`; each track
+  keeps its own tags, and you can pick **“no genre”** so mixed-artist lists aren't forced to one
+- 🔁 **Playlist sync (subscriptions)** — subscribe a playlist and Soundpull re-syncs it on a
+  configurable interval to your WebDAV, fetching **only tracks not already on your server**
 - 🎚️ **Choose quality & format** — MP3 320 or 192 kbps, or the **original** Opus/M4A stream
   with no re-encode (best fidelity, smallest file)
 - 🏷️ **Clean, consistent tags** — feat. artists, album artist, title cleanup, track number,
@@ -59,6 +65,11 @@ Browser ──HTTPS──▶ Reverse proxy ──▶ Soundpull (web app)
 
 Under the hood it drives [yt-dlp](https://github.com/yt-dlp/yt-dlp) for the download and a
 dedicated tagging step for the metadata. Built with [NiceGUI](https://nicegui.io/) (Python).
+
+For playlist subscriptions, an in-process scheduler periodically checks which subscriptions
+are due and re-syncs them. Soundpull keeps a per-user index of what it has delivered to your
+server (by artist + title, seedable by scanning your WebDAV target), so each sync downloads
+only the newly added tracks instead of the whole playlist.
 
 ## Quick start (Docker)
 
@@ -100,20 +111,38 @@ Set via environment / `.env` (see `.env.example`):
 | `DATABASE_URL` | SQLite database location (default `sqlite:///./data/app.db`) |
 | `LOCAL_MUSIC_ROOT` | Staging/temp directory for downloads |
 | `MAX_CONCURRENT_DOWNLOADS` | How many downloads run at once |
+| `MAX_PLAYLIST_ITEMS` | *(optional)* Cap on tracks fetched from one playlist (0 = unlimited) |
+| `SYNC_ENABLED` | *(optional)* Enable the background playlist-sync scheduler (default on) |
+| `SYNC_TICK_SECONDS` | *(optional)* How often the scheduler checks for due subscriptions |
 | `WEBDAV_ALLOWED_HOSTS` | *(optional)* SSRF guard: comma-separated allowlist of WebDAV hosts (empty = no restriction) |
 
 ## Usage
 
 1. Open the app and sign in.
 2. Paste a YouTube Music URL (or use the bookmarklet from **Settings**).
-3. Pick the audio quality/format, genre, album/single, and the destination (browser ZIP or
-   WebDAV) — and, if you like, expand **Metadata fields** to override which tags get written
-   for this download.
+3. Pick the audio quality/format, genre, mode (album / single / playlist), and the destination
+   (browser ZIP or WebDAV) — and, if you like, expand **Metadata fields** to override which
+   tags get written for this download.
 4. Start — follow the live progress; the ZIP download starts automatically when done.
 
 In **Settings** you set your defaults (genre, quality/format, destination, and which metadata
 fields to write), pick the interface language, and, for WebDAV, connect and browse to a target
 folder. Your WebDAV password is stored encrypted.
+
+### Playlist sync (subscriptions)
+
+Under **Subscriptions** you can have Soundpull keep a playlist up to date automatically. Add a
+playlist URL, choose how often to sync (e.g. every 6/12/24 h or weekly), and pick what the
+first run should do:
+
+- **Download everything now** — fetch the whole playlist immediately, then only new tracks after.
+- **Mark as already present** — treat the current playlist as already on your server (no
+  download), so only tracks added *later* are pulled in.
+
+Subscriptions deliver to WebDAV, so a WebDAV target must be configured first. To recognise
+tracks you already have (e.g. downloaded before subscribing), use **Settings → Scan server**
+once to index your existing library. Each subscription shows its live status, last sync and
+how many new tracks it added.
 
 ### YouTube cookie (for restricted tracks)
 
