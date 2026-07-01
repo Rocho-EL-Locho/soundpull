@@ -184,6 +184,24 @@ def settings_page() -> None:
                     .props("unelevated").classes("accent-grad text-white")
                 folder_lbl = ui.label(_folder_text()).classes("text-sm text-white/70")
 
+            # Server library scan (issue #21): index tracks already on the server so
+            # playlist sync only fetches new ones. Runs off-thread (WebDAV walk is I/O).
+            ui.label(t("settings.scan_desc")).classes("text-xs text-white/50")
+
+            async def scan_server() -> None:
+                from app import library_index
+
+                ui.notify(t("settings.scan_running"), type="ongoing")
+                try:
+                    added = await run.io_bound(library_index.scan_webdav, uid)
+                except Exception as exc:  # noqa: BLE001 - surface config/connection errors
+                    ui.notify(t("settings.scan_error", error=exc), type="negative")
+                    return
+                ui.notify(t("settings.scan_done", count=added), type="positive")
+
+            ui.button(t("settings.scan_button"), icon="cloud_sync", on_click=scan_server) \
+                .props("outline").classes("text-white/90 self-start")
+
             def save() -> None:
                 with session_scope() as session:
                     row = session.exec(select(UserSettings).where(UserSettings.user_id == uid)).first()

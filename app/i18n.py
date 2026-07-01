@@ -24,6 +24,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         # nav / app shell
         "nav.download": "Download",
         "nav.history": "Verlauf",
+        "nav.subscriptions": "Abos",
         "nav.settings": "Einstellungen",
         "nav.logout": "Abmelden",
         "nav.language": "Sprache",
@@ -31,6 +32,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "common.album": "Album",
         "common.single": "Single",
         "common.playlist": "Playlist",
+        "genre.none": "Kein Genre",
         "dest.browser": "Im Browser (ZIP)",
         "dest.webdav": "WebDAV",
         "dest.webdav_unconfigured": "WebDAV (nicht konfiguriert)",
@@ -130,11 +132,54 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "settings.bm_copied": "Bookmarklet-Code kopiert",
         "settings.bm_copy_button": "Code kopieren",
         "settings.bm_code_label": "Bookmarklet-Code",
+        # Server-Bestand einlesen (issue #21)
+        "settings.scan_heading": "Server-Bestand",
+        "settings.scan_desc": "Einmal den WebDAV-Zielordner durchsuchen und vorhandene "
+                              "Titel erfassen. Damit erkennt der Playlist-Sync, welche "
+                              "Titel schon auf dem Server liegen, und lädt nur neue.",
+        "settings.scan_button": "Server einlesen",
+        "settings.scan_running": "Server wird eingelesen …",
+        "settings.scan_done": "{count} neue Titel im Bestand erfasst",
+        "settings.scan_error": "Einlesen fehlgeschlagen: {error}",
+        # Playlist-Abos (issue #21)
+        "subs.heading_new": "Neues Playlist-Abo",
+        "subs.desc": "Eine Playlist in einem Intervall automatisch synchronisieren. "
+                     "Jeder Lauf lädt nur Titel, die noch nicht auf dem Server liegen.",
+        "subs.no_webdav": "Für Abos muss zuerst ein WebDAV-Ziel in den Einstellungen "
+                          "hinterlegt werden.",
+        "subs.url_label": "Playlist-URL",
+        "subs.interval_label": "Intervall",
+        "subs.interval_6h": "Alle 6 Stunden",
+        "subs.interval_12h": "Alle 12 Stunden",
+        "subs.interval_daily": "Täglich",
+        "subs.interval_weekly": "Wöchentlich",
+        "subs.initial_label": "Erster Lauf",
+        "subs.initial_download_all": "Jetzt alles laden",
+        "subs.initial_mark_existing": "Als vorhanden markieren",
+        "subs.create_button": "Abo anlegen",
+        "subs.list_heading": "Meine Abos",
+        "subs.empty": "Noch keine Abos.",
+        "subs.every_hours": "Alle {hours} h",
+        "subs.enabled": "Aktiv",
+        "subs.sync_now": "Jetzt synchronisieren",
+        "subs.delete": "Löschen",
+        "subs.last_sync_never": "Noch nie synchronisiert",
+        "subs.last_sync": "Zuletzt: {when} · {count} neu",
+        "subs.status_ok": "OK",
+        "subs.status_error": "Fehler",
+        "subs.status_idle": "Wartet",
+        "subs.status_running": "Läuft",
+        "subs.notify_need_url": "Bitte eine Playlist-URL angeben",
+        "subs.notify_bad_url": "Keine gültige YouTube-(Music-)URL",
+        "subs.notify_created": "Abo angelegt",
+        "subs.notify_deleted": "Abo gelöscht",
+        "subs.notify_sync_started": "Synchronisierung gestartet",
     },
     "en": {
         # nav / app shell
         "nav.download": "Download",
         "nav.history": "History",
+        "nav.subscriptions": "Subscriptions",
         "nav.settings": "Settings",
         "nav.logout": "Log out",
         "nav.language": "Language",
@@ -142,6 +187,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "common.album": "Album",
         "common.single": "Single",
         "common.playlist": "Playlist",
+        "genre.none": "No genre",
         "dest.browser": "In browser (ZIP)",
         "dest.webdav": "WebDAV",
         "dest.webdav_unconfigured": "WebDAV (not configured)",
@@ -240,6 +286,48 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "settings.bm_copied": "Bookmarklet code copied",
         "settings.bm_copy_button": "Copy code",
         "settings.bm_code_label": "Bookmarklet code",
+        # Server library scan (issue #21)
+        "settings.scan_heading": "Server library",
+        "settings.scan_desc": "Scan the WebDAV target folder once and index existing "
+                              "tracks. This lets playlist sync recognise which titles are "
+                              "already on the server and fetch only new ones.",
+        "settings.scan_button": "Scan server",
+        "settings.scan_running": "Scanning server …",
+        "settings.scan_done": "Indexed {count} new tracks",
+        "settings.scan_error": "Scan failed: {error}",
+        # Playlist subscriptions (issue #21)
+        "subs.heading_new": "New playlist subscription",
+        "subs.desc": "Automatically sync a playlist on an interval. Each run downloads "
+                     "only tracks that aren't on the server yet.",
+        "subs.no_webdav": "Subscriptions require a WebDAV target — configure one in "
+                          "Settings first.",
+        "subs.url_label": "Playlist URL",
+        "subs.interval_label": "Interval",
+        "subs.interval_6h": "Every 6 hours",
+        "subs.interval_12h": "Every 12 hours",
+        "subs.interval_daily": "Daily",
+        "subs.interval_weekly": "Weekly",
+        "subs.initial_label": "First run",
+        "subs.initial_download_all": "Download everything now",
+        "subs.initial_mark_existing": "Mark as already present",
+        "subs.create_button": "Create subscription",
+        "subs.list_heading": "My subscriptions",
+        "subs.empty": "No subscriptions yet.",
+        "subs.every_hours": "Every {hours} h",
+        "subs.enabled": "Enabled",
+        "subs.sync_now": "Sync now",
+        "subs.delete": "Delete",
+        "subs.last_sync_never": "Never synced",
+        "subs.last_sync": "Last: {when} · {count} new",
+        "subs.status_ok": "OK",
+        "subs.status_error": "Error",
+        "subs.status_idle": "Idle",
+        "subs.status_running": "Running",
+        "subs.notify_need_url": "Please enter a playlist URL",
+        "subs.notify_bad_url": "Not a valid YouTube (Music) URL",
+        "subs.notify_created": "Subscription created",
+        "subs.notify_deleted": "Subscription deleted",
+        "subs.notify_sync_started": "Sync started",
     },
 }
 
@@ -284,3 +372,15 @@ def audio_format_labels() -> dict[str, str]:
     from app.pipeline import AUDIO_FORMATS
 
     return {key: t(f"audio.{key}") for key in AUDIO_FORMATS}
+
+
+def genre_options() -> dict[str, str]:
+    """`{genre: label}` for the genre selects, plus a "no genre" choice (issue #21).
+
+    The genre names come from `app.genres.ALLOWED_GENRES` (label == value); the extra
+    empty-string entry lets a download/playlist opt out of forcing a genre. `t()` is
+    only used for the translated "no genre" label, so this stays render-time.
+    """
+    from app.genres import ALLOWED_GENRES
+
+    return {g: g for g in ALLOWED_GENRES} | {"": t("genre.none")}

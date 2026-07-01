@@ -65,3 +65,22 @@ def test_reconcile_is_idempotent(tmp_path):
     reconcile_columns(engine)  # second run must be a harmless no-op
     after = {c["name"] for c in inspect(engine).get_columns("usersettings")}
     assert before == after
+
+
+def test_init_db_creates_issue21_tables(tmp_path):
+    # The playlist interval-sync tables (issue #21) must be created on an old on-disk
+    # DB that predates them — create_all adds the missing tables in full.
+    from sqlmodel import SQLModel
+
+    engine = _old_db(tmp_path)  # a DB without servertrack / playlistsubscription
+    SQLModel.metadata.create_all(engine)
+    reconcile_columns(engine)
+
+    tables = set(inspect(engine).get_table_names())
+    assert {"servertrack", "playlistsubscription"} <= tables
+
+    st_cols = {c["name"] for c in inspect(engine).get_columns("servertrack")}
+    assert {"user_id", "artist_norm", "title_norm"} <= st_cols
+    ps_cols = {c["name"] for c in inspect(engine).get_columns("playlistsubscription")}
+    assert {"url", "interval_hours", "enabled", "initial_mode", "playlist_files",
+            "last_synced_at", "last_new_count"} <= ps_cols
