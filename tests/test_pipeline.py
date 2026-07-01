@@ -8,6 +8,7 @@ from app.pipeline import (
     _ALBUM_FLAGS,
     _SINGLE_FLAGS,
     _apply_audio_format,
+    _apply_cookie_policy,
     _apply_tag_options,
     _build_ydl_opts,
     _primary_artist,
@@ -143,6 +144,29 @@ def test_safe_segment_blocks_traversal():
     assert _safe_segment("../../etc") == ".._.._etc"
     assert _safe_segment("  ") == "Unbekannt"
     assert _safe_segment("Drake") == "Drake"          # legitimate names untouched
+
+
+def test_default_download_opts_use_no_cookies():
+    # Without a user cookie, yt-dlp must use NO cookies — neither a server file nor
+    # a browser store on the server (issue #9).
+    for flags in (_ALBUM_FLAGS, _SINGLE_FLAGS):
+        opts = _build_ydl_opts(flags + _OUT)
+        assert opts.get("cookiefile") is None
+        assert opts.get("cookiesfrombrowser") is None
+
+
+def test_apply_cookie_policy_pins_user_cookie_and_forbids_browser():
+    # No user cookie → cookiefile stays None, browser store forced off.
+    opts = {}
+    _apply_cookie_policy(opts, None)
+    assert opts["cookiefile"] is None
+    assert opts["cookiesfrombrowser"] is None
+
+    # User cookie present → exactly that file is used, still no browser store.
+    opts = {"cookiesfrombrowser": ("firefox",)}  # even if something set it, we override
+    _apply_cookie_policy(opts, "/work/job.cookies.txt")
+    assert opts["cookiefile"] == "/work/job.cookies.txt"
+    assert opts["cookiesfrombrowser"] is None
 
 
 def test_write_cookie_file_none_when_empty():
