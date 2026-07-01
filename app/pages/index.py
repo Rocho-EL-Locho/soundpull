@@ -116,8 +116,8 @@ def index_page(url: str = "") -> None:
                     .props("outlined dense dark").classes("flex-1 min-w-32")
                 with ui.column().classes("gap-1"):
                     ui.label(t("index.mode_label")).classes("text-xs text-white/50")
-                    mode_tgl = ui.toggle({"album": t("common.album"), "single": t("common.single")},
-                                         value=d_mode) \
+                    mode_tgl = ui.toggle({"album": t("common.album"), "single": t("common.single"),
+                                          "playlist": t("common.playlist")}, value=d_mode) \
                         .props("toggle-color=primary unelevated no-caps").classes("glass rounded-lg")
             audio_sel = ui.select(audio_format_labels(), value=d_audio, label=t("index.audio_label")) \
                 .props("outlined dense dark").classes("w-full")

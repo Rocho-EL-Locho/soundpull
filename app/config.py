@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./data/app.db"
     local_music_root: str = "./downloads"
     max_concurrent_downloads: int = 2
+    # Cap on tracks fetched from a single playlist (issue #11). 0 = unlimited.
+    max_playlist_items: int = 100
 
     # Optional SSRF guard: comma-separated host allowlist for WebDAV targets.
     # Empty = no restriction (any host the server can reach is allowed).

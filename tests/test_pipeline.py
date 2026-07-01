@@ -1,11 +1,17 @@
 """Guards metadata parity: parse_options must turn the original flag lists into
 the exact yt-dlp options the bash scripts produced."""
+import shutil
 import stat
+import subprocess
+
+import pytest
+import yt_dlp
 
 from app.fix_music_tags import TagOptions
 from app.pipeline import (
     DEFAULT_AUDIO_FORMAT,
     _ALBUM_FLAGS,
+    _PLAYLIST_TRACK_TMPL,
     _SINGLE_FLAGS,
     _apply_audio_format,
     _apply_cookie_policy,
@@ -13,12 +19,30 @@ from app.pipeline import (
     _build_ydl_opts,
     _primary_artist,
     _safe_segment,
+    _square_crop_jpeg,
     _write_cookie_file,
+    _write_m3u,
     audio_format_short,
     is_supported_url,
     normalize_audio_format,
     pick_square_cover,
 )
+
+
+def _jpeg_dimensions(data: bytes) -> tuple[int, int] | None:
+    """(width, height) from a JPEG's SOF marker — avoids needing PIL/ffprobe."""
+    i = 2
+    while i < len(data) - 9:
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        marker = data[i + 1]
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            h = int.from_bytes(data[i + 5:i + 7], "big")
+            w = int.from_bytes(data[i + 7:i + 9], "big")
+            return w, h
+        i += 2 + int.from_bytes(data[i + 2:i + 4], "big")
+    return None
 
 _OUT = ["-o", "/tmp/x/%(title)s.%(ext)s"]
 
@@ -136,6 +160,64 @@ def test_is_supported_url_rejects_lookalikes_and_non_http():
     assert not is_supported_url("https://evil.com/youtube.com")     # substring only
     assert not is_supported_url("file:///etc/passwd")               # wrong scheme
     assert not is_supported_url("")
+
+
+def test_playlist_track_tmpl_orders_and_is_traversal_safe():
+    # Playlist mode (issue #11): all tracks in one folder, filenames prefixed with a
+    # zero-padded playlist index so they sort in playlist order; yt-dlp sanitises
+    # %(title)s so a hostile title can't escape the folder. Assert via the real
+    # download path (prepare_filename).
+    ydl = yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "outtmpl": _PLAYLIST_TRACK_TMPL})
+    assert ydl.prepare_filename(
+        {"title": "Song A", "ext": "mp3", "playlist_index": 3}) == "0003 - Song A.mp3"
+    # a track without an index (e.g. a single-video URL in playlist mode) still names cleanly
+    assert ydl.prepare_filename({"title": "Solo", "ext": "mp3"}) == "NA - Solo.mp3"
+    # path separators in the title are neutralised → stays a single filename, so a
+    # hostile title cannot escape the playlist folder (the '..' dots are inert
+    # without a real separator).
+    out = ydl.prepare_filename({"title": "../../etc/x", "ext": "mp3", "playlist_index": 1})
+    assert "/" not in out and "\\" not in out
+
+
+def test_write_m3u_lists_tracks_in_order_relative(tmp_path):
+    # The .m3u8 must reference tracks by bare filename (Navidrome resolves relative
+    # to the file's folder) and preserve order (issue #11).
+    (tmp_path / "0001 - A.mp3").write_bytes(b"")
+    (tmp_path / "0002 - B.mp3").write_bytes(b"")
+    tracks = sorted(tmp_path.glob("*.mp3"))
+    m3u = _write_m3u(tmp_path, "My/Mix", tracks)
+
+    assert m3u.name == "My_Mix.m3u8"                       # playlist name sanitised for the file
+    body = m3u.read_text(encoding="utf-8").splitlines()
+    assert body[0] == "#EXTM3U"
+    # bare filenames, in order, no directory component
+    track_lines = [ln for ln in body if not ln.startswith("#")]
+    assert track_lines == ["0001 - A.mp3", "0002 - B.mp3"]
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+def test_square_crop_jpeg_center_crops_to_square(tmp_path):
+    # A 16:9 thumbnail must be cropped to a square so Navidrome shows no blurred bars
+    # (issue #11). Generate a 640x360 image, crop, and assert the result is square.
+    src = tmp_path / "wide.jpg"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+         "-i", "testsrc=size=640x360:rate=1", "-frames:v", "1", str(src)],
+        check=True, capture_output=True,
+    )
+    out = _square_crop_jpeg(src)
+    assert out and out[:2] == b"\xff\xd8"        # valid JPEG
+    w, h = _jpeg_dimensions(out)
+    assert w == h == 360                          # shorter side, centered
+
+
+def test_write_m3u_neutralises_newline_injection(tmp_path):
+    # A playlist/track title with an embedded newline must not forge extra m3u lines.
+    (tmp_path / "0001 - A.mp3").write_bytes(b"")
+    m3u = _write_m3u(tmp_path, "Evil\n#EXTINF:0,forged", sorted(tmp_path.glob("*.mp3")))
+    body = m3u.read_text(encoding="utf-8").splitlines()
+    assert body[1] == "#PLAYLIST:Evil #EXTINF:0,forged"      # newline collapsed to a space
+    assert sum(1 for ln in body if ln.startswith("#PLAYLIST:")) == 1  # no forged directive line
 
 
 def test_safe_segment_blocks_traversal():

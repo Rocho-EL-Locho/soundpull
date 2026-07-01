@@ -33,3 +33,10 @@ def test_webdav_host_allowlist_parsing():
     s = _settings(webdav_allowed_hosts="Cloud.Example.org, dav.foo ")
     assert s.webdav_host_allowlist == {"cloud.example.org", "dav.foo"}
     assert _settings(webdav_allowed_hosts="").webdav_host_allowlist == set()
+
+
+def test_max_playlist_items_default_and_override():
+    # Playlist cap (issue #11): a sane default, overridable (0 = unlimited).
+    assert _settings().max_playlist_items == 100
+    assert _settings(max_playlist_items=0).max_playlist_items == 0
+    assert _settings(max_playlist_items=25).max_playlist_items == 25
