@@ -42,6 +42,15 @@ class UserSettings(SQLModel, table=True):
     destination_type: str = "browser"  # browser (ZIP download) | webdav (direct upload)
     language: str = "de"  # UI language code ("de" | "en"); see app.i18n.SUPPORTED_LANGUAGES
 
+    # Which metadata fields to write (issue #7). All True = original behaviour;
+    # see app.fix_music_tags.TagOptions / TAG_OPTION_FIELDS.
+    tag_genre: bool = True
+    tag_album_artist: bool = True
+    tag_cover: bool = True
+    tag_track_number: bool = True
+    tag_feat_artist: bool = True
+    tag_comments: bool = True
+
     webdav_url: str | None = None          # connection base URL
     webdav_folder: str | None = None       # chosen target sub-folder (relative to base)
     webdav_username: str | None = None

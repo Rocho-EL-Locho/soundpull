@@ -150,6 +150,28 @@ def _apply_audio_format(flags: list[str], audio_format: str) -> list[str]:
     return out
 
 
+def _apply_tag_options(flags: list[str], options: fix_music_tags.TagOptions) -> list[str]:
+    """Return a copy of `flags` with download-time fields gated per `options`.
+
+    Drops the thumbnail-embed flags when cover is off and the playlist→track
+    remap when track numbers are off. With all options on this is a no-op, so the
+    flag list (and thus tag output) is unchanged — the parity baseline. (Genre is
+    gated where the postprocessor-arg is appended in `run_download`; the remaining
+    fields are stripped post-download in fix_music_tags.)
+    """
+    out = list(flags)
+    if not options.cover:
+        if "--embed-thumbnail" in out:
+            out.remove("--embed-thumbnail")
+        if "--convert-thumbnails" in out:
+            ti = out.index("--convert-thumbnails")
+            del out[ti:ti + 2]
+    if not options.track_number and "--parse-metadata" in out:
+        pi = out.index("--parse-metadata")
+        del out[pi:pi + 2]
+    return out
+
+
 @dataclass
 class Destination:
     type: str = "browser"  # browser (ZIP for download) | webdav (direct upload)
@@ -299,11 +321,15 @@ def _upload_tree(dest: Destination, local_root: Path) -> None:
 
 def run_download(*, job_id: str, url: str, genre: str, mode: str,
                  destination: Destination, reporter: Reporter,
-                 audio_format: str = DEFAULT_AUDIO_FORMAT) -> Result:
+                 audio_format: str = DEFAULT_AUDIO_FORMAT,
+                 tag_options: fix_music_tags.TagOptions = fix_music_tags.TagOptions()) -> Result:
     """Execute one download end-to-end and return a Result.
 
     Both destinations stage into a temp work dir; then either a ZIP is packaged
     (browser) or the tree is uploaded (webdav). Raises on fatal errors.
+
+    `tag_options` gates which metadata fields are written (issue #7); the default
+    (all on) keeps the output byte-identical to the original tool.
     """
     is_album = mode != "single"
 
@@ -327,7 +353,10 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
 
         # 3) Download (parity-safe opts from parse_options + our hooks).
         flags = _apply_audio_format(_ALBUM_FLAGS if is_album else _SINGLE_FLAGS, audio_format)
-        flags += ["--postprocessor-args", f"ffmpeg:-metadata genre={genre}", "-o", out_tmpl]
+        flags = _apply_tag_options(flags, tag_options)
+        if tag_options.genre:
+            flags += ["--postprocessor-args", f"ffmpeg:-metadata genre={genre}"]
+        flags += ["-o", out_tmpl]
         opts = _build_ydl_opts(flags)
         opts.update({"quiet": True, "no_warnings": True, "noprogress": True, "logger": _QuietLogger()})
 
@@ -360,16 +389,18 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
             # Defensive: keeps fix_music_tags' sys.exit path (BaseException) unreachable.
             raise RuntimeError(f"Album-Verzeichnis fehlt: {album_dir}")
 
-        # 4) Square cover.
-        cover_path = _fetch_cover(url, is_album, album_dir / "cover.jpg")
+        # 4) Square cover (skipped when the cover field is toggled off).
+        cover_path = _fetch_cover(url, is_album, album_dir / "cover.jpg") if tag_options.cover else None
 
-        # 5) Navidrome tag correction (unchanged logic from fix_music_tags.py).
+        # 5) Navidrome tag correction (unchanged logic from fix_music_tags.py),
+        #    gated per tag_options — all-on keeps the original behaviour.
         reporter.on_phase("tags")
         fix_music_tags.process_directory(
             str(album_dir),
             str(cover_path) if cover_path else None,
             album,
             primary_artist,
+            tag_options,
         )
 
         # 6) Deliver.

@@ -20,11 +20,42 @@ import base64
 import os
 import re
 import sys
+from dataclasses import dataclass
+
 from mutagen.flac import Picture
 from mutagen.id3 import ID3, TPE1, TPE2, TIT2, TALB, APIC, ID3NoHeaderError
 from mutagen.mp4 import MP4, MP4Cover
 from mutagen.oggopus import OggOpus
 from mutagen.oggvorbis import OggVorbis
+
+
+@dataclass(frozen=True)
+class TagOptions:
+    """Welche Metadaten-Felder Soundpull schreibt (issue #7).
+
+    Alle Schalter an (Default) = ursprüngliches Verhalten, byte-identisch zur
+    Parität. Ein Schalter aus → das Feld wird NICHT geschrieben und ein evtl. von
+    yt-dlp eingebetteter Wert wird beim Tagging wieder entfernt (siehe _strip_*).
+    `feat_artist` ist die Ausnahme: aus = die Titel-/Artist-Bereinigung wird
+    übersprungen, die rohen yt-dlp-Werte bleiben stehen.
+    """
+    genre: bool = True
+    album_artist: bool = True
+    cover: bool = True
+    track_number: bool = True
+    feat_artist: bool = True
+    comments: bool = True
+
+
+# Stabile Feldreihenfolge für UI/Tests (entspricht den TagOptions-Attributen).
+TAG_OPTION_FIELDS = ("genre", "album_artist", "cover", "track_number", "feat_artist", "comments")
+
+# Default-Instanz: TagOptions ist frozen → als geteilter Default-Parameter sicher.
+_ALL_ON = TagOptions()
+
+# TXXX-Beschreibungen (lowercase), die yt-dlp/ffmpeg als „Kommentar“-artige Felder
+# schreibt (das eigentliche COMM trägt die Webseiten-URL).
+_COMMENT_TXXX_DESCS = {"description", "synopsis", "purl", "comment"}
 
 
 # Regex-Muster für Featured Artists im Titel
@@ -103,10 +134,85 @@ def get_tag_text(tags, key: str) -> str:
     return str(frame).strip()
 
 
-def process_file(filepath: str, cover_data: bytes | None = None, album_name: str | None = None, album_artist: str | None = None) -> bool:
+def _strip_id3(tags: ID3, options: TagOptions) -> bool:
+    """Entfernt ID3-Frames für abgeschaltete Felder (issue #7). True wenn etwas wegfiel."""
+    changed = False
+
+    def drop(label: str, *keys: str) -> None:
+        nonlocal changed
+        hit = any(tags.getall(k) for k in keys)
+        if hit:
+            for k in keys:
+                tags.delall(k)
+            print(f"  [STRIP] {label}")
+            changed = True
+
+    if not options.genre:
+        drop("Genre", "TCON")
+    if not options.album_artist:
+        drop("AlbumArtist", "TPE2")
+    if not options.track_number:
+        drop("Track", "TRCK")
+    if not options.cover:
+        drop("Cover", "APIC")
+    if not options.comments:
+        hit = bool(tags.getall("COMM"))
+        tags.delall("COMM")
+        for frame in list(tags.getall("TXXX")):
+            if frame.desc.lower() in _COMMENT_TXXX_DESCS:
+                del tags[frame.HashKey]
+                hit = True
+        if hit:
+            print("  [STRIP] Kommentare")
+            changed = True
+
+    return changed
+
+
+def _strip_dict(audio, options: TagOptions, fields: dict[str, tuple[str, ...]]) -> bool:
+    """Strip für dict-artige Tags (MP4-Atome / Vorbis-Comments). True wenn etwas wegfiel.
+
+    `fields` mappt einen TagOptions-Attributnamen auf die zu löschenden Schlüssel.
+    Gemeinsame Logik für MP4 und Opus/OGG (gleiche Lösch-API: `key in audio` / del).
+    """
+    changed = False
+    labels = {"genre": "Genre", "album_artist": "AlbumArtist", "track_number": "Track",
+              "cover": "Cover", "comments": "Kommentare"}
+    for attr, keys in fields.items():
+        if getattr(options, attr):
+            continue
+        hit = False
+        for key in keys:
+            if key in audio:
+                del audio[key]
+                hit = True
+        if hit:
+            print(f"  [STRIP] {labels[attr]}")
+            changed = True
+    return changed
+
+
+_MP4_STRIP_KEYS = {
+    "genre": ("\xa9gen", "gnre"),
+    "album_artist": ("aART",),
+    "track_number": ("trkn",),
+    "cover": ("covr",),
+    "comments": ("\xa9cmt", "desc", "ldes"),
+}
+_VORBIS_STRIP_KEYS = {
+    "genre": ("genre",),
+    "album_artist": ("albumartist",),
+    "track_number": ("tracknumber",),
+    "cover": ("metadata_block_picture", "coverart"),
+    "comments": ("comment", "description", "synopsis", "purl"),
+}
+
+
+def process_file(filepath: str, cover_data: bytes | None = None, album_name: str | None = None, album_artist: str | None = None, options: TagOptions = _ALL_ON) -> bool:
     """
     Verarbeitet eine einzelne MP3-Datei.
     cover_data: optionale JPG-Bytes für das Cover-Bild (ersetzt das eingebettete Thumbnail)
+    options: welche Felder geschrieben werden (issue #7); Default = alle an (Parität).
     Returns True wenn Änderungen vorgenommen wurden.
     """
     try:
@@ -128,28 +234,30 @@ def process_file(filepath: str, cover_data: bytes | None = None, album_name: str
             print(f"  [SKIP] Kein Artist-Tag: {os.path.basename(filepath)}")
             return False
 
-        clean_title, new_artist, new_albumartist = parse_featured_artists(title, artist)
+        clean_title, new_artist, _ = parse_featured_artists(title, artist)
 
         changed = False
 
-        if clean_title != title:
-            print(f"  Titel:       '{title}' → '{clean_title}'")
-            tags["TIT2"] = TIT2(encoding=3, text=clean_title)
-            changed = True
+        # Feat.-Bereinigung von Titel & Artist (nur wenn aktiviert)
+        if options.feat_artist:
+            if clean_title != title:
+                print(f"  Titel:       '{title}' → '{clean_title}'")
+                tags["TIT2"] = TIT2(encoding=3, text=clean_title)
+                changed = True
+            if new_artist != artist:
+                print(f"  Artist:      '{artist}' → '{new_artist}'")
+                tags["TPE1"] = TPE1(encoding=3, text=new_artist)
+                changed = True
 
-        if new_artist != artist:
-            print(f"  Artist:      '{artist}' → '{new_artist}'")
-            tags["TPE1"] = TPE1(encoding=3, text=new_artist)
-            changed = True
-
-        # AlbumArtist: immer auf den korrekten Primärkünstler setzen.
+        # AlbumArtist: auf den korrekten Primärkünstler setzen (nur wenn aktiviert).
         # Priorität: explizit übergebener album_artist > erster Teil des Artist-Tags
-        correct_albumartist = album_artist if album_artist else artist.split(" / ")[0]
-        if albumartist != correct_albumartist:
-            label = "(leer)" if not albumartist else f"'{albumartist}'"
-            print(f"  AlbumArtist: {label} → '{correct_albumartist}'")
-            tags["TPE2"] = TPE2(encoding=3, text=correct_albumartist)
-            changed = True
+        if options.album_artist:
+            correct_albumartist = album_artist if album_artist else artist.split(" / ")[0]
+            if albumartist != correct_albumartist:
+                label = "(leer)" if not albumartist else f"'{albumartist}'"
+                print(f"  AlbumArtist: {label} → '{correct_albumartist}'")
+                tags["TPE2"] = TPE2(encoding=3, text=correct_albumartist)
+                changed = True
 
         # Album-Name vereinheitlichen falls übergeben
         if album_name:
@@ -159,8 +267,8 @@ def process_file(filepath: str, cover_data: bytes | None = None, album_name: str
                 tags["TALB"] = TALB(encoding=3, text=album_name)
                 changed = True
 
-        # Cover-Bild ersetzen falls übergeben
-        if cover_data is not None:
+        # Cover-Bild ersetzen falls übergeben (nur wenn aktiviert)
+        if options.cover and cover_data is not None:
             tags.delall("APIC")
             tags["APIC:"] = APIC(
                 encoding=0,
@@ -169,6 +277,10 @@ def process_file(filepath: str, cover_data: bytes | None = None, album_name: str
                 desc="Cover",
                 data=cover_data,
             )
+            changed = True
+
+        # Felder abgeschalteter Schalter entfernen (no-op wenn alle an → Parität)
+        if _strip_id3(tags, options):
             changed = True
 
         if changed:
@@ -183,20 +295,25 @@ def process_file(filepath: str, cover_data: bytes | None = None, album_name: str
         return False
 
 
-def _normalized_tags(title: str, artist: str, albumartist: str, album_artist: str | None):
+def _normalized_tags(title: str, artist: str, albumartist: str, album_artist: str | None,
+                     options: TagOptions = _ALL_ON):
     """Gemeinsame Logik: Titel/Artist/AlbumArtist nach Navidrome-Regeln.
 
     Liefert (clean_title, new_artist, correct_albumartist) oder None, wenn
-    Titel/Artist fehlen (dann Datei überspringen — wie beim MP3-Pfad).
+    Titel/Artist fehlen (dann Datei überspringen — wie beim MP3-Pfad). Ist
+    `options.feat_artist` aus, bleiben Titel/Artist roh (keine Bereinigung).
     """
     if not title or not artist:
         return None
-    clean_title, new_artist, _ = parse_featured_artists(title, artist)
+    if options.feat_artist:
+        clean_title, new_artist, _ = parse_featured_artists(title, artist)
+    else:
+        clean_title, new_artist = title, artist
     correct_albumartist = album_artist if album_artist else artist.split(" / ")[0]
     return clean_title, new_artist, correct_albumartist
 
 
-def process_file_mp4(filepath: str, cover_data: bytes | None = None, album_name: str | None = None, album_artist: str | None = None) -> bool:
+def process_file_mp4(filepath: str, cover_data: bytes | None = None, album_name: str | None = None, album_artist: str | None = None, options: TagOptions = _ALL_ON) -> bool:
     """Verarbeitet eine MP4/M4A-Datei (AAC/ALAC, iTunes-Atome)."""
     try:
         audio = MP4(filepath)
@@ -206,7 +323,7 @@ def process_file_mp4(filepath: str, cover_data: bytes | None = None, album_name:
             return str(val[0]).strip() if val else ""
 
         title, artist, albumartist = first("\xa9nam"), first("\xa9ART"), first("aART")
-        norm = _normalized_tags(title, artist, albumartist, album_artist)
+        norm = _normalized_tags(title, artist, albumartist, album_artist, options)
         if norm is None:
             print(f"  [SKIP] Kein Titel/Artist-Tag: {os.path.basename(filepath)}")
             return False
@@ -219,7 +336,7 @@ def process_file_mp4(filepath: str, cover_data: bytes | None = None, album_name:
         if new_artist != artist:
             print(f"  Artist:      '{artist}' → '{new_artist}'")
             audio["\xa9ART"] = [new_artist]; changed = True
-        if albumartist != correct_albumartist:
+        if options.album_artist and albumartist != correct_albumartist:
             label = "(leer)" if not albumartist else f"'{albumartist}'"
             print(f"  AlbumArtist: {label} → '{correct_albumartist}'")
             audio["aART"] = [correct_albumartist]; changed = True
@@ -227,8 +344,10 @@ def process_file_mp4(filepath: str, cover_data: bytes | None = None, album_name:
         if album_name and cur_album != album_name:
             print(f"  Album:       '{cur_album}' → '{album_name}'")
             audio["\xa9alb"] = [album_name]; changed = True
-        if cover_data is not None:
+        if options.cover and cover_data is not None:
             audio["covr"] = [MP4Cover(cover_data, imageformat=MP4Cover.FORMAT_JPEG)]
+            changed = True
+        if audio.tags is not None and _strip_dict(audio, options, _MP4_STRIP_KEYS):
             changed = True
 
         if changed:
@@ -251,7 +370,7 @@ def _vorbis_cover(cover_data: bytes) -> str:
     return base64.b64encode(pic.write()).decode("ascii")
 
 
-def process_file_ogg(filepath: str, opener, cover_data: bytes | None = None, album_name: str | None = None, album_artist: str | None = None) -> bool:
+def process_file_ogg(filepath: str, opener, cover_data: bytes | None = None, album_name: str | None = None, album_artist: str | None = None, options: TagOptions = _ALL_ON) -> bool:
     """Verarbeitet eine Opus-/Ogg-Datei (Vorbis-Comments, case-insensitive)."""
     try:
         audio = opener(filepath)
@@ -261,7 +380,7 @@ def process_file_ogg(filepath: str, opener, cover_data: bytes | None = None, alb
             return str(val[0]).strip() if val else ""
 
         title, artist, albumartist = first("title"), first("artist"), first("albumartist")
-        norm = _normalized_tags(title, artist, albumartist, album_artist)
+        norm = _normalized_tags(title, artist, albumartist, album_artist, options)
         if norm is None:
             print(f"  [SKIP] Kein Titel/Artist-Tag: {os.path.basename(filepath)}")
             return False
@@ -274,7 +393,7 @@ def process_file_ogg(filepath: str, opener, cover_data: bytes | None = None, alb
         if new_artist != artist:
             print(f"  Artist:      '{artist}' → '{new_artist}'")
             audio["artist"] = [new_artist]; changed = True
-        if albumartist != correct_albumartist:
+        if options.album_artist and albumartist != correct_albumartist:
             label = "(leer)" if not albumartist else f"'{albumartist}'"
             print(f"  AlbumArtist: {label} → '{correct_albumartist}'")
             audio["albumartist"] = [correct_albumartist]; changed = True
@@ -282,9 +401,11 @@ def process_file_ogg(filepath: str, opener, cover_data: bytes | None = None, alb
         if album_name and cur_album != album_name:
             print(f"  Album:       '{cur_album}' → '{album_name}'")
             audio["album"] = [album_name]; changed = True
-        if cover_data is not None:
+        if options.cover and cover_data is not None:
             audio["metadata_block_picture"] = [_vorbis_cover(cover_data)]
             audio.pop("coverart", None)  # älteres, nicht-standard Cover-Feld entfernen
+            changed = True
+        if _strip_dict(audio, options, _VORBIS_STRIP_KEYS):
             changed = True
 
         if changed:
@@ -301,18 +422,18 @@ def process_file_ogg(filepath: str, opener, cover_data: bytes | None = None, alb
 _SUPPORTED_EXTS = (".mp3", ".m4a", ".mp4", ".opus", ".ogg", ".oga")
 
 
-def _process_any(filepath: str, cover_data: bytes | None, album_name: str | None, album_artist: str | None) -> bool:
+def _process_any(filepath: str, cover_data: bytes | None, album_name: str | None, album_artist: str | None, options: TagOptions = _ALL_ON) -> bool:
     ext = os.path.splitext(filepath)[1].lower()
     if ext == ".mp3":
-        return process_file(filepath, cover_data, album_name, album_artist)
+        return process_file(filepath, cover_data, album_name, album_artist, options)
     if ext in (".m4a", ".mp4"):
-        return process_file_mp4(filepath, cover_data, album_name, album_artist)
+        return process_file_mp4(filepath, cover_data, album_name, album_artist, options)
     if ext == ".opus":
-        return process_file_ogg(filepath, OggOpus, cover_data, album_name, album_artist)
-    return process_file_ogg(filepath, OggVorbis, cover_data, album_name, album_artist)
+        return process_file_ogg(filepath, OggOpus, cover_data, album_name, album_artist, options)
+    return process_file_ogg(filepath, OggVorbis, cover_data, album_name, album_artist, options)
 
 
-def process_directory(directory: str, cover_path: str | None = None, album_name: str | None = None, album_artist: str | None = None) -> None:
+def process_directory(directory: str, cover_path: str | None = None, album_name: str | None = None, album_artist: str | None = None, options: TagOptions = _ALL_ON) -> None:
     """Verarbeitet alle unterstützten Audiodateien in einem Verzeichnis (nicht rekursiv)."""
     if not os.path.isdir(directory):
         print(f"Verzeichnis nicht gefunden: {directory}")
@@ -345,7 +466,7 @@ def process_directory(directory: str, cover_path: str | None = None, album_name:
     for filename in mp3_files:
         filepath = os.path.join(directory, filename)
         print(f"→ {filename}")
-        if _process_any(filepath, cover_data, album_name, album_artist):
+        if _process_any(filepath, cover_data, album_name, album_artist, options):
             changed_count += 1
 
     print(f"\n{changed_count} von {len(mp3_files)} Dateien aktualisiert.")

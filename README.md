@@ -5,13 +5,14 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
 
-**Soundpull turns YouTube Music links into properly tagged MP3s.**
+**Soundpull turns YouTube Music links into properly tagged audio — MP3 or the original Opus/M4A.**
 
-Paste a link to an album or a single, and Soundpull downloads it in high quality,
-cleans up the metadata (artist, album artist, title, genre, square cover art) so it
-looks right in music servers like [Navidrome](https://www.navidrome.org/), and hands
-it to you either as a **ZIP download in your browser** or by uploading it **straight
-to your own WebDAV storage**.
+Paste a link to an album or a single, and Soundpull downloads it in the quality and format
+you choose (MP3 320 / 192 kbps, or the original Opus/M4A stream with no re-encode), cleans up
+the metadata (artist, album artist, title, track number, genre, square cover art) so it looks
+right in music servers like [Navidrome](https://www.navidrome.org/) — and you decide which of
+those fields it actually writes. It then hands the result to you either as a **ZIP download in
+your browser** or by uploading it **straight to your own WebDAV storage**.
 
 It's a small, self-hosted web app meant to run on your own server. Access is protected
 by **single sign-on (authentik / OIDC)**, and every user gets their own profile, default
@@ -26,10 +27,16 @@ settings and download history.
 ## Features
 
 - 🎵 **Albums & singles** — paste any YouTube Music URL
-- 🏷️ **Clean, consistent tags** — feat. artists, album artist, title cleanup, genre and
-  square cover art, tuned for Navidrome (and compatible with most players)
+- 🎚️ **Choose quality & format** — MP3 320 or 192 kbps, or the **original** Opus/M4A stream
+  with no re-encode (best fidelity, smallest file)
+- 🏷️ **Clean, consistent tags** — feat. artists, album artist, title cleanup, track number,
+  genre and square cover art, tuned for Navidrome (and compatible with most players)
+- 🎛️ **Pick which tags to write** — toggle each field (genre, album artist, cover art, track
+  number, feat-artist cleanup, comments) on or off, as a default or per download; a field
+  turned off is left out of the file entirely
 - 📦 **Flexible delivery** — download as a ZIP in the browser, or upload directly to a
   WebDAV target you pick from a built-in folder browser
+- 🌍 **Bilingual UI** — switch the interface between English and German
 - 🔐 **Protected** — login via authentik (OIDC); optionally restrict to a group
 - 👤 **Per-user** — personal defaults, WebDAV credentials (encrypted) and history
 - 📊 **Live progress** — watch each download move through its stages in real time
@@ -81,18 +88,25 @@ Set via environment / `.env` (see `.env.example`):
 | `SESSION_SECRET` | Signs the session cookie |
 | `FERNET_KEY` | Encrypts stored WebDAV passwords at rest |
 | `OIDC_DISCOVERY_URL`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `OIDC_REDIRECT_URI` | authentik OIDC |
+| `OIDC_SCOPES` | *(optional)* OIDC scopes (default `openid email profile`) |
 | `OIDC_ALLOWED_GROUP` | *(optional)* restrict access to a group |
+| `OIDC_POST_LOGOUT_REDIRECT` | *(optional)* where authentik sends the user after logout |
+| `DATABASE_URL` | SQLite database location (default `sqlite:///./data/app.db`) |
 | `LOCAL_MUSIC_ROOT` | Staging/temp directory for downloads |
 | `MAX_CONCURRENT_DOWNLOADS` | How many downloads run at once |
+| `WEBDAV_ALLOWED_HOSTS` | *(optional)* SSRF guard: comma-separated allowlist of WebDAV hosts (empty = no restriction) |
 
 ## Usage
 
 1. Open the app and sign in.
 2. Paste a YouTube Music URL (or use the bookmarklet from **Settings**).
-3. Pick genre, album/single, and the destination (browser ZIP or WebDAV).
+3. Pick the audio quality/format, genre, album/single, and the destination (browser ZIP or
+   WebDAV) — and, if you like, expand **Metadata fields** to override which tags get written
+   for this download.
 4. Start — follow the live progress; the ZIP download starts automatically when done.
 
-In **Settings** you set your defaults and, for WebDAV, connect and browse to a target
+In **Settings** you set your defaults (genre, quality/format, destination, and which metadata
+fields to write), pick the interface language, and, for WebDAV, connect and browse to a target
 folder. Your WebDAV password is stored encrypted.
 
 ## Tech stack

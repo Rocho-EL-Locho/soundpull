@@ -19,11 +19,19 @@ from sqlmodel import select
 
 from app.config import settings
 from app.db import session_scope
+from app.fix_music_tags import TAG_OPTION_FIELDS, TagOptions
 from app.models import DownloadHistory, UserSettings
 from app.pipeline import DEFAULT_AUDIO_FORMAT, Destination, Reporter, normalize_audio_format, run_download
 from app.security import decrypt_secret
 
 log = logging.getLogger("jobs")
+
+
+def tag_options_from_settings(us: UserSettings | None) -> TagOptions:
+    """Build TagOptions from a UserSettings row (defaults to all-on if absent)."""
+    if us is None:
+        return TagOptions()
+    return TagOptions(**{f: bool(getattr(us, f"tag_{f}")) for f in TAG_OPTION_FIELDS})
 
 _FINISHED_RETENTION_S = 600  # keep finished jobs visible in the UI this long
 
@@ -41,6 +49,7 @@ class JobState:
     mode: str
     destination_type: str
     audio_format: str = DEFAULT_AUDIO_FORMAT
+    tag_options: TagOptions = field(default_factory=TagOptions)
     phase: str = "queued"
     artist: str | None = None
     album: str | None = None
@@ -74,7 +83,7 @@ def _persist(job_id: str, **fields) -> None:
 
 
 def _run(job_id: str, url: str, genre: str, mode: str, destination: Destination,
-         audio_format: str) -> None:
+         audio_format: str, tag_options: TagOptions) -> None:
     js = _registry[job_id]
 
     def on_phase(phase: str) -> None:
@@ -98,7 +107,7 @@ def _run(job_id: str, url: str, genre: str, mode: str, destination: Destination,
     try:
         result = run_download(job_id=job_id, url=url, genre=genre, mode=mode,
                               destination=destination, reporter=reporter,
-                              audio_format=audio_format)
+                              audio_format=audio_format, tag_options=tag_options)
         with _lock:
             js.phase, js.finished_at = "done", _utcnow()
             js.result_path = result.zip_path
@@ -115,8 +124,13 @@ def _run(job_id: str, url: str, genre: str, mode: str, destination: Destination,
 
 
 def start_job(*, user_id: int, url: str, genre: str, mode: str, destination_type: str,
-              audio_format: str = DEFAULT_AUDIO_FORMAT) -> str:
-    """Queue a download for a user. Returns the job id. Raises on bad config."""
+              audio_format: str = DEFAULT_AUDIO_FORMAT,
+              tag_options: TagOptions | None = None) -> str:
+    """Queue a download for a user. Returns the job id. Raises on bad config.
+
+    `tag_options` is the per-download field selection; when omitted it falls back
+    to the user's saved defaults (issue #7).
+    """
     job_id = uuid.uuid4().hex
     audio_format = normalize_audio_format(audio_format)
 
@@ -132,16 +146,19 @@ def start_job(*, user_id: int, url: str, genre: str, mode: str, destination_type
             destination.webdav_password = (
                 decrypt_secret(us.webdav_password_enc) if us.webdav_password_enc else None
             )
+        if tag_options is None:
+            tag_options = tag_options_from_settings(us)
         session.add(DownloadHistory(
             id=job_id, user_id=user_id, url=url, genre=genre, mode=mode,
             audio_format=audio_format, destination_type=destination_type, phase="queued",
         ))
 
     js = JobState(id=job_id, user_id=user_id, url=url, genre=genre, mode=mode,
-                  destination_type=destination_type, audio_format=audio_format)
+                  destination_type=destination_type, audio_format=audio_format,
+                  tag_options=tag_options)
     with _lock:
         _registry[job_id] = js
-    _executor.submit(_run, job_id, url, genre, mode, destination, audio_format)
+    _executor.submit(_run, job_id, url, genre, mode, destination, audio_format, tag_options)
     return job_id
 
 
