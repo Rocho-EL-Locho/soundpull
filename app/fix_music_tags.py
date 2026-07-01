@@ -250,22 +250,35 @@ def process_file(filepath: str, cover_data: bytes | None = None, album_name: str
                 changed = True
 
         # AlbumArtist: auf den korrekten Primärkünstler setzen (nur wenn aktiviert).
-        # Priorität: explizit übergebener album_artist > erster Teil des Artist-Tags
+        # Priorität: explizit übergebener album_artist > erster Teil des Artists, der
+        # auch tatsächlich geschrieben wird (bei feat-Bereinigung `new_artist`, sonst
+        # der rohe `artist` — sonst driften MP3 und M4A/Opus auseinander). Der
+        # Pipeline-Pfad (Album/Single) übergibt IMMER einen album_artist, daher ist
+        # der Fallback dort nie aktiv → Parität bleibt bit-identisch. Er greift nur
+        # ohne expliziten Wert (Playlist-Tagging via process_tree, issue #11) und
+        # stimmt so mit dem M4A/Opus-Pfad (_normalized_tags) überein.
         if options.album_artist:
-            correct_albumartist = album_artist if album_artist else artist.split(" / ")[0]
+            effective_artist = new_artist if options.feat_artist else artist
+            correct_albumartist = album_artist if album_artist else effective_artist.split(" / ")[0]
             if albumartist != correct_albumartist:
                 label = "(leer)" if not albumartist else f"'{albumartist}'"
                 print(f"  AlbumArtist: {label} → '{correct_albumartist}'")
                 tags["TPE2"] = TPE2(encoding=3, text=correct_albumartist)
                 changed = True
 
-        # Album-Name vereinheitlichen falls übergeben
-        if album_name:
-            current_album = get_tag_text(tags, "TALB")
-            if current_album != album_name:
-                print(f"  Album:       '{current_album}' → '{album_name}'")
-                tags["TALB"] = TALB(encoding=3, text=album_name)
-                changed = True
+        # Album-Name: expliziten Wert übernehmen; sonst (Playlist ohne erzwungenes
+        # Album) ein LEERES Album auf den Titel zurückfallen lassen, damit Navidrome
+        # kein "[Unknown Album]" zeigt. Der Pipeline-Pfad (Album/Single) übergibt
+        # IMMER album_name → der Fallback greift dort nie → Parität bit-identisch.
+        current_album = get_tag_text(tags, "TALB")
+        # Fallback nutzt den TATSÄCHLICH geschriebenen Titel (roh bei feat-off), damit
+        # MP3 mit dem M4A/Opus-Pfad (_normalized_tags) übereinstimmt.
+        effective_title = clean_title if options.feat_artist else title
+        target_album = album_name or current_album or effective_title
+        if target_album and current_album != target_album:
+            print(f"  Album:       '{current_album}' → '{target_album}'")
+            tags["TALB"] = TALB(encoding=3, text=target_album)
+            changed = True
 
         # Cover-Bild ersetzen falls übergeben (nur wenn aktiviert)
         if options.cover and cover_data is not None:
@@ -309,7 +322,11 @@ def _normalized_tags(title: str, artist: str, albumartist: str, album_artist: st
         clean_title, new_artist, _ = parse_featured_artists(title, artist)
     else:
         clean_title, new_artist = title, artist
-    correct_albumartist = album_artist if album_artist else artist.split(" / ")[0]
+    # Explicit album_artist wins (album/single always pass it → parity); otherwise
+    # the primary is the first segment of the normalised artist — correct for
+    # playlist per-track tagging (issue #11) and identical to the old raw split
+    # when feat cleanup is off (new_artist == artist).
+    correct_albumartist = album_artist if album_artist else new_artist.split(" / ")[0]
     return clean_title, new_artist, correct_albumartist
 
 
@@ -341,9 +358,10 @@ def process_file_mp4(filepath: str, cover_data: bytes | None = None, album_name:
             print(f"  AlbumArtist: {label} → '{correct_albumartist}'")
             audio["aART"] = [correct_albumartist]; changed = True
         cur_album = first("\xa9alb")
-        if album_name and cur_album != album_name:
-            print(f"  Album:       '{cur_album}' → '{album_name}'")
-            audio["\xa9alb"] = [album_name]; changed = True
+        target_album = album_name or cur_album or clean_title  # empty → title (issue #11)
+        if target_album and cur_album != target_album:
+            print(f"  Album:       '{cur_album}' → '{target_album}'")
+            audio["\xa9alb"] = [target_album]; changed = True
         if options.cover and cover_data is not None:
             audio["covr"] = [MP4Cover(cover_data, imageformat=MP4Cover.FORMAT_JPEG)]
             changed = True
@@ -398,9 +416,10 @@ def process_file_ogg(filepath: str, opener, cover_data: bytes | None = None, alb
             print(f"  AlbumArtist: {label} → '{correct_albumartist}'")
             audio["albumartist"] = [correct_albumartist]; changed = True
         cur_album = first("album")
-        if album_name and cur_album != album_name:
-            print(f"  Album:       '{cur_album}' → '{album_name}'")
-            audio["album"] = [album_name]; changed = True
+        target_album = album_name or cur_album or clean_title  # empty → title (issue #11)
+        if target_album and cur_album != target_album:
+            print(f"  Album:       '{cur_album}' → '{target_album}'")
+            audio["album"] = [target_album]; changed = True
         if options.cover and cover_data is not None:
             audio["metadata_block_picture"] = [_vorbis_cover(cover_data)]
             audio.pop("coverart", None)  # älteres, nicht-standard Cover-Feld entfernen
@@ -470,6 +489,44 @@ def process_directory(directory: str, cover_path: str | None = None, album_name:
             changed_count += 1
 
     print(f"\n{changed_count} von {len(mp3_files)} Dateien aktualisiert.")
+
+
+def process_tree(root: str, options: TagOptions = _ALL_ON, cover_for=None) -> list[str]:
+    """Verarbeitet alle unterstützten Audiodateien unter `root` rekursiv (issue #11).
+
+    Für Playlist-Downloads: die Tracks verteilen sich auf viele Interpreten/Alben,
+    daher wird — anders als bei `process_directory` — KEIN gemeinsamer Album-Name /
+    Album-Interpret erzwungen. Jeder Track wird aus seinen EIGENEN Metadaten
+    normalisiert (Feat-Bereinigung + AlbumArtist = sein eigener Primärkünstler) über
+    dieselben eingefrorenen Regeln (`_process_any`).
+
+    `cover_for(filepath) -> bytes | None` liefert optional pro Track ein quadratisches
+    Cover, das das (oft 16:9-)eingebettete Thumbnail ersetzt — sonst zeigt Navidrome
+    unscharfe Ränder. Ohne Callback bleibt das eingebettete Thumbnail erhalten.
+
+    Gibt die verarbeiteten Audiodateien in Bearbeitungsreihenfolge zurück (je Ordner
+    nach Dateiname sortiert) — der Aufrufer nutzt sie z. B. für die m3u8-Tracklist,
+    ohne denselben Ordner erneut scannen zu müssen.
+    """
+    if not os.path.isdir(root):
+        print(f"Verzeichnis nicht gefunden: {root}")
+        return []
+
+    processed: list[str] = []
+    changed = 0
+    for dirpath, _dirs, files in os.walk(root):
+        for filename in sorted(files):
+            if not filename.lower().endswith(_SUPPORTED_EXTS):
+                continue
+            filepath = os.path.join(dirpath, filename)
+            processed.append(filepath)
+            cover = cover_for(filepath) if cover_for else None
+            print(f"→ {os.path.relpath(filepath, root)}")
+            if _process_any(filepath, cover, None, None, options):
+                changed += 1
+
+    print(f"\n{changed} von {len(processed)} Dateien aktualisiert.")
+    return processed
 
 
 if __name__ == "__main__":

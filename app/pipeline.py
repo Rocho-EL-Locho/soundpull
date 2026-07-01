@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import subprocess
 import zipfile
 from collections import Counter
 from dataclasses import dataclass, field
@@ -135,6 +136,13 @@ AUDIO_FORMATS: dict[str, tuple[str | None, str | None]] = {
 }
 # Localized labels for the UI selects live in app.i18n (keys "audio.<format>"),
 # built from these keys via app.i18n.audio_format_labels().
+
+# Filename template for playlist tracks (issue #11): a REAL playlist keeps every
+# track in one folder (the playlist name) with an .m3u8 that Navidrome imports as a
+# playlist. The `%(playlist_index)04d` prefix preserves playlist order and avoids
+# collisions between same-titled tracks. yt-dlp sanitises `%(title)s` into a safe
+# segment (verified: '/' → '⧸'); the folder name is our own `_safe_segment(title)`.
+_PLAYLIST_TRACK_TMPL = "%(playlist_index)04d - %(title)s.%(ext)s"
 
 
 def normalize_audio_format(value: str | None) -> str:
@@ -275,6 +283,33 @@ def _probe_meta(url: str, is_album: bool, cookiefile: str | None = None) -> tupl
     return artist, album
 
 
+def _probe_playlist(url: str, cookiefile: str | None = None) -> tuple[str, str, int]:
+    """Read a playlist's title, uploader and entry count (issue #11).
+
+    Uses `extract_flat` so we only touch the playlist envelope, not every video —
+    fast, and enough to name the download and seed the progress total. A playlist
+    spans many artists/albums, so (unlike `_probe_meta`) there is no single
+    artist/album to collapse to; each track is tagged from its own metadata later.
+    Returns (title, uploader, count); count is 0 when unknown.
+    """
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extract_flat": True,
+        "extractor_args": _extractor_args(),
+        "logger": _QuietLogger(),
+    }
+    _apply_cookie_policy(opts, cookiefile)
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False) or {}
+    title = info.get("title") or "Playlist"
+    uploader = info.get("uploader") or info.get("channel") or "Playlist"
+    entries = [e for e in (info.get("entries") or []) if e]
+    count = info.get("playlist_count") or len(entries)
+    return title, uploader, int(count or 0)
+
+
 def pick_square_cover(thumbnails: list[dict] | None) -> str | None:
     """Largest square thumbnail; prefer signed (sqp=) URLs (verbatim logic)."""
     signed_best = None
@@ -294,6 +329,44 @@ def pick_square_cover(thumbnails: list[dict] | None) -> str | None:
     return signed_best or any_best
 
 
+def _download_cover(url: str) -> bytes | None:
+    """GET a cover image URL; None on any failure (cover is best-effort)."""
+    try:
+        resp = httpx.get(url, follow_redirects=True, timeout=30)
+        resp.raise_for_status()
+        return resp.content
+    except Exception as exc:  # noqa: BLE001 - never fail the job over a cover
+        log.warning("cover fetch failed: %s", exc)
+        return None
+
+
+# Thumbnail image formats yt-dlp may leave on disk (--write-thumbnail).
+_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+
+
+def _square_crop_jpeg(src: Path) -> bytes | None:
+    """Center-crop an image to a square and return JPEG bytes (via ffmpeg).
+
+    A 16:9 YouTube thumbnail would otherwise be padded with blurred bars by
+    Navidrome; cropping to `min(w,h)²` fills the square. An already-square source
+    (YouTube Music art) is unchanged by the crop. Returns None on any failure so
+    the caller falls back to the embedded thumbnail. ffmpeg is a hard dependency.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        return None
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(src),
+             "-vf", "crop=min(iw\\,ih):min(iw\\,ih)", "-q:v", "2", "-f", "mjpeg", "pipe:1"],
+            capture_output=True, check=True,
+        )
+        return proc.stdout or None
+    except Exception as exc:  # noqa: BLE001 - cover is best-effort; keep embedded
+        log.warning("cover square-crop failed: %s", exc)
+        return None
+
+
 def _fetch_cover(url: str, is_album: bool, dest: Path, cookiefile: str | None = None) -> Path | None:
     """Download the square album cover into `dest` (cover.jpg). Returns path or None."""
     opts = {"quiet": True, "no_warnings": True, "skip_download": True, "logger": _QuietLogger()}
@@ -303,16 +376,65 @@ def _fetch_cover(url: str, is_album: bool, dest: Path, cookiefile: str | None = 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             data = ydl.extract_info(url, download=False)
-        cover_url = pick_square_cover((data or {}).get("thumbnails"))
-        if not cover_url:
-            return None
-        resp = httpx.get(cover_url, follow_redirects=True, timeout=30)
-        resp.raise_for_status()
-        dest.write_bytes(resp.content)
-        return dest
     except Exception as exc:  # cover is best-effort; embedded thumbnail remains
-        log.warning("cover fetch failed: %s", exc)
+        log.warning("cover probe failed: %s", exc)
         return None
+    cover_url = pick_square_cover((data or {}).get("thumbnails"))
+    if not cover_url:
+        return None
+    data_bytes = _download_cover(cover_url)
+    if data_bytes is None:
+        return None
+    dest.write_bytes(data_bytes)
+    return dest
+
+
+def _track_meta(path: Path) -> tuple[str, str, int]:
+    """(title, artist, duration_seconds) read from a track's tags via mutagen.
+
+    Best-effort for the `.m3u8` #EXTINF lines; falls back to the filename stem and
+    an unknown (-1) duration so a track with sparse tags still lists cleanly.
+    """
+    try:
+        from mutagen import File as MutagenFile
+
+        audio = MutagenFile(str(path), easy=True)
+        if audio is None:
+            return path.stem, "", -1
+        title = (audio.get("title") or [""])[0]
+        artist = (audio.get("artist") or [""])[0]
+        dur = int(getattr(audio.info, "length", 0) or 0)
+        return title or path.stem, artist, (dur or -1)
+    except Exception:  # noqa: BLE001 - m3u metadata is cosmetic; never fail the job
+        return path.stem, "", -1
+
+
+def _m3u_line_safe(text: str) -> str:
+    """Collapse any CR/LF/control chars to spaces so a value can't inject an m3u line.
+
+    The m3u format is line-oriented; a newline inside a playlist/track title (or the
+    `#PLAYLIST:` name) would otherwise forge extra directive/track lines.
+    """
+    return "".join(" " if ord(ch) < 32 else ch for ch in text).strip()
+
+
+def _write_m3u(folder: Path, name: str, tracks: list[Path]) -> Path:
+    """Write an `<name>.m3u8` (UTF-8) into `folder`, listing `tracks` in order.
+
+    Tracks are referenced by bare filename (relative to the playlist file). Navidrome
+    auto-imports `.m3u`/`.m3u8` files found in the library and resolves those relative
+    paths against the file's own folder, so the download becomes a real playlist
+    (issue #11) — distinct from an album, tracks keep their own metadata.
+    """
+    lines = ["#EXTM3U", f"#PLAYLIST:{_m3u_line_safe(name)}"]
+    for path in tracks:
+        title, artist, dur = _track_meta(path)
+        head = f"{artist} - {title}" if artist else title
+        lines.append(f"#EXTINF:{dur},{_m3u_line_safe(head)}")
+        lines.append(_m3u_line_safe(path.name))
+    m3u_path = folder / f"{_safe_segment(name)}.m3u8"
+    m3u_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return m3u_path
 
 
 def _ensure_remote_dir(client, posix_dir: str) -> None:
@@ -372,8 +494,15 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
     given it is handed to every yt-dlp call so bot-checks/age gates don't block
     the download. When omitted, no `cookiefile` is set — the output stays
     byte-identical (metadata parity).
+
+    `mode` is one of `album` / `single` / `playlist`. A playlist (issue #11)
+    spans many artists/albums, so — unlike album/single, which collapse to one
+    forced artist+album — each track lands in and is tagged from its OWN
+    metadata; unknown/legacy modes fall back to album.
     """
-    is_album = mode != "single"
+    is_playlist = mode == "playlist"
+    is_single = mode == "single"
+    is_album = not is_playlist and not is_single  # unknown/legacy modes → album
 
     # Materialise the cookie to a 0600 file (kept outside work_base so the WebDAV
     # delivery never ships it); cleaned up in `finally`. None when no cookie → the
@@ -384,32 +513,56 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
         cookie_path = _write_cookie_file(job_id, cookies_txt)
         cookiefile = str(cookie_path) if cookie_path else None
 
-        # 1) Metadata → primary artist + album, to build the output directory.
+        # 1) Metadata → output-directory template. Albums/singles collapse to one
+        #    artist/album; a playlist keeps each track's own (issue #11). Always
+        #    stage into a temp work dir; delivery then packages a ZIP (browser) or
+        #    uploads the tree (webdav). The work dir is removed in `finally`.
         reporter.on_phase("metadata")
-        artist_raw, album_raw = _probe_meta(url, is_album, cookiefile=cookiefile)
-        primary_artist = _primary_artist(artist_raw)
-        album = (album_raw or "Unbekannt Album") if is_album else "Singles"
-        reporter.on_meta(primary_artist, album)
-
-        # 2) Always stage into a temp work dir; the delivery step then packages a
-        #    ZIP (browser) or uploads the tree (webdav). The work dir is removed in
-        #    `finally` so failed jobs don't leak it; the browser ZIP lives outside it.
         work_base.mkdir(parents=True, exist_ok=True)
+        pl_title = ""
+        if is_playlist:
+            pl_title, pl_uploader, pl_count = _probe_playlist(url, cookiefile=cookiefile)
+            if settings.max_playlist_items > 0 and pl_count:
+                pl_count = min(pl_count, settings.max_playlist_items)
+            reporter.on_meta(pl_uploader, pl_title)
+            if pl_count:
+                reporter.on_track(0, pl_count)
+            # A real playlist: ALL tracks in one folder (the playlist name), plus an
+            # .m3u8 written after tagging. `pl_title` is interpolated literally, so
+            # sanitise it into one safe path segment; the track filename is a yt-dlp
+            # template (its fields are sanitised by yt-dlp).
+            playlist_dir = work_base / _safe_segment(pl_title)
+            out_tmpl = str(playlist_dir / _PLAYLIST_TRACK_TMPL)
+            base_flags = _SINGLE_FLAGS  # per-track tags, no album track-number remap
+        else:
+            artist_raw, album_raw = _probe_meta(url, is_album, cookiefile=cookiefile)
+            primary_artist = _primary_artist(artist_raw)
+            album = (album_raw or "Unbekannt Album") if is_album else "Singles"
+            reporter.on_meta(primary_artist, album)
+            # `primary_artist` is interpolated literally (not a yt-dlp `%(...)s`
+            # field), so sanitise it ourselves to keep it a single, traversal-safe
+            # path segment.
+            subfolder = "%(album)s" if is_album else "Singles"
+            out_tmpl = str(work_base / _safe_segment(primary_artist) / subfolder / "%(title)s.%(ext)s")
+            base_flags = _ALBUM_FLAGS if is_album else _SINGLE_FLAGS
 
-        # `primary_artist` is interpolated literally (not a yt-dlp `%(...)s` field),
-        # so sanitise it ourselves to keep it a single, traversal-safe path segment.
-        subfolder = "%(album)s" if is_album else "Singles"
-        out_tmpl = str(work_base / _safe_segment(primary_artist) / subfolder / "%(title)s.%(ext)s")
-
-        # 3) Download (parity-safe opts from parse_options + our hooks).
-        flags = _apply_audio_format(_ALBUM_FLAGS if is_album else _SINGLE_FLAGS, audio_format)
+        # 2) Download (parity-safe opts from parse_options + our hooks).
+        flags = _apply_audio_format(base_flags, audio_format)
         flags = _apply_tag_options(flags, tag_options)
         if tag_options.genre:
             flags += ["--postprocessor-args", f"ffmpeg:-metadata genre={genre}"]
+        # Playlists keep the per-track thumbnail on disk (as jpg) so we can crop it
+        # to a square cover afterwards (issue #11); album/single don't need it (they
+        # embed one fetched square album cover). Only when the cover field is on —
+        # else _apply_tag_options already dropped the thumbnail flags.
+        if is_playlist and tag_options.cover:
+            flags += ["--write-thumbnail"]
         flags += ["-o", out_tmpl]
         opts = _build_ydl_opts(flags)
         opts.update({"quiet": True, "no_warnings": True, "noprogress": True, "logger": _QuietLogger()})
         _apply_cookie_policy(opts, cookiefile)
+        if is_playlist and settings.max_playlist_items > 0:
+            opts["playlistend"] = settings.max_playlist_items  # cap runaway playlists
 
         finished_dirs: Counter[str] = Counter()
 
@@ -435,37 +588,66 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
 
         if not finished_dirs:
             raise RuntimeError("Download lieferte keine Dateien (siehe Logs).")
-        album_dir = Path(finished_dirs.most_common(1)[0][0])
-        if not album_dir.is_dir():
-            # Defensive: keeps fix_music_tags' sys.exit path (BaseException) unreachable.
-            raise RuntimeError(f"Album-Verzeichnis fehlt: {album_dir}")
 
-        # 4) Square cover (skipped when the cover field is toggled off).
-        cover_path = (_fetch_cover(url, is_album, album_dir / "cover.jpg", cookiefile=cookiefile)
-                      if tag_options.cover else None)
-
-        # 5) Navidrome tag correction (unchanged logic from fix_music_tags.py),
-        #    gated per tag_options — all-on keeps the original behaviour.
+        # 3) Navidrome tag correction (frozen fix_music_tags logic), gated per
+        #    tag_options — all-on keeps the original behaviour. A playlist tags
+        #    every track in the tree from its OWN metadata (no forced album/artist,
+        #    no single shared cover); album/single force the one album + primary
+        #    artist and embed the fetched square cover.
         reporter.on_phase("tags")
-        fix_music_tags.process_directory(
-            str(album_dir),
-            str(cover_path) if cover_path else None,
-            album,
-            primary_artist,
-            tag_options,
-        )
+        if is_playlist:
+            # Tag each track from its OWN metadata (no forced album/artist), embedding
+            # a per-track SQUARE cover: yt-dlp left a `<stem>.jpg` thumbnail per track
+            # (--write-thumbnail); we center-crop it to a square so Navidrome doesn't
+            # pad a 16:9 thumbnail with blurred bars (already-square art is unchanged).
+            # Then delete those stray thumbnails and write the .m3u8 so Navidrome sees
+            # a playlist, not an album. process_tree returns the tracks in order.
+            thumb_by_stem = {p.stem: p for p in playlist_dir.glob("*")
+                             if p.is_file() and p.suffix.lower() in _IMAGE_EXTS}
 
-        # 6) Deliver.
+            def cover_for(fp: str) -> bytes | None:
+                if not tag_options.cover:
+                    return None  # cover disabled → thumbnail already stripped
+                src = thumb_by_stem.get(Path(fp).stem)
+                return _square_crop_jpeg(src) if src else None  # else keep embedded
+
+            tracks = [Path(p) for p in fix_music_tags.process_tree(
+                str(playlist_dir), tag_options, cover_for=cover_for)]
+            for src in thumb_by_stem.values():
+                src.unlink(missing_ok=True)  # don't ship the standalone thumbnails
+            _write_m3u(playlist_dir, pl_title, tracks)
+            stage_root = playlist_dir
+            root_name = pl_title
+            webdav_label = pl_title
+        else:
+            album_dir = Path(finished_dirs.most_common(1)[0][0])
+            if not album_dir.is_dir():
+                # Defensive: keeps fix_music_tags' sys.exit path (BaseException) unreachable.
+                raise RuntimeError(f"Album-Verzeichnis fehlt: {album_dir}")
+            cover_path = (_fetch_cover(url, is_album, album_dir / "cover.jpg", cookiefile=cookiefile)
+                          if tag_options.cover else None)
+            fix_music_tags.process_directory(
+                str(album_dir),
+                str(cover_path) if cover_path else None,
+                album,
+                primary_artist,
+                tag_options,
+            )
+            stage_root = album_dir
+            root_name = f"{primary_artist} - {album}"
+            webdav_label = f"{primary_artist}/{album}"
+
+        # 4) Deliver. WebDAV mirrors the whole work tree into the library (for a
+        #    playlist that's the `<name>/` folder with its tracks + .m3u8); browser
+        #    ZIPs the staged folder under a single top-level name.
         if destination.type == "webdav":
             reporter.on_phase("upload")
             _upload_tree(destination, work_base)
-            return Result(summary=f"WebDAV: {primary_artist}/{album}")
+            return Result(summary=f"WebDAV: {webdav_label}")
 
-        # browser → package the tagged album folder as a ZIP for download
         reporter.on_phase("packaging")
-        root_name = f"{primary_artist} - {album}"
         zip_path = _WORK_ROOT / f"{job_id}.zip"
-        _zip_dir(album_dir, zip_path, root_name)
+        _zip_dir(stage_root, zip_path, root_name)
         return Result(summary=f"{root_name}.zip", zip_path=str(zip_path), zip_name=f"{root_name}.zip")
     finally:
         shutil.rmtree(work_base, ignore_errors=True)

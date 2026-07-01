@@ -122,6 +122,110 @@ def test_mp3_feat_off_keeps_raw_title_and_artist(tmp_path):
     assert str(tags["TPE1"]) == "A, B"
 
 
+def test_albumartist_fallback_uses_normalized_primary_when_none_given(tmp_path):
+    # No explicit album_artist (playlist per-track tagging / CLI): the album artist
+    # is the first segment of the NORMALISED artist, so a comma list "A, B" yields
+    # "A" — not the whole raw tag (issue #11).
+    p = str(tmp_path / "a.mp3")
+    _make_mp3(p)  # TPE1 "A, B", title "Song (feat. B)"
+    fmt.process_file(p, options=TagOptions())  # album_artist omitted → fallback
+    assert str(ID3(p)["TPE2"]) == "A"
+
+
+def test_album_falls_back_to_title_when_empty_and_none_given(tmp_path):
+    # Playlist per-track tagging (issue #11): a track with NO album tag gets its
+    # (feat-stripped) title as the album, so Navidrome shows no "[Unknown Album]".
+    p = str(tmp_path / "a.mp3")
+    tags = ID3()
+    tags.add(TIT2(encoding=3, text="Some Song (feat. B)"))
+    tags.add(TPE1(encoding=3, text="A, B"))
+    tags.save(p, v2_version=3)  # deliberately NO TALB
+    fmt.process_file(p, options=TagOptions())  # album_name omitted → fallback
+    assert str(ID3(p)["TALB"]) == "Some Song"
+
+
+def test_album_fallback_uses_raw_title_when_feat_off(tmp_path):
+    # Consistency with the M4A/Opus path: with feat cleanup off, the empty-album
+    # fallback uses the RAW title (as actually written), not the feat-stripped one.
+    p = str(tmp_path / "a.mp3")
+    tags = ID3()
+    tags.add(TIT2(encoding=3, text="Song (feat. B)"))
+    tags.add(TPE1(encoding=3, text="A, B"))
+    tags.save(p, v2_version=3)  # no TALB
+    fmt.process_file(p, options=TagOptions(feat_artist=False))
+    assert str(ID3(p)["TALB"]) == "Song (feat. B)"   # raw, matches the left-raw title tag
+    assert str(ID3(p)["TIT2"]) == "Song (feat. B)"
+
+
+def test_album_kept_when_present_and_none_given(tmp_path):
+    # A track that already has an album keeps it — the title fallback only fills an
+    # EMPTY album, it never overwrites a real one.
+    p = str(tmp_path / "a.mp3")
+    _make_mp3(p)  # TALB "X"
+    fmt.process_file(p, options=TagOptions())  # album_name omitted
+    assert str(ID3(p)["TALB"]) == "X"
+
+
+def test_albumartist_fallback_feat_off_matches_raw_across_formats(tmp_path):
+    # With feat cleanup OFF and no explicit album_artist, the album artist is the
+    # first segment of the RAW artist — the MP3 path and the shared M4A/Opus path
+    # (_normalized_tags) must agree, no format-dependent divergence (issue #11).
+    p = str(tmp_path / "a.mp3")
+    _make_mp3(p)  # TPE1 "A, B"
+    fmt.process_file(p, options=TagOptions(feat_artist=False))
+    assert str(ID3(p)["TPE2"]) == "A, B"  # raw first segment (no " / "), not parsed "A"
+    assert _normalized_tags("Song", "A, B", "", None, TagOptions(feat_artist=False))[2] == "A, B"
+
+
+def test_process_tree_embeds_per_track_cover_via_callback(tmp_path):
+    # Playlist tracks get a per-track square cover embedded (issue #11): process_tree
+    # calls cover_for(filepath) and writes the returned bytes as the APIC, replacing
+    # the (often 16:9) embedded thumbnail that would otherwise show blurred bars.
+    p = tmp_path / "0001 - A.mp3"
+    _make_mp3(str(p))  # starts with APIC data b"OLD"
+    fmt.process_tree(str(tmp_path), TagOptions(), cover_for=lambda fp: b"SQUARE")
+    assert ID3(str(p)).getall("APIC")[0].data == b"SQUARE"
+
+
+def test_process_tree_keeps_embedded_thumbnail_when_no_cover_supplied(tmp_path):
+    # No cover_for (or it returns None) → the embedded thumbnail is left untouched.
+    p = tmp_path / "0001 - A.mp3"
+    _make_mp3(str(p))
+    fmt.process_tree(str(tmp_path), TagOptions())
+    assert ID3(str(p)).getall("APIC")[0].data == b"OLD"
+
+
+def test_process_tree_tags_each_track_from_its_own_metadata(tmp_path):
+    # A playlist (issue #11) spans many artists/albums: process_tree must walk the
+    # whole tree and normalise each track from its OWN tags — no shared album name
+    # or album-artist forced across tracks (unlike process_directory).
+    d1 = tmp_path / "A" / "AlbumX"
+    d2 = tmp_path / "C" / "AlbumY"
+    d1.mkdir(parents=True)
+    d2.mkdir(parents=True)
+    _make_mp3(str(d1 / "t1.mp3"))  # title "Song (feat. B)", artist "A, B", album "X"
+
+    tags = ID3()
+    tags.add(TIT2(encoding=3, text="Other (feat. Z)"))
+    tags.add(TPE1(encoding=3, text="C, Z"))
+    tags.add(TALB(encoding=3, text="AlbumY"))
+    tags.save(str(d2 / "t2.mp3"), v2_version=3)
+
+    fmt.process_tree(str(tmp_path), TagOptions())
+
+    t1 = ID3(str(d1 / "t1.mp3"))
+    assert str(t1["TIT2"]) == "Song"          # own feat cleanup applied
+    assert str(t1["TPE1"]) == "A / B"
+    assert str(t1["TPE2"]) == "A"             # album-artist = its own primary artist
+    assert str(t1["TALB"]) == "X"             # own album kept, NOT unified
+
+    t2 = ID3(str(d2 / "t2.mp3"))
+    assert str(t2["TIT2"]) == "Other"
+    assert str(t2["TPE1"]) == "C / Z"
+    assert str(t2["TPE2"]) == "C"
+    assert str(t2["TALB"]) == "AlbumY"        # each track keeps its own album
+
+
 _FFMPEG = shutil.which("ffmpeg")
 needs_ffmpeg = pytest.mark.skipif(_FFMPEG is None, reason="ffmpeg not on PATH")
 

@@ -30,6 +30,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         # shared values
         "common.album": "Album",
         "common.single": "Single",
+        "common.playlist": "Playlist",
         "dest.browser": "Im Browser (ZIP)",
         "dest.webdav": "WebDAV",
         "dest.webdav_unconfigured": "WebDAV (nicht konfiguriert)",
@@ -140,6 +141,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         # shared values
         "common.album": "Album",
         "common.single": "Single",
+        "common.playlist": "Playlist",
         "dest.browser": "In browser (ZIP)",
         "dest.webdav": "WebDAV",
         "dest.webdav_unconfigured": "WebDAV (not configured)",
