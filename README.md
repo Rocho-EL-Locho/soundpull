@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="app/static/soundpull-readme-banner.svg" alt="Soundpull" width="720">
+  <img src="app/static/soundpull-readme-banner.svg" alt="Soundpull" width="640">
 </p>
 
 <p align="center">
