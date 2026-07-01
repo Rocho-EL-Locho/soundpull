@@ -233,6 +233,18 @@ def _extractor_args() -> dict:
     return _build_ydl_opts(["--extractor-args", EXTRACTOR_ARGS]).get("extractor_args", {})
 
 
+def _apply_cookie_policy(opts: dict, cookiefile: str | None) -> None:
+    """Pin yt-dlp's cookie source to the user's own cookie — never the server's.
+
+    Sets `cookiefile` to the per-user cookie file (or None → no cookie at all) and
+    forces `cookiesfrombrowser=None`, so yt-dlp never falls back to a browser cookie
+    store on the server. `--ignore-config` already blocks a yt-dlp config file from
+    injecting `--cookies`/`--cookies-from-browser`; this makes the "user cookie or
+    nothing" rule explicit and resistant to future drift (issue #9)."""
+    opts["cookiefile"] = cookiefile      # the user's cookie, or None → no cookie
+    opts["cookiesfrombrowser"] = None    # never read a browser cookie store on the server
+
+
 def _primary_artist(raw: str | None) -> str:
     """Main artist = part before the first ', ' (mirrors `sed 's/, .*//'`)."""
     if not raw or raw == "NA":
@@ -249,8 +261,7 @@ def _probe_meta(url: str, is_album: bool, cookiefile: str | None = None) -> tupl
         "extractor_args": _extractor_args(),
         "logger": _QuietLogger(),
     }
-    if cookiefile:
-        opts["cookiefile"] = cookiefile
+    _apply_cookie_policy(opts, cookiefile)
     if is_album:
         opts["playlist_items"] = "1"
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -286,8 +297,7 @@ def pick_square_cover(thumbnails: list[dict] | None) -> str | None:
 def _fetch_cover(url: str, is_album: bool, dest: Path, cookiefile: str | None = None) -> Path | None:
     """Download the square album cover into `dest` (cover.jpg). Returns path or None."""
     opts = {"quiet": True, "no_warnings": True, "skip_download": True, "logger": _QuietLogger()}
-    if cookiefile:
-        opts["cookiefile"] = cookiefile
+    _apply_cookie_policy(opts, cookiefile)
     if is_album:
         opts["extract_flat"] = True  # playlist-level thumbnails (the album art)
     try:
@@ -399,8 +409,7 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
         flags += ["-o", out_tmpl]
         opts = _build_ydl_opts(flags)
         opts.update({"quiet": True, "no_warnings": True, "noprogress": True, "logger": _QuietLogger()})
-        if cookiefile:
-            opts["cookiefile"] = cookiefile
+        _apply_cookie_policy(opts, cookiefile)
 
         finished_dirs: Counter[str] = Counter()
 
