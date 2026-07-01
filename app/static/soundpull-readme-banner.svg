@@ -1,23 +1,33 @@
-<svg width="1280" height="640" viewBox="0 0 1280 640" fill="none" xmlns="http://www.w3.org/2000/svg">
+<svg width="960" height="280" viewBox="0 0 960 280" fill="none" xmlns="http://www.w3.org/2000/svg">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#0e1014"></stop>
       <stop offset="1" stop-color="#12151b"></stop>
     </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#2CC2B3" stop-opacity="0.35"></stop>
+      <stop offset="1" stop-color="#2CC2B3" stop-opacity="0"></stop>
+    </radialGradient>
   </defs>
-  <rect width="1280" height="640" fill="url(#bg)"></rect>
-  <rect x="452" y="214" width="120" height="120" rx="28" fill="#2CC2B3"></rect>
-  <g transform="translate(482,244) scale(0.5)" color="#0e1014">
-  <rect x="22" y="42" width="10" height="22" rx="5" fill="currentColor"></rect>
-  <rect x="38" y="26" width="10" height="38" rx="5" fill="currentColor"></rect>
-  <rect x="54" y="16" width="10" height="48" rx="5" fill="currentColor"></rect>
-  <rect x="70" y="32" width="10" height="32" rx="5" fill="currentColor"></rect>
-  <rect x="86" y="44" width="10" height="20" rx="5" fill="currentColor"></rect>
-  <polyline points="42,74 60,92 78,74" fill="none" stroke="currentColor" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"></polyline>
-  <line x1="34" y1="104" x2="86" y2="104" stroke="currentColor" stroke-width="9" stroke-linecap="round"></line>
+  <rect width="960" height="280" rx="20" fill="url(#bg)"></rect>
+  <g transform="translate(220,0)">
+    <circle cx="48" cy="140" r="150" fill="url(#glow)"></circle>
+    <!-- logo mark: teal rounded square badge (favicon composition) scaled to 96px -->
+    <g transform="translate(0,92) scale(1.5)">
+      <rect width="64" height="64" rx="15" fill="#2CC2B3"></rect>
+      <g transform="translate(12,12) scale(0.333)" color="#0e1014">
+        <rect x="22" y="42" width="10" height="22" rx="5" fill="currentColor"></rect>
+        <rect x="38" y="26" width="10" height="38" rx="5" fill="currentColor"></rect>
+        <rect x="54" y="16" width="10" height="48" rx="5" fill="currentColor"></rect>
+        <rect x="70" y="32" width="10" height="32" rx="5" fill="currentColor"></rect>
+        <rect x="86" y="44" width="10" height="20" rx="5" fill="currentColor"></rect>
+        <polyline points="42,74 60,92 78,74" fill="none" stroke="currentColor" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"></polyline>
+        <line x1="34" y1="104" x2="86" y2="104" stroke="currentColor" stroke-width="9" stroke-linecap="round"></line>
+      </g>
+    </g>
+    <text x="126" y="150" font-family="'Space Grotesk','Helvetica Neue',Arial,sans-serif" font-size="58" font-weight="700" letter-spacing="-1.5">
+      <tspan fill="#E8EAED">Sound</tspan><tspan fill="#2CC2B3">pull</tspan>
+    </text>
+    <text x="129" y="184" font-family="'IBM Plex Mono','DejaVu Sans Mono',monospace" font-size="18" fill="#9AA0A8" letter-spacing="0.5">YouTube Music &#8594; Navidrome-tagged audio</text>
   </g>
-  <text x="604" y="300" font-family="&#39;Space Grotesk&#39;,&#39;Helvetica Neue&#39;,sans-serif" font-size="72" font-weight="700" letter-spacing="-2">
-    <tspan fill="#E8EAED">sound</tspan><tspan fill="#2CC2B3">pull</tspan>
-  </text>
-  <text x="606" y="352" font-family="&#39;IBM Plex Mono&#39;,monospace" font-size="24" fill="#9AA0A8">YouTube Music -&gt; Navidrome-tagged MP3s</text>
 </svg>
