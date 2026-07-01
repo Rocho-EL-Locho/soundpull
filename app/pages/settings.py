@@ -41,6 +41,8 @@ def settings_page() -> None:
                 "tags": {f: bool(getattr(us, f"tag_{f}")) for f in TAG_OPTION_FIELDS},
                 "wd_url": us.webdav_url or "", "wd_user": us.webdav_username or "",
                 "wd_folder": us.webdav_folder or "", "has_pw": us.has_webdav_password,
+                # Only the "is one stored?" flag — never the plaintext cookie (issue #9).
+                "has_cookie": us.has_youtube_cookies,
             }
 
         with ui.card().classes("glass w-full rounded-2xl p-6 gap-4"):
@@ -64,6 +66,21 @@ def settings_page() -> None:
         with ui.card().classes("glass w-full rounded-2xl p-6 gap-3"):
             ui.label(t("meta.heading")).classes("text-lg font-semibold")
             tag_switches = tag_option_switches(TagOptions(**snap["tags"]))
+
+        # YouTube cookie (issue #9). Defined before the WebDAV card so the shared
+        # save() closure below can persist it. The stored cookie is never echoed
+        # back — only a "set" state via the placeholder.
+        with ui.card().classes("glass w-full rounded-2xl p-6 gap-3"):
+            ui.label(t("settings.cookie_heading")).classes("text-lg font-semibold")
+            ui.label(t("settings.cookie_desc")).classes("text-xs text-white/50")
+            cookie_placeholder = t("settings.cookie_placeholder_set") if snap["has_cookie"] \
+                else t("settings.cookie_label")
+            cookie_ta = ui.textarea(t("settings.cookie_label"), placeholder=cookie_placeholder) \
+                .props("outlined dense dark autogrow").classes("w-full")
+            cookie_clear = ui.switch(t("settings.cookie_clear"), value=False) \
+                .props("dark").classes("text-sm")
+            if not snap["has_cookie"]:
+                cookie_clear.set_visibility(False)  # nothing to remove yet
 
         with ui.card().classes("glass w-full rounded-2xl p-6 gap-3"):
             ui.label(t("settings.webdav_heading")).classes("text-lg font-semibold")
@@ -184,6 +201,11 @@ def settings_page() -> None:
                     row.webdav_username = (wd_user.value or "").strip() or None
                     if (wd_pass.value or "").strip():
                         row.webdav_password_enc = encrypt_secret(wd_pass.value.strip())
+                    # YouTube cookie (issue #9): remove wins; else store new; else keep.
+                    if cookie_clear.value:
+                        row.youtube_cookies_enc = None
+                    elif (cookie_ta.value or "").strip():
+                        row.youtube_cookies_enc = encrypt_secret(cookie_ta.value.strip())
                     row.updated_at = datetime.now(timezone.utc)
                     session.add(row)
                 ui.notify(t("settings.saved"), type="positive")

@@ -8,6 +8,7 @@ top — the postprocessor/metadata behaviour is exactly what the CLI produced.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import zipfile
 from collections import Counter
@@ -39,6 +40,27 @@ _YOUTUBE_HOSTS = {
 def purge_work_root() -> None:
     """Delete leftover staging dirs/ZIPs from previous runs (call at startup)."""
     shutil.rmtree(_WORK_ROOT, ignore_errors=True)
+
+
+def _write_cookie_file(job_id: str, cookies_txt: str | None) -> Path | None:
+    """Persist a user's decrypted cookies.txt to a 0600 file for yt-dlp's `cookiefile`.
+
+    Kept OUTSIDE the per-job work dir on purpose: the WebDAV delivery mirrors the
+    whole work tree, so a cookie inside it would be uploaded. Returns the path, or
+    None when no cookie is given (issue #9). The caller removes it after the job.
+    """
+    if not cookies_txt:
+        return None
+    _WORK_ROOT.mkdir(parents=True, exist_ok=True)
+    path = _WORK_ROOT / f"{job_id}.cookies.txt"
+    # Create the file 0600 atomically (not write-then-chmod) so the secret is never
+    # briefly world-readable at the prevailing umask. job_id is a uuid, so O_EXCL
+    # never trips in practice; unlink first defends against a stale leftover.
+    path.unlink(missing_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(cookies_txt)
+    return path
 
 
 def is_supported_url(raw: str) -> bool:
@@ -218,7 +240,7 @@ def _primary_artist(raw: str | None) -> str:
     return raw.split(", ")[0].strip() or "Unbekannt"
 
 
-def _probe_meta(url: str, is_album: bool) -> tuple[str | None, str | None]:
+def _probe_meta(url: str, is_album: bool, cookiefile: str | None = None) -> tuple[str | None, str | None]:
     """Read artist/album from the first item (like `yt-dlp --simulate --print`)."""
     opts = {
         "quiet": True,
@@ -227,6 +249,8 @@ def _probe_meta(url: str, is_album: bool) -> tuple[str | None, str | None]:
         "extractor_args": _extractor_args(),
         "logger": _QuietLogger(),
     }
+    if cookiefile:
+        opts["cookiefile"] = cookiefile
     if is_album:
         opts["playlist_items"] = "1"
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -259,9 +283,11 @@ def pick_square_cover(thumbnails: list[dict] | None) -> str | None:
     return signed_best or any_best
 
 
-def _fetch_cover(url: str, is_album: bool, dest: Path) -> Path | None:
+def _fetch_cover(url: str, is_album: bool, dest: Path, cookiefile: str | None = None) -> Path | None:
     """Download the square album cover into `dest` (cover.jpg). Returns path or None."""
     opts = {"quiet": True, "no_warnings": True, "skip_download": True, "logger": _QuietLogger()}
+    if cookiefile:
+        opts["cookiefile"] = cookiefile
     if is_album:
         opts["extract_flat"] = True  # playlist-level thumbnails (the album art)
     try:
@@ -322,7 +348,8 @@ def _upload_tree(dest: Destination, local_root: Path) -> None:
 def run_download(*, job_id: str, url: str, genre: str, mode: str,
                  destination: Destination, reporter: Reporter,
                  audio_format: str = DEFAULT_AUDIO_FORMAT,
-                 tag_options: fix_music_tags.TagOptions = fix_music_tags.TagOptions()) -> Result:
+                 tag_options: fix_music_tags.TagOptions = fix_music_tags.TagOptions(),
+                 cookies_txt: str | None = None) -> Result:
     """Execute one download end-to-end and return a Result.
 
     Both destinations stage into a temp work dir; then either a ZIP is packaged
@@ -330,22 +357,35 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
 
     `tag_options` gates which metadata fields are written (issue #7); the default
     (all on) keeps the output byte-identical to the original tool.
+
+    `cookies_txt` is the user's decrypted Netscape cookies.txt (issue #9); when
+    given it is handed to every yt-dlp call so bot-checks/age gates don't block
+    the download. When omitted, no `cookiefile` is set — the output stays
+    byte-identical (metadata parity).
     """
     is_album = mode != "single"
 
-    # 1) Metadata → primary artist + album, to build the output directory.
-    reporter.on_phase("metadata")
-    artist_raw, album_raw = _probe_meta(url, is_album)
-    primary_artist = _primary_artist(artist_raw)
-    album = (album_raw or "Unbekannt Album") if is_album else "Singles"
-    reporter.on_meta(primary_artist, album)
-
-    # 2) Always stage into a temp work dir; the delivery step then packages a
-    #    ZIP (browser) or uploads the tree (webdav). The work dir is removed in
-    #    `finally` so failed jobs don't leak it; the browser ZIP lives outside it.
+    # Materialise the cookie to a 0600 file (kept outside work_base so the WebDAV
+    # delivery never ships it); cleaned up in `finally`. None when no cookie → the
+    # no-cookie path is byte-identical (metadata parity).
+    cookie_path: Path | None = None
     work_base = _WORK_ROOT / job_id
-    work_base.mkdir(parents=True, exist_ok=True)
     try:
+        cookie_path = _write_cookie_file(job_id, cookies_txt)
+        cookiefile = str(cookie_path) if cookie_path else None
+
+        # 1) Metadata → primary artist + album, to build the output directory.
+        reporter.on_phase("metadata")
+        artist_raw, album_raw = _probe_meta(url, is_album, cookiefile=cookiefile)
+        primary_artist = _primary_artist(artist_raw)
+        album = (album_raw or "Unbekannt Album") if is_album else "Singles"
+        reporter.on_meta(primary_artist, album)
+
+        # 2) Always stage into a temp work dir; the delivery step then packages a
+        #    ZIP (browser) or uploads the tree (webdav). The work dir is removed in
+        #    `finally` so failed jobs don't leak it; the browser ZIP lives outside it.
+        work_base.mkdir(parents=True, exist_ok=True)
+
         # `primary_artist` is interpolated literally (not a yt-dlp `%(...)s` field),
         # so sanitise it ourselves to keep it a single, traversal-safe path segment.
         subfolder = "%(album)s" if is_album else "Singles"
@@ -359,6 +399,8 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
         flags += ["-o", out_tmpl]
         opts = _build_ydl_opts(flags)
         opts.update({"quiet": True, "no_warnings": True, "noprogress": True, "logger": _QuietLogger()})
+        if cookiefile:
+            opts["cookiefile"] = cookiefile
 
         finished_dirs: Counter[str] = Counter()
 
@@ -390,7 +432,8 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
             raise RuntimeError(f"Album-Verzeichnis fehlt: {album_dir}")
 
         # 4) Square cover (skipped when the cover field is toggled off).
-        cover_path = _fetch_cover(url, is_album, album_dir / "cover.jpg") if tag_options.cover else None
+        cover_path = (_fetch_cover(url, is_album, album_dir / "cover.jpg", cookiefile=cookiefile)
+                      if tag_options.cover else None)
 
         # 5) Navidrome tag correction (unchanged logic from fix_music_tags.py),
         #    gated per tag_options — all-on keeps the original behaviour.
@@ -417,3 +460,5 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
         return Result(summary=f"{root_name}.zip", zip_path=str(zip_path), zip_name=f"{root_name}.zip")
     finally:
         shutil.rmtree(work_base, ignore_errors=True)
+        if cookie_path:
+            cookie_path.unlink(missing_ok=True)

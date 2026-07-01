@@ -1,5 +1,7 @@
 """Guards metadata parity: parse_options must turn the original flag lists into
 the exact yt-dlp options the bash scripts produced."""
+import stat
+
 from app.fix_music_tags import TagOptions
 from app.pipeline import (
     DEFAULT_AUDIO_FORMAT,
@@ -10,6 +12,7 @@ from app.pipeline import (
     _build_ydl_opts,
     _primary_artist,
     _safe_segment,
+    _write_cookie_file,
     audio_format_short,
     is_supported_url,
     normalize_audio_format,
@@ -140,3 +143,25 @@ def test_safe_segment_blocks_traversal():
     assert _safe_segment("../../etc") == ".._.._etc"
     assert _safe_segment("  ") == "Unbekannt"
     assert _safe_segment("Drake") == "Drake"          # legitimate names untouched
+
+
+def test_write_cookie_file_none_when_empty():
+    # No cookie → no file → the download path stays byte-identical (issue #9 parity).
+    assert _write_cookie_file("job-none", None) is None
+    assert _write_cookie_file("job-empty", "") is None
+
+
+def test_write_cookie_file_writes_verbatim_0600(tmp_path, monkeypatch):
+    import app.pipeline as pipeline
+
+    monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
+    content = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tPREF\tabc\n"
+
+    path = pipeline._write_cookie_file("job-42", content)
+
+    assert path is not None
+    assert path.read_text() == content                       # verbatim, no mangling
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600        # owner-only
+    # kept OUTSIDE the per-job work dir so the WebDAV upload never ships it
+    assert path.name == "job-42.cookies.txt"
+    assert (pipeline._WORK_ROOT / "job-42") not in path.parents

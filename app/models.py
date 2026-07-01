@@ -56,6 +56,11 @@ class UserSettings(SQLModel, table=True):
     webdav_username: str | None = None
     webdav_password_enc: str | None = None  # Fernet-encrypted; never exposed in plaintext
 
+    # Per-user YouTube cookie (issue #9), a Netscape cookies.txt fed to yt-dlp so
+    # age-gated / bot-checked / throttled tracks download. Fernet-encrypted; never
+    # exposed in plaintext to the client.
+    youtube_cookies_enc: str | None = None
+
     updated_at: datetime = Field(default_factory=_utcnow)
 
     user: User = Relationship(back_populates="settings")
@@ -63,6 +68,10 @@ class UserSettings(SQLModel, table=True):
     @property
     def has_webdav_password(self) -> bool:
         return bool(self.webdav_password_enc)
+
+    @property
+    def has_youtube_cookies(self) -> bool:
+        return bool(self.youtube_cookies_enc)
 
 
 class DownloadHistory(SQLModel, table=True):
