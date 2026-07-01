@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from nicegui import app, ui
 
@@ -15,6 +16,12 @@ from app.pages import history, index, settings as settings_page  # noqa: F401,E4
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("main")
+
+# Branding assets live inside the package so they ship in the Docker image
+# (which only copies `app/`). Served at /static; the favicon is exposed by
+# NiceGUI at /favicon.ico (already allow-listed in AuthMiddleware).
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+FAVICON = STATIC_DIR / "soundpull-favicon.svg"
 
 
 def _check_production_config() -> None:
@@ -49,6 +56,9 @@ def healthz() -> dict:
     return {"status": "ok"}
 
 
+# Serve branding assets (logo, banner) for the UI and README.
+app.add_static_files("/static", str(STATIC_DIR))
+
 # Gate every page behind authentication (must be added before the server starts).
 app.add_middleware(auth.AuthMiddleware)
 
@@ -58,7 +68,7 @@ if __name__ in {"__main__", "__mp_main__"}:
         host="0.0.0.0",
         port=8080,
         title="Soundpull",
-        favicon="📥",
+        favicon=str(FAVICON),
         storage_secret=settings.session_secret,
         reload=False,
         show=False,
