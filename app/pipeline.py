@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import zipfile
@@ -180,6 +181,18 @@ def _apply_audio_format(flags: list[str], audio_format: str) -> list[str]:
     return out
 
 
+def _genre_flags(genre: str | None) -> list[str]:
+    """`--postprocessor-args` to force a genre, or `[]` for "no genre" (issue #21).
+
+    An empty/blank genre skips the override so each track keeps its own metadata genre
+    (useful for mixed-artist playlists). A real genre still forces it exactly as before,
+    so the default path is unchanged (parity). Gated additionally by `tag_options.genre`
+    at the call site — off there strips the genre entirely via `fix_music_tags`.
+    """
+    g = (genre or "").strip()
+    return ["--postprocessor-args", f"ffmpeg:-metadata genre={g}"] if g else []
+
+
 def _apply_tag_options(flags: list[str], options: fix_music_tags.TagOptions) -> list[str]:
     """Return a copy of `flags` with download-time fields gated per `options`.
 
@@ -216,6 +229,14 @@ class Result:
     summary: str = ""
     zip_path: str | None = None   # set for browser destination
     zip_name: str | None = None
+    # (artist, title) of every track uploaded to WebDAV — fed to the server index
+    # (issue #21). Populated for all modes; the caller records it only for WebDAV.
+    delivered: list = field(default_factory=list)
+    new_track_count: int = 0      # tracks actually downloaded (relevant for sync)
+    # Updated ordered m3u manifest for a playlist SYNC (see `existing_tracks`); the
+    # caller persists it on the subscription to rebuild the complete playlist next run.
+    playlist_files: list = field(default_factory=list)
+    playlist_name: str = ""       # resolved playlist title (for the subscription UI)
 
 
 @dataclass
@@ -308,6 +329,43 @@ def _probe_playlist(url: str, cookiefile: str | None = None) -> tuple[str, str, 
     entries = [e for e in (info.get("entries") or []) if e]
     count = info.get("playlist_count") or len(entries)
     return title, uploader, int(count or 0)
+
+
+def enumerate_playlist_tracks(url: str, cookiefile: str | None = None,
+                              limit: int = 0) -> list[tuple[str, str]]:
+    """(artist, title) for each playlist entry, metadata only — NO download (issue #21).
+
+    Seeds the server index for a "mark existing" subscription first run: a per-entry
+    (non-flat) extraction so artist/track are the real tags, not the sparse flat
+    fields. `limit` caps entries (0 = unlimited). Mirrors the artist/title fallbacks
+    used by the sync match-filter so the seeded keys line up with later lookups.
+    """
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        # A single unavailable/region-locked entry must not abort enumerating the whole
+        # playlist — skip it (it appears as a None entry) and keep going (issue #21).
+        "ignoreerrors": True,
+        "extractor_args": _extractor_args(),
+        "logger": _QuietLogger(),
+    }
+    _apply_cookie_policy(opts, cookiefile)
+    if limit and limit > 0:
+        opts["playlistend"] = limit
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False) or {}
+    pairs: list[tuple[str, str]] = []
+    for entry in (info.get("entries") or []):
+        if not entry:
+            continue
+        title = entry.get("track") or entry.get("title") or ""
+        artists = entry.get("artists")
+        first = artists[0] if isinstance(artists, list) and artists else ""
+        artist = entry.get("artist") or first or entry.get("uploader") or ""
+        if title:
+            pairs.append((artist, title))
+    return pairs
 
 
 def pick_square_cover(thumbnails: list[dict] | None) -> str | None:
@@ -437,6 +495,76 @@ def _write_m3u(folder: Path, name: str, tracks: list[Path]) -> Path:
     return m3u_path
 
 
+# Leading zero-padded playlist index in a track filename ("0001 - Title.mp3").
+_TRACK_INDEX = re.compile(r"^\s*(\d{1,4})\s*-")
+
+
+def _index_from_name(name: str) -> int:
+    """Playlist index parsed from a track filename ("0003 - X.mp3" → 3), else 0."""
+    m = _TRACK_INDEX.match(name)
+    return int(m.group(1)) if m else 0
+
+
+def _m3u_entries_from_paths(tracks: list[Path]) -> list[dict]:
+    """Build ordered m3u manifest entries (index/name/title/artist/dur) from files."""
+    entries: list[dict] = []
+    for path in tracks:
+        title, artist, dur = _track_meta(path)
+        entries.append({"index": _index_from_name(path.name), "name": path.name,
+                        "title": title, "artist": artist, "dur": dur})
+    return entries
+
+
+def _write_m3u_entries(folder: Path, name: str, entries: list[dict]) -> Path:
+    """Write `<name>.m3u8` from precomputed manifest entries, sorted by index/name.
+
+    Unlike `_write_m3u` (which reads local files), this rebuilds the COMPLETE playlist
+    on an incremental sync (issue #21) from entries that may no longer be on local
+    disk — tracks referenced by bare filename resolve against the folder on the server.
+    """
+    ordered = sorted(entries, key=lambda e: (e.get("index") or 0, e.get("name", "")))
+    lines = ["#EXTM3U", f"#PLAYLIST:{_m3u_line_safe(name)}"]
+    for entry in ordered:
+        title = entry.get("title") or entry.get("name", "")
+        artist = entry.get("artist") or ""
+        head = f"{artist} - {title}" if artist else title
+        lines.append(f"#EXTINF:{entry.get('dur', -1)},{_m3u_line_safe(head)}")
+        lines.append(_m3u_line_safe(entry.get("name", "")))
+    m3u_path = folder / f"{_safe_segment(name)}.m3u8"
+    m3u_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return m3u_path
+
+
+def _merge_manifest(existing: list[dict] | None, new: list[dict]) -> list[dict]:
+    """Union of prior + new manifest entries, deduped by filename (new wins)."""
+    by_name: dict[str, dict] = {e["name"]: e for e in (existing or []) if e.get("name")}
+    for entry in new:
+        if entry.get("name"):
+            by_name[entry["name"]] = entry
+    return list(by_name.values())
+
+
+def _make_match_filter(on_server: Callable[[str, str], bool]):
+    """yt-dlp match_filter: reject a track already on the server (issue #21).
+
+    yt-dlp extracts each entry's full metadata (artist/track) BEFORE downloading the
+    media, then calls this; returning a string skips the entry. `incomplete` is True
+    during playlist enumeration when tags aren't final — we defer (return None) so the
+    real check runs on the complete info_dict.
+    """
+    def _filter(info_dict: dict, incomplete: bool = False) -> str | None:
+        if incomplete or info_dict.get("_type") in ("playlist", "multi_video"):
+            return None
+        title = info_dict.get("track") or info_dict.get("title") or ""
+        artists = info_dict.get("artists")
+        first = artists[0] if isinstance(artists, list) and artists else ""
+        artist = info_dict.get("artist") or first or info_dict.get("uploader") or ""
+        if title and on_server(artist, title):
+            return f"schon auf dem Server: {artist} - {title}".strip()
+        return None
+    return _filter
+
+
 def _ensure_remote_dir(client, posix_dir: str) -> None:
     parts = [p for p in posix_dir.split("/") if p]
     cumulative = ""
@@ -481,7 +609,9 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
                  destination: Destination, reporter: Reporter,
                  audio_format: str = DEFAULT_AUDIO_FORMAT,
                  tag_options: fix_music_tags.TagOptions = fix_music_tags.TagOptions(),
-                 cookies_txt: str | None = None) -> Result:
+                 cookies_txt: str | None = None,
+                 on_server: Callable[[str, str], bool] | None = None,
+                 existing_tracks: list[dict] | None = None) -> Result:
     """Execute one download end-to-end and return a Result.
 
     Both destinations stage into a temp work dir; then either a ZIP is packaged
@@ -499,10 +629,19 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
     spans many artists/albums, so — unlike album/single, which collapse to one
     forced artist+album — each track lands in and is tagged from its OWN
     metadata; unknown/legacy modes fall back to album.
+
+    `on_server(artist, title) -> bool` turns this into a playlist SYNC (issue #21):
+    it becomes a yt-dlp match_filter that skips tracks already on the server, so only
+    new ones download (zero new tracks is then a normal, non-error outcome). It is
+    parity-safe — the filter only selects which entries download, never how the
+    downloaded ones are tagged. When None (every non-sync call) the behaviour and
+    output are unchanged. `existing_tracks` is the subscription's prior m3u manifest,
+    merged with the new tracks to rebuild the COMPLETE `<name>.m3u8`.
     """
     is_playlist = mode == "playlist"
     is_single = mode == "single"
     is_album = not is_playlist and not is_single  # unknown/legacy modes → album
+    is_sync = is_playlist and on_server is not None  # issue #21: only-new-tracks sync
 
     # Materialise the cookie to a 0600 file (kept outside work_base so the WebDAV
     # delivery never ships it); cleaned up in `finally`. None when no cookie → the
@@ -550,7 +689,7 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
         flags = _apply_audio_format(base_flags, audio_format)
         flags = _apply_tag_options(flags, tag_options)
         if tag_options.genre:
-            flags += ["--postprocessor-args", f"ffmpeg:-metadata genre={genre}"]
+            flags += _genre_flags(genre)
         # Playlists keep the per-track thumbnail on disk (as jpg) so we can crop it
         # to a square cover afterwards (issue #11); album/single don't need it (they
         # embed one fetched square album cover). Only when the cover field is on —
@@ -563,6 +702,13 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
         _apply_cookie_policy(opts, cookiefile)
         if is_playlist and settings.max_playlist_items > 0:
             opts["playlistend"] = settings.max_playlist_items  # cap runaway playlists
+        if is_playlist:
+            # A playlist spans many videos; a dead/region-locked one must not abort the
+            # whole run — skip it and download the rest (issue #21). Set on the opts dict
+            # (not the frozen flag lists) so album/single stay strict and tag parity holds.
+            opts["ignoreerrors"] = True
+        if on_server is not None:  # sync: skip tracks already on the server (issue #21)
+            opts["match_filter"] = _make_match_filter(on_server)
 
         finished_dirs: Counter[str] = Counter()
 
@@ -587,6 +733,12 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
             ydl.download([url])
 
         if not finished_dirs:
+            if is_sync:
+                # Nothing new on the playlist — a normal sync outcome, not an error.
+                # Return the prior manifest unchanged so the subscription keeps it.
+                return Result(summary="Keine neuen Titel", new_track_count=0,
+                              playlist_files=list(existing_tracks or []),
+                              playlist_name=pl_title)
             raise RuntimeError("Download lieferte keine Dateien (siehe Logs).")
 
         # 3) Navidrome tag correction (frozen fix_music_tags logic), gated per
@@ -615,7 +767,19 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
                 str(playlist_dir), tag_options, cover_for=cover_for)]
             for src in thumb_by_stem.values():
                 src.unlink(missing_ok=True)  # don't ship the standalone thumbnails
-            _write_m3u(playlist_dir, pl_title, tracks)
+            # Record what we're delivering (issue #21): (artist, title) per track,
+            # read from the FINAL tags so the server index matches later lookups.
+            new_entries = _m3u_entries_from_paths(tracks)
+            delivered = [(e["artist"], e["title"]) for e in new_entries]
+            if is_sync:
+                # Incremental sync: rebuild the COMPLETE playlist from prior + new
+                # tracks so Navidrome shows every track, though we upload only the new
+                # files (+ the regenerated m3u8). Prior tracks already sit in the folder.
+                manifest = _merge_manifest(existing_tracks, new_entries)
+                _write_m3u_entries(playlist_dir, pl_title, manifest)
+            else:
+                manifest = new_entries
+                _write_m3u(playlist_dir, pl_title, tracks)
             stage_root = playlist_dir
             root_name = pl_title
             webdav_label = pl_title
@@ -633,6 +797,12 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
                 primary_artist,
                 tag_options,
             )
+            # Record delivered tracks for the server index (issue #21). Album/single
+            # force one primary artist, so pair each track's title with it.
+            audio_files = sorted(p for p in album_dir.glob("*")
+                                 if p.suffix.lower() in fix_music_tags._SUPPORTED_EXTS)
+            delivered = [(primary_artist, _track_meta(p)[0]) for p in audio_files]
+            manifest = []
             stage_root = album_dir
             root_name = f"{primary_artist} - {album}"
             webdav_label = f"{primary_artist}/{album}"
@@ -643,12 +813,16 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
         if destination.type == "webdav":
             reporter.on_phase("upload")
             _upload_tree(destination, work_base)
-            return Result(summary=f"WebDAV: {webdav_label}")
+            return Result(summary=f"WebDAV: {webdav_label}", delivered=delivered,
+                          new_track_count=len(delivered), playlist_files=manifest,
+                          playlist_name=pl_title)
 
         reporter.on_phase("packaging")
         zip_path = _WORK_ROOT / f"{job_id}.zip"
         _zip_dir(stage_root, zip_path, root_name)
-        return Result(summary=f"{root_name}.zip", zip_path=str(zip_path), zip_name=f"{root_name}.zip")
+        return Result(summary=f"{root_name}.zip", zip_path=str(zip_path), zip_name=f"{root_name}.zip",
+                      delivered=delivered, new_track_count=len(delivered), playlist_files=manifest,
+                      playlist_name=pl_title)
     finally:
         shutil.rmtree(work_base, ignore_errors=True)
         if cookie_path:

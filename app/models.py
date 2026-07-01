@@ -7,6 +7,7 @@ registry, and the future import would double-stringify them and break mapping.
 from datetime import datetime, timezone
 from typing import Optional
 
+from sqlalchemy import UniqueConstraint
 from sqlmodel import Field, Relationship, SQLModel
 
 from app.genres import DEFAULT_GENRE
@@ -94,3 +95,58 @@ class DownloadHistory(SQLModel, table=True):
 
     created_at: datetime = Field(default_factory=_utcnow, index=True)
     finished_at: datetime | None = None
+
+
+class ServerTrack(SQLModel, table=True):
+    """Per-user index of tracks known to be on the server (issue #21).
+
+    The detector for playlist interval-sync: "does <artist> already have <title> on
+    the server?" A row is the normalised (artist, title) of a track Soundpull has
+    delivered to WebDAV (populated on every successful WebDAV upload; seedable via a
+    directory scan). The keys are normalised by `app.library_index.track_key`, so a
+    lookup matches regardless of feat-suffixes or the raw-vs-tagged artist form.
+    """
+    __table_args__ = (
+        UniqueConstraint("user_id", "artist_norm", "title_norm",
+                         name="uq_servertrack_user_artist_title"),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    artist_norm: str = Field(index=True)
+    title_norm: str = Field(index=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class PlaylistSubscription(SQLModel, table=True):
+    """A playlist the user wants auto-synced on an interval (issue #21).
+
+    The scheduler enqueues a sync every `interval_hours`; each sync downloads only
+    tracks not already on the server (see `ServerTrack`) and uploads them via WebDAV
+    (destination/credentials/tag-options are taken from the user's `UserSettings` at
+    sync time — a subscription therefore requires WebDAV to be configured).
+    """
+    id: int | None = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+
+    url: str
+    name: str = "Playlist"          # cached playlist title (for the UI)
+    interval_hours: int = 24        # sync cadence
+    enabled: bool = True
+    genre: str = DEFAULT_GENRE
+    audio_format: str = "mp3_320"
+    # First run: "download_all" fetches everything now; "mark_existing" seeds the
+    # index with the current playlist (no download) so only future additions arrive.
+    initial_mode: str = "download_all"
+
+    # Ordered manifest (JSON) of tracks this subscription placed into the playlist
+    # folder, used to regenerate the complete `<name>.m3u8` on each incremental sync.
+    playlist_files: str | None = None
+
+    last_checked_at: datetime | None = None   # last scheduler evaluation / enqueue
+    last_synced_at: datetime | None = None     # last successful sync
+    last_status: str = "idle"                  # idle | ok | error
+    last_error: str | None = None
+    last_new_count: int = 0                    # tracks added by the last sync
+
+    created_at: datetime = Field(default_factory=_utcnow, index=True)

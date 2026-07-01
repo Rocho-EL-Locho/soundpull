@@ -60,6 +60,7 @@ def history_page() -> None:
                     ui.label(label).classes(f"text-sm {color}")
                 with ui.row().classes("items-center gap-3 text-xs text-white/45 flex-wrap"):
                     ui.label(it["created"].strftime("%d.%m.%Y %H:%M"))
-                    ui.label(f"{it['mode']} · {it['genre']} · {it['audio']} · {it['dest']}")
+                    genre = it["genre"] or t("genre.none")
+                    ui.label(f"{it['mode']} · {genre} · {it['audio']} · {it['dest']}")
                 if it["error"]:
                     ui.label(it["error"]).classes("text-red-400 text-xs")

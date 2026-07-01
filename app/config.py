@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     # Cap on tracks fetched from a single playlist (issue #11). 0 = unlimited.
     max_playlist_items: int = 100
 
+    # Playlist interval-sync (issue #21). `sync_enabled` is the master switch for the
+    # background scheduler; `sync_tick_seconds` is how often it checks for due
+    # subscriptions (the per-subscription cadence is `interval_hours`).
+    sync_enabled: bool = True
+    sync_tick_seconds: int = 60
+
     # Optional SSRF guard: comma-separated host allowlist for WebDAV targets.
     # Empty = no restriction (any host the server can reach is allowed).
     webdav_allowed_hosts: str = ""

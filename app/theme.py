@@ -101,6 +101,7 @@ def frame(active: str = "download"):
             with ui.row().classes("items-center gap-1"):
                 _nav_link(t("nav.download"), "/", "download", active)
                 _nav_link(t("nav.history"), "/history", "history", active)
+                _nav_link(t("nav.subscriptions"), "/subscriptions", "subscriptions", active)
                 _nav_link(t("nav.settings"), "/settings", "settings", active)
                 ui.element("div").classes("w-px h-6 bg-white/15 mx-2")
                 _language_selector()

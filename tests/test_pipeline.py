@@ -17,11 +17,16 @@ from app.pipeline import (
     _apply_cookie_policy,
     _apply_tag_options,
     _build_ydl_opts,
+    _genre_flags,
+    _index_from_name,
+    _make_match_filter,
+    _merge_manifest,
     _primary_artist,
     _safe_segment,
     _square_crop_jpeg,
     _write_cookie_file,
     _write_m3u,
+    _write_m3u_entries,
     audio_format_short,
     is_supported_url,
     normalize_audio_format,
@@ -249,6 +254,71 @@ def test_apply_cookie_policy_pins_user_cookie_and_forbids_browser():
     _apply_cookie_policy(opts, "/work/job.cookies.txt")
     assert opts["cookiefile"] == "/work/job.cookies.txt"
     assert opts["cookiesfrombrowser"] is None
+
+
+def test_genre_flags_forces_real_genre_but_skips_empty():
+    # A real genre forces the metadata override exactly as before (parity)…
+    assert _genre_flags("Rap") == ["--postprocessor-args", "ffmpeg:-metadata genre=Rap"]
+    # …while "no genre" (empty/blank) skips it → track keeps its own genre (issue #21).
+    assert _genre_flags("") == []
+    assert _genre_flags("   ") == []
+    assert _genre_flags(None) == []
+
+
+def test_default_download_opts_set_no_match_filter():
+    # Parity (issue #21): a normal (non-sync) download must not carry a match_filter
+    # that could skip tracks — parse_options leaves it None.
+    for flags in (_ALBUM_FLAGS, _SINGLE_FLAGS):
+        assert _build_ydl_opts(flags + _OUT).get("match_filter") is None
+
+
+def test_match_filter_rejects_tracks_on_server():
+    # The sync match-filter skips a track already on the server, keeps a new one,
+    # defers while incomplete, and ignores the playlist envelope (issue #21).
+    known = {("drake", "hotline bling")}
+    mf = _make_match_filter(lambda artist, title: (
+        # mirror library_index.track_key just enough for the test's inputs
+        artist.split(",")[0].strip().casefold(),
+        title.casefold(),
+    ) in known)
+
+    # already on server → rejected (non-None reason string)
+    assert mf({"_type": "video", "title": "hotline bling", "artist": "drake"}) is not None
+    # new track → downloaded (None)
+    assert mf({"_type": "video", "title": "gods plan", "artist": "drake"}) is None
+    # partial metadata during enumeration → defer (never reject early)
+    assert mf({"title": "hotline bling", "artist": "drake"}, incomplete=True) is None
+    # the playlist container itself is never filtered out
+    assert mf({"_type": "playlist", "title": "hotline bling"}) is None
+
+
+def test_merge_manifest_dedupes_by_name_new_wins():
+    existing = [{"index": 1, "name": "0001 - A.mp3", "title": "A", "artist": "X", "dur": 10}]
+    new = [{"index": 1, "name": "0001 - A.mp3", "title": "A2", "artist": "X", "dur": 11},
+           {"index": 2, "name": "0002 - B.mp3", "title": "B", "artist": "Y", "dur": 20}]
+    merged = _merge_manifest(existing, new)
+    by_name = {e["name"]: e for e in merged}
+    assert len(merged) == 2
+    assert by_name["0001 - A.mp3"]["title"] == "A2"   # new entry wins on collision
+
+
+def test_index_from_name():
+    assert _index_from_name("0007 - Song.mp3") == 7
+    assert _index_from_name("no-index.mp3") == 0
+
+
+def test_write_m3u_entries_rebuilds_complete_playlist_sorted(tmp_path):
+    # A sync rebuilds the full m3u8 from a manifest whose files may not be on local
+    # disk; entries are ordered by index and referenced by bare filename (issue #21).
+    entries = [
+        {"index": 2, "name": "0002 - B.mp3", "title": "B", "artist": "Y", "dur": 20},
+        {"index": 1, "name": "0001 - A.mp3", "title": "A", "artist": "X", "dur": 10},
+    ]
+    m3u = _write_m3u_entries(tmp_path, "My Mix", entries)
+    body = m3u.read_text(encoding="utf-8").splitlines()
+    assert body[0] == "#EXTM3U"
+    track_lines = [ln for ln in body if not ln.startswith("#")]
+    assert track_lines == ["0001 - A.mp3", "0002 - B.mp3"]   # sorted by index
 
 
 def test_write_cookie_file_none_when_empty():

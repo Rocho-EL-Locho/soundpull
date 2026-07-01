@@ -6,11 +6,13 @@ and audio-format labels drifting from app.pipeline.AUDIO_FORMATS.
 """
 from string import Formatter
 
+from app.genres import ALLOWED_GENRES
 from app.i18n import (
     DEFAULT_LANGUAGE,
     SUPPORTED_LANGUAGES,
     TRANSLATIONS,
     audio_format_labels,
+    genre_options,
     t,
 )
 from app.pipeline import AUDIO_FORMATS
@@ -41,6 +43,13 @@ def test_format_slots_match_across_languages():
 def test_audio_labels_cover_every_format():
     # Outside a request context current_language() falls back to the default.
     assert set(audio_format_labels()) == set(AUDIO_FORMATS)
+
+
+def test_genre_options_include_no_genre_choice():
+    # Every real genre plus an empty-string "no genre" option (issue #21).
+    opts = genre_options()
+    assert set(ALLOWED_GENRES) <= set(opts)
+    assert opts[""] == TRANSLATIONS[DEFAULT_LANGUAGE]["genre.none"]
 
 
 def test_t_falls_back_to_key_when_missing():

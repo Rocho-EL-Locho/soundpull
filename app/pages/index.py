@@ -8,8 +8,8 @@ from nicegui import ui
 from app.auth import get_current_user
 from app.db import session_scope
 from app.fix_music_tags import TagOptions
-from app.genres import ALLOWED_GENRES, DEFAULT_GENRE
-from app.i18n import audio_format_labels, t
+from app.genres import DEFAULT_GENRE
+from app.i18n import audio_format_labels, genre_options, t
 from app.jobs import JobState, get_user_jobs, start_job, tag_options_from_settings
 from app.pipeline import is_supported_url, normalize_audio_format
 from app.theme import frame, tag_option_switches
@@ -31,7 +31,7 @@ def _job_card(js: JobState, delivered: set[str]) -> None:
             with ui.column().classes("gap-0 min-w-0"):
                 ui.label(js.album or "…").classes("font-semibold truncate")
                 ui.label(js.artist or "…").classes("text-sm text-white/60 truncate")
-            ui.label(js.genre).classes("text-xs px-2 py-0.5 rounded-full glass text-white/70")
+            ui.label(js.genre or t("genre.none")).classes("text-xs px-2 py-0.5 rounded-full glass text-white/70")
 
         if js.phase == "error":
             ui.icon("error").classes("text-red-400")
@@ -112,7 +112,7 @@ def index_page(url: str = "") -> None:
                               placeholder="https://music.youtube.com/...") \
                 .props("outlined dense dark").classes("w-full")
             with ui.row().classes("w-full gap-3 items-end"):
-                genre_sel = ui.select(ALLOWED_GENRES, value=d_genre, label=t("index.genre_label")) \
+                genre_sel = ui.select(genre_options(), value=d_genre, label=t("index.genre_label")) \
                     .props("outlined dense dark").classes("flex-1 min-w-32")
                 with ui.column().classes("gap-1"):
                     ui.label(t("index.mode_label")).classes("text-xs text-white/50")

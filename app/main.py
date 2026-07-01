@@ -10,9 +10,15 @@ from app import auth
 from app.config import DEFAULT_SESSION_SECRET, settings
 from app.db import init_db
 from app.pipeline import purge_work_root
+from app.scheduler import start_scheduler, stop_scheduler
 
 # Import page modules so their @ui.page routes are registered.
-from app.pages import history, index, settings as settings_page  # noqa: F401,E402
+from app.pages import (  # noqa: F401,E402
+    history,
+    index,
+    settings as settings_page,
+    subscriptions,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("main")
@@ -61,6 +67,11 @@ app.add_static_files("/static", str(STATIC_DIR))
 
 # Gate every page behind authentication (must be added before the server starts).
 app.add_middleware(auth.AuthMiddleware)
+
+# Background scheduler for playlist interval-sync (issue #21). Runs in-process; the
+# start/stop are no-ops when SYNC_ENABLED=false.
+app.on_startup(start_scheduler)
+app.on_shutdown(stop_scheduler)
 
 
 if __name__ in {"__main__", "__mp_main__"}:
