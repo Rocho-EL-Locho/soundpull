@@ -83,7 +83,7 @@ def _persist(job_id: str, **fields) -> None:
 
 
 def _run(job_id: str, url: str, genre: str, mode: str, destination: Destination,
-         audio_format: str, tag_options: TagOptions) -> None:
+         audio_format: str, tag_options: TagOptions, cookies_txt: str | None) -> None:
     js = _registry[job_id]
 
     def on_phase(phase: str) -> None:
@@ -107,7 +107,8 @@ def _run(job_id: str, url: str, genre: str, mode: str, destination: Destination,
     try:
         result = run_download(job_id=job_id, url=url, genre=genre, mode=mode,
                               destination=destination, reporter=reporter,
-                              audio_format=audio_format, tag_options=tag_options)
+                              audio_format=audio_format, tag_options=tag_options,
+                              cookies_txt=cookies_txt)
         with _lock:
             js.phase, js.finished_at = "done", _utcnow()
             js.result_path = result.zip_path
@@ -146,6 +147,10 @@ def start_job(*, user_id: int, url: str, genre: str, mode: str, destination_type
             destination.webdav_password = (
                 decrypt_secret(us.webdav_password_enc) if us.webdav_password_enc else None
             )
+        # Per-user YouTube cookie (issue #9): decrypt here and pass it through as a
+        # call argument only (never stored on JobState/DB, to avoid holding plaintext).
+        # Applies to both destinations, so it's independent of destination_type.
+        cookies_txt = decrypt_secret(us.youtube_cookies_enc) if us and us.youtube_cookies_enc else None
         if tag_options is None:
             tag_options = tag_options_from_settings(us)
         session.add(DownloadHistory(
@@ -158,7 +163,7 @@ def start_job(*, user_id: int, url: str, genre: str, mode: str, destination_type
                   tag_options=tag_options)
     with _lock:
         _registry[job_id] = js
-    _executor.submit(_run, job_id, url, genre, mode, destination, audio_format, tag_options)
+    _executor.submit(_run, job_id, url, genre, mode, destination, audio_format, tag_options, cookies_txt)
     return job_id
 
 

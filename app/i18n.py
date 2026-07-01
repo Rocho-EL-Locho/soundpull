@@ -109,6 +109,16 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "settings.connect_button": "Verbinden & Ordner wählen",
         "settings.saved": "Einstellungen gespeichert",
         "settings.save_button": "Speichern",
+        # YouTube cookie (issue #9)
+        "settings.cookie_heading": "YouTube-Cookie",
+        "settings.cookie_desc": "Optional: Cookie hinterlegen, damit altersbeschränkte oder "
+                                "gesperrte Titel und „Bestätige, dass du kein Bot bist“-Sperren "
+                                "umgangen werden. Exportiere deine cookies.txt mit einer "
+                                "Browser-Erweiterung (z. B. „Get cookies.txt LOCALLY“) und füge "
+                                "den Inhalt hier ein. Wird verschlüsselt gespeichert.",
+        "settings.cookie_label": "cookies.txt (Inhalt einfügen)",
+        "settings.cookie_placeholder_set": "•••••••• (gesetzt — leer lassen zum Behalten)",
+        "settings.cookie_clear": "Gespeicherten Cookie entfernen",
         "settings.bookmarklet_heading": "Bookmarklet",
         "settings.bm_setup": "Einmalig einrichten:",
         "settings.bm_step1": "1. Code unten mit „Code kopieren“ kopieren.",
@@ -209,6 +219,15 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "settings.connect_button": "Connect & choose folder",
         "settings.saved": "Settings saved",
         "settings.save_button": "Save",
+        # YouTube cookie (issue #9)
+        "settings.cookie_heading": "YouTube cookie",
+        "settings.cookie_desc": "Optional: provide a cookie so age-restricted or blocked tracks "
+                                "and “confirm you're not a bot” prompts are bypassed. Export your "
+                                "cookies.txt with a browser extension (e.g. “Get cookies.txt "
+                                "LOCALLY”) and paste its contents here. Stored encrypted.",
+        "settings.cookie_label": "cookies.txt (paste contents)",
+        "settings.cookie_placeholder_set": "•••••••• (set — leave empty to keep)",
+        "settings.cookie_clear": "Remove stored cookie",
         "settings.bookmarklet_heading": "Bookmarklet",
         "settings.bm_setup": "One-time setup:",
         "settings.bm_step1": "1. Copy the code below with “Copy code”.",

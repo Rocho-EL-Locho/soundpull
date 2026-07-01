@@ -42,6 +42,8 @@ settings and download history.
   WebDAV target you pick from a built-in folder browser
 - 🌍 **Bilingual UI** — switch the interface between English and German
 - 🔐 **Protected** — login via authentik (OIDC); optionally restrict to a group
+- 🍪 **Your own YouTube cookie** — optionally store a `cookies.txt` (encrypted, per user) to
+  download age-gated / region-locked tracks and get past "confirm you're not a bot" prompts
 - 👤 **Per-user** — personal defaults, WebDAV credentials (encrypted) and history
 - 📊 **Live progress** — watch each download move through its stages in real time
 - 🔖 **Bookmarklet** — one click on a YouTube Music page opens Soundpull with the URL filled in
@@ -90,7 +92,7 @@ Set via environment / `.env` (see `.env.example`):
 |---|---|
 | `APP_BASE_URL` | Public URL of the app (redirect URIs, bookmarklet) |
 | `SESSION_SECRET` | Signs the session cookie |
-| `FERNET_KEY` | Encrypts stored WebDAV passwords at rest |
+| `FERNET_KEY` | Encrypts stored secrets at rest (WebDAV passwords, YouTube cookies) |
 | `OIDC_DISCOVERY_URL`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `OIDC_REDIRECT_URI` | authentik OIDC |
 | `OIDC_SCOPES` | *(optional)* OIDC scopes (default `openid email profile`) |
 | `OIDC_ALLOWED_GROUP` | *(optional)* restrict access to a group |
@@ -112,6 +114,18 @@ Set via environment / `.env` (see `.env.example`):
 In **Settings** you set your defaults (genre, quality/format, destination, and which metadata
 fields to write), pick the interface language, and, for WebDAV, connect and browse to a target
 folder. Your WebDAV password is stored encrypted.
+
+### YouTube cookie (for restricted tracks)
+
+Some tracks are age-gated, region-locked, or trip YouTube's "Sign in to confirm you're not a
+bot" check. To download those, store your own YouTube cookie in **Settings → YouTube cookie**:
+
+1. In your browser (signed in to YouTube), export a `cookies.txt` with a Netscape-format
+   cookie extension such as **Get cookies.txt LOCALLY**.
+2. Paste the file's contents into the **YouTube cookie** field and save.
+
+The cookie is [Fernet-encrypted](SECURITY.md) at rest (requires `FERNET_KEY`), is never shown
+back to you, and is used only for your own downloads. Toggle **Remove stored cookie** to delete it.
 
 ## Tech stack
 
