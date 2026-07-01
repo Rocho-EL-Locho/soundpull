@@ -218,6 +218,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
             app.storage.user.get("authenticated")
             or path in UNRESTRICTED_ROUTES
             or path.startswith("/_nicegui")
+            or path.startswith("/static/")
         ):
             return await call_next(request)
         target = path + (f"?{request.url.query}" if request.url.query else "")

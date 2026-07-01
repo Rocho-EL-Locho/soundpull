@@ -1,9 +1,13 @@
-# Soundpull
+<p align="center">
+  <img src="app/static/soundpull-readme-banner.svg" alt="Soundpull" width="720">
+</p>
 
-[![Tests](https://github.com/Rocho-EL-Locho/soundpull/actions/workflows/ci.yml/badge.svg)](https://github.com/Rocho-EL-Locho/soundpull/actions/workflows/ci.yml)
-[![Build & publish](https://github.com/Rocho-EL-Locho/soundpull/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/Rocho-EL-Locho/soundpull/actions/workflows/docker-publish.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
+<p align="center">
+  <a href="https://github.com/Rocho-EL-Locho/soundpull/actions/workflows/ci.yml"><img src="https://github.com/Rocho-EL-Locho/soundpull/actions/workflows/ci.yml/badge.svg" alt="Tests"></a>
+  <a href="https://github.com/Rocho-EL-Locho/soundpull/actions/workflows/docker-publish.yml"><img src="https://github.com/Rocho-EL-Locho/soundpull/actions/workflows/docker-publish.yml/badge.svg" alt="Build & publish"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/Python-3.11%2B-blue" alt="Python">
+</p>
 
 **Soundpull turns YouTube Music links into properly tagged audio — MP3 or the original Opus/M4A.**
 

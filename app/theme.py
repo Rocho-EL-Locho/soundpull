@@ -94,9 +94,10 @@ def frame(active: str = "download"):
 
     with ui.element("div").classes("glass sticky top-0 z-50 w-full"):
         with ui.row().classes("w-full max-w-5xl mx-auto items-center justify-between px-6 py-3"):
-            with ui.row().classes("items-center gap-2"):
-                ui.icon("graphic_eq").classes("text-2xl accent-text")
-                ui.label("Soundpull").classes("text-lg font-semibold")
+            with ui.link(target="/").classes("flex items-center gap-2 no-underline"):
+                ui.html('<img src="/static/soundpull-icon.svg" alt="Soundpull" class="h-7 w-7">')
+                ui.html('<span class="text-lg font-bold tracking-tight text-white">'
+                        'Sound<span style="color:#2CC2B3">pull</span></span>')
             with ui.row().classes("items-center gap-1"):
                 _nav_link(t("nav.download"), "/", "download", active)
                 _nav_link(t("nav.history"), "/history", "history", active)
