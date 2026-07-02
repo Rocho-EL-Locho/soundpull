@@ -84,6 +84,40 @@ def test_single_has_no_playlist_track_remap():
     assert "EmbedThumbnail" in keys
 
 
+# Frozen postprocessor chains for the pinned yt-dlp (== in pyproject, issue #37).
+# The full ORDERED key list — not just presence — so a yt-dlp bump that reorders,
+# drops, adds or reworks a postprocessor fails CI instead of silently shipping a
+# changed extraction/tagging path. Re-verify against real tag output, then update
+# these lists deliberately, when bumping the pin.
+_ALBUM_PP_CHAIN = [
+    "MetadataParser",
+    "FFmpegThumbnailsConvertor",
+    "FFmpegExtractAudio",
+    "FFmpegMetadata",
+    "EmbedThumbnail",
+    "FFmpegConcat",
+]
+_SINGLE_PP_CHAIN = [
+    "FFmpegThumbnailsConvertor",
+    "FFmpegExtractAudio",
+    "FFmpegMetadata",
+    "EmbedThumbnail",
+    "FFmpegConcat",
+]
+
+
+def test_postprocessor_chain_snapshot_parity():
+    # Snapshot guard for the metadata-parity invariant: the pinned yt-dlp must
+    # produce exactly this postprocessor chain (mp3 / 320 extraction included). A
+    # bump that changes the chain must break this test — that's the whole point.
+    for flags, expected in ((_ALBUM_FLAGS, _ALBUM_PP_CHAIN), (_SINGLE_FLAGS, _SINGLE_PP_CHAIN)):
+        opts = _build_ydl_opts(flags + _OUT)
+        assert _pp_keys(opts) == expected
+        extract = next(pp for pp in opts["postprocessors"] if pp["key"] == "FFmpegExtractAudio")
+        assert extract["preferredcodec"] == "mp3"
+        assert extract["preferredquality"] == "320"
+
+
 def test_default_audio_format_is_noop_parity():
     # The default (mp3_320) must not alter the original flag lists at all —
     # byte-identical flags → byte-identical tags (the parity invariant).

@@ -11,7 +11,12 @@ dependencies = [
     "sqlmodel>=0.0.21",
     "pydantic-settings>=2.2",
     "cryptography>=42.0",
-    "yt-dlp>=2024.8.6",
+    # Pinned exactly for metadata parity: a floating yt-dlp can silently change
+    # extraction/tagging and break the byte-identical tag output the pipeline
+    # guarantees. Bumps come as reviewed Dependabot PRs, each re-verified against
+    # real tag output (guarded by the postprocessor-chain snapshot in
+    # tests/test_pipeline.py). See issue #37.
+    "yt-dlp==2026.6.9",
     "mutagen>=1.47",
     "webdav4>=0.10",
 ]
