@@ -55,7 +55,8 @@ def settings_page() -> None:
                 with ui.column().classes("gap-1"):
                     ui.label(t("settings.default_mode")).classes("text-xs text-white/50")
                     mode_tgl = ui.toggle({"album": t("common.album"), "single": t("common.single"),
-                                          "playlist": t("common.playlist")}, value=snap["mode"]) \
+                                          "playlist": t("common.playlist"),
+                                          "artist": t("common.artist")}, value=snap["mode"]) \
                         .props("toggle-color=primary unelevated no-caps").classes("glass rounded-lg")
             audio_sel = ui.select(audio_format_labels(), value=snap["audio"],
                                   label=t("settings.default_audio")) \

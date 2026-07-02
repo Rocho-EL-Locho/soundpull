@@ -247,6 +247,9 @@ class Reporter:
     on_phase: Callable[[str], None] = field(default=lambda phase: None)
     on_meta: Callable[[str, str], None] = field(default=lambda artist, album: None)
     on_track: Callable[[int, int], None] = field(default=lambda cur, tot: None)
+    # Album-level progress for an artist run (issue #32): (current, total, album name).
+    # No-op by default so album/single/playlist callers are unaffected.
+    on_album: Callable[[int, int, str], None] = field(default=lambda cur, tot, name: None)
 
 
 class _QuietLogger:
@@ -369,6 +372,50 @@ def enumerate_playlist_tracks(url: str, cookiefile: str | None = None,
         if title:
             pairs.append((artist, title))
     return pairs
+
+
+def enumerate_artist(url: str, cookiefile: str | None = None,
+                     limit: int = 0) -> tuple[str, list[dict]]:
+    """Artist name + every release for an artist/channel URL, metadata only (issue #32).
+
+    A YouTube Music artist's whole catalogue (albums, EPs AND singles) surfaces via the
+    channel's `/releases` tab, where each release is an `OLAK5uy_…` album playlist. We flat-probe
+    the given URL to resolve its `channel_url`, then flat-extract `<channel_url>/releases`. Every
+    release is downloaded through the normal album path, so a single lands as a 1-track album
+    folder (faithful to how YT Music / Navidrome model it). `limit` caps the number of releases
+    (0 = unlimited). Returns `(artist_name, [{"title", "url"}, …])`.
+    """
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extract_flat": True,
+        # A dead/region-locked release must not abort enumerating the whole discography.
+        "ignoreerrors": True,
+        "extractor_args": _extractor_args(),
+        "logger": _QuietLogger(),
+    }
+    _apply_cookie_policy(opts, cookiefile)
+
+    releases_url = url if url.rstrip("/").endswith("/releases") else None
+    if releases_url is None:
+        with yt_dlp.YoutubeDL({**opts, "playlistend": 1}) as ydl:
+            probe = ydl.extract_info(url, download=False) or {}
+        channel_url = (probe.get("channel_url") or probe.get("uploader_url")
+                       or probe.get("webpage_url") or url)
+        releases_url = channel_url.rstrip("/") + "/releases"
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(releases_url, download=False) or {}
+    artist = (info.get("channel") or info.get("uploader")
+              or (info.get("title") or "").removesuffix(" - Releases") or "Artist")
+    releases: list[dict] = []
+    for entry in (info.get("entries") or []):
+        if entry and entry.get("url"):
+            releases.append({"title": entry.get("title") or "Album", "url": entry["url"]})
+    if limit and limit > 0:
+        releases = releases[:limit]
+    return artist, releases
 
 
 def pick_square_cover(thumbnails: list[dict] | None) -> str | None:
@@ -647,7 +694,9 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
                  cookies_txt: str | None = None,
                  on_server: Callable[[str, str], bool] | None = None,
                  existing_ref: Callable[[str, str], str | None] | None = None,
-                 existing_tracks: list[dict] | None = None) -> Result:
+                 existing_tracks: list[dict] | None = None,
+                 stage_dir: Path | None = None, deliver: bool = True,
+                 album_name: str | None = None) -> Result:
     """Execute one download end-to-end and return a Result.
 
     Both destinations stage into a temp work dir; then either a ZIP is packaged
@@ -679,6 +728,20 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
     re-downloaded). Ignored for album/single (no m3u). `existing_tracks` is a
     subscription's prior m3u manifest, merged with new+referenced tracks to rebuild the
     COMPLETE `<name>.m3u8`.
+
+    `stage_dir` / `deliver` support the artist orchestrator (issue #32): when `stage_dir` is
+    given, the run stages into THAT shared dir (instead of `_WORK_ROOT/job_id`) and the caller
+    owns its lifetime — so this call must NOT remove it. With `deliver=False` the staged, tagged
+    tree is left in place and the delivery step (ZIP / WebDAV upload) is skipped; the returned
+    Result carries `delivered` so the caller can deliver the combined tree once. The download +
+    tag steps in between are unchanged, so metadata parity is unaffected.
+
+    `album_name` (album mode, issue #32) forces the album folder + tag to a known release title
+    instead of trusting each track's `%(album)s`. The artist orchestrator passes the release
+    title from the `/releases` tab so a single (which carries no album tag) lands in its own
+    `Artist/<Release>/` folder instead of collapsing every tag-less single into one shared
+    `%(album)s`→"NA" folder (where they would cross-contaminate on tagging). None (a plain
+    album/single download) keeps the original `%(album)s`/"Singles" behaviour → parity preserved.
     """
     is_playlist = mode == "playlist"
     is_single = mode == "single"
@@ -696,7 +759,9 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
     # delivery never ships it); cleaned up in `finally`. None when no cookie → the
     # no-cookie path is byte-identical (metadata parity).
     cookie_path: Path | None = None
-    work_base = _WORK_ROOT / job_id
+    # An artist run stages many releases into ONE shared dir it owns (issue #32); a plain
+    # run gets its own per-job dir that we clean up in `finally`.
+    work_base = stage_dir if stage_dir is not None else _WORK_ROOT / job_id
     try:
         cookie_path = _write_cookie_file(job_id, cookies_txt)
         cookiefile = str(cookie_path) if cookie_path else None
@@ -725,12 +790,17 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
         else:
             artist_raw, album_raw = _probe_meta(url, is_album, cookiefile=cookiefile)
             primary_artist = _primary_artist(artist_raw)
-            album = (album_raw or "Unbekannt Album") if is_album else "Singles"
+            album = (album_name or album_raw or "Unbekannt Album") if is_album else "Singles"
             reporter.on_meta(primary_artist, album)
             # `primary_artist` is interpolated literally (not a yt-dlp `%(...)s`
             # field), so sanitise it ourselves to keep it a single, traversal-safe
-            # path segment.
-            subfolder = "%(album)s" if is_album else "Singles"
+            # path segment. With a known `album_name` (artist mode) the album folder is
+            # likewise a literal segment — so tag-less singles get distinct per-release
+            # folders instead of collapsing into one `%(album)s`→"NA" directory.
+            if is_album and album_name:
+                subfolder = _safe_segment(album)
+            else:
+                subfolder = "%(album)s" if is_album else "Singles"
             out_tmpl = str(work_base / _safe_segment(primary_artist) / subfolder / "%(title)s.%(ext)s")
             base_flags = _ALBUM_FLAGS if is_album else _SINGLE_FLAGS
 
@@ -811,7 +881,7 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
                     # downloaded: regenerate + upload just the .m3u8 (no duplicate files).
                     playlist_dir.mkdir(parents=True, exist_ok=True)
                     _write_m3u_entries(playlist_dir, pl_title, manifest)
-                    if destination.type == "webdav":
+                    if deliver and destination.type == "webdav":
                         reporter.on_phase("upload")
                         _upload_tree(destination, work_base)
                 return Result(summary="Keine neuen Titel", new_track_count=0,
@@ -888,6 +958,13 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
             root_name = f"{primary_artist} - {album}"
             webdav_label = f"{primary_artist}/{album}"
 
+        # Artist run (issue #32): the staged, tagged tree stays in the shared dir; the
+        # orchestrator delivers the whole tree once. Hand back what we produced so it can
+        # accumulate the delivered tracks and combine the delivery.
+        if not deliver:
+            return Result(summary="", delivered=delivered, new_track_count=len(delivered),
+                          playlist_files=manifest, playlist_name=pl_title)
+
         # 4) Deliver. WebDAV mirrors the whole work tree into the library (for a
         #    playlist that's the `<name>/` folder with its tracks + .m3u8); browser
         #    ZIPs the staged folder under a single top-level name.
@@ -904,6 +981,99 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
         return Result(summary=f"{root_name}.zip", zip_path=str(zip_path), zip_name=f"{root_name}.zip",
                       delivered=delivered, new_track_count=len(delivered), playlist_files=manifest,
                       playlist_name=pl_title)
+    finally:
+        # Only remove the work dir we created; a shared `stage_dir` is the caller's to clean.
+        if stage_dir is None:
+            shutil.rmtree(work_base, ignore_errors=True)
+        if cookie_path:
+            cookie_path.unlink(missing_ok=True)
+
+
+def run_artist_download(*, job_id: str, url: str, genre: str, destination: Destination,
+                        reporter: Reporter, audio_format: str = DEFAULT_AUDIO_FORMAT,
+                        tag_options: fix_music_tags.TagOptions = fix_music_tags.TagOptions(),
+                        cookies_txt: str | None = None,
+                        on_server: Callable[[str, str], bool] | None = None,
+                        max_items: int = 0) -> Result:
+    """Download an artist's whole discography (issue #32).
+
+    Enumerates the artist's releases (`enumerate_artist`) and stages each through the ordinary
+    album path (`run_download(mode="album", …)`) into ONE shared work dir — so the album
+    download + tag logic (and its metadata parity) is reused verbatim. Then delivers the whole
+    tree ONCE: a WebDAV upload mirrors `<Artist>/<Album>/…` into the library; a browser run ZIPs
+    it under the artist name. `on_server` (dedup, issue #31) is passed through to every release so
+    a re-run skips already-present tracks; `max_items` caps the number of releases (0 = unlimited).
+    One failing release is logged and skipped — it does not abort the whole run.
+    """
+    work_base = _WORK_ROOT / job_id
+    cookie_path = _write_cookie_file(job_id, cookies_txt)
+    try:
+        work_base.mkdir(parents=True, exist_ok=True)
+        reporter.on_phase("metadata")
+        artist, releases = enumerate_artist(
+            url, cookiefile=str(cookie_path) if cookie_path else None, limit=max_items)
+        if not releases:
+            raise RuntimeError("Keine Releases gefunden — ist das eine YouTube-Music-Künstlerseite?")
+        reporter.on_meta(artist, "")
+
+        # Per-release reporter: forward track/meta to the outer reporter, but swallow phase
+        # changes — the orchestrator owns the macro phase (so sub-albums don't flip it).
+        album_reporter = Reporter(on_phase=lambda phase: None,
+                                  on_meta=reporter.on_meta, on_track=reporter.on_track)
+
+        total = len(releases)
+        delivered_all: list = []
+        new_count = 0
+        failed: list[str] = []
+        used_titles: dict[str, int] = {}
+        reporter.on_phase("download")
+        for i, rel in enumerate(releases, 1):
+            # Two releases can share a title (a reissue, a re-released single). They would
+            # otherwise stage into the SAME `Artist/<title>/` folder and clobber each other's
+            # cover / re-tag each other's tracks — so disambiguate the album name per run.
+            base = rel["title"]
+            used_titles[base] = used_titles.get(base, 0) + 1
+            album_name = base if used_titles[base] == 1 else f"{base} ({used_titles[base]})"
+            reporter.on_album(i, total, album_name)
+            try:
+                sub = run_download(job_id=f"{job_id}.{i}", url=rel["url"], genre=genre,
+                                   mode="album", destination=destination, reporter=album_reporter,
+                                   audio_format=audio_format, tag_options=tag_options,
+                                   cookies_txt=cookies_txt, on_server=on_server,
+                                   stage_dir=work_base, deliver=False, album_name=album_name)
+                delivered_all += sub.delivered
+                new_count += sub.new_track_count
+            except Exception:  # noqa: BLE001 - one bad release must not abort the whole artist run
+                log.exception("artist release failed: %s", album_name)
+                failed.append(album_name)
+
+        # A failed release may have left incomplete-download artifacts behind (the shared
+        # work dir is not cleaned per-release); never ship those partials.
+        for tmp in (*work_base.rglob("*.part"), *work_base.rglob("*.ytdl")):
+            tmp.unlink(missing_ok=True)
+
+        # Nothing staged: dedup found everything already present, or every release failed.
+        if not any(p.is_file() for p in work_base.rglob("*")):
+            if failed and not delivered_all:
+                raise RuntimeError(f"Keine Releases konnten geladen werden ({len(failed)} fehlgeschlagen).")
+            return Result(summary="Keine neuen Titel", new_track_count=0)
+
+        note = f" ({len(failed)} übersprungen)" if failed else ""
+        if destination.type == "webdav":
+            reporter.on_phase("upload")
+            _upload_tree(destination, work_base)
+            return Result(summary=f"WebDAV: {artist} — {new_count} Titel / {total} Releases{note}",
+                          delivered=delivered_all, new_track_count=new_count)
+
+        reporter.on_phase("packaging")
+        # Releases stage under a single `<Artist>/` dir; zip that so the archive root is the
+        # artist (not doubly nested). Fall back to the whole tree for the rare multi-artist case.
+        dirs = [p for p in sorted(work_base.iterdir()) if p.is_dir()]
+        stage_root = dirs[0] if len(dirs) == 1 else work_base
+        zip_path = _WORK_ROOT / f"{job_id}.zip"
+        _zip_dir(stage_root, zip_path, artist)
+        return Result(summary=f"{artist}.zip{note}", zip_path=str(zip_path),
+                      zip_name=f"{artist}.zip", delivered=delivered_all, new_track_count=new_count)
     finally:
         shutil.rmtree(work_base, ignore_errors=True)
         if cookie_path:
