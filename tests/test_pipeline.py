@@ -28,6 +28,7 @@ from app.pipeline import (
     _index_from_name,
     _make_match_filter,
     _merge_manifest,
+    _playlist_folder_name,
     _primary_artist,
     _safe_segment,
     _square_crop_jpeg,
@@ -272,6 +273,28 @@ def test_safe_segment_blocks_traversal():
     assert _safe_segment("../../etc") == ".._.._etc"
     assert _safe_segment("  ") == "Unbekannt"
     assert _safe_segment("Drake") == "Drake"          # legitimate names untouched
+
+
+def test_playlist_folder_name_disambiguates_by_id():
+    # Two different playlists that share a title must NOT map to the same folder,
+    # or the second delivery overwrites the first's .m3u8 / clobbers tracks (issue #39).
+    a = _playlist_folder_name("Chill", "PLaaaa")
+    b = _playlist_folder_name("Chill", "PLbbbb")
+    assert a != b
+    assert a == "Chill [PLaaaa]"
+    # The id is stable per URL, so a re-sync of the SAME playlist lands in the SAME folder.
+    assert _playlist_folder_name("Chill", "PLaaaa") == a
+
+
+def test_playlist_folder_name_without_id_falls_back_to_title():
+    # No id exposed by the extractor → keep the bare (sanitised) title.
+    assert _playlist_folder_name("Chill", "") == "Chill"
+
+
+def test_playlist_folder_name_is_traversal_safe():
+    # The disambiguated name is still one safe path segment (no escaping the work dir).
+    assert _playlist_folder_name("../../etc", "PLx") == ".._.._etc [PLx]"
+    assert "/" not in _playlist_folder_name("A/B", "PLx")
 
 
 def test_default_download_opts_use_no_cookies():
