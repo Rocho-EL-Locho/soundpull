@@ -56,6 +56,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "phase.metadata": "Metadaten",
         "phase.download": "Download",
         "phase.tags": "Tags & Cover",
+        "phase.lyrics": "Liedtext",
         "phase.packaging": "ZIP packen",
         "phase.upload": "WebDAV-Upload",
         "phase.done": "Fertig",
@@ -159,6 +160,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
                                "vorhandene Datei verwiesen (kein Duplikat). Nur bei WebDAV.",
         "index.dedup_label": "Vorhandene Titel überspringen",
         "index.dedup_hint": "Nur bei Ziel „WebDAV“ verfügbar.",
+        # Synchronisierter Liedtext (issue #43)
+        "settings.lyrics_label": "Synchronisierten Liedtext (.lrc) laden",
+        "settings.lyrics_desc": "Lädt — soweit vorhanden — synchronisierten Liedtext von "
+                                "LRCLIB und legt pro Titel eine .lrc-Datei daneben ab, die "
+                                "Navidrome anzeigt. Ohne Treffer wird der Titel übersprungen.",
+        "index.lyrics_label": "Liedtext (.lrc) laden",
         # Playlist-Abos (issue #21)
         "subs.heading_new": "Neues Playlist-Abo",
         "subs.desc": "Eine Playlist in einem Intervall automatisch synchronisieren. "
@@ -229,6 +236,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "phase.metadata": "Metadata",
         "phase.download": "Download",
         "phase.tags": "Tags & cover",
+        "phase.lyrics": "Lyrics",
         "phase.packaging": "Packing ZIP",
         "phase.upload": "WebDAV upload",
         "phase.done": "Done",
@@ -330,6 +338,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
                                "duplicate). WebDAV only.",
         "index.dedup_label": "Skip tracks I already have",
         "index.dedup_hint": "Only available with the WebDAV destination.",
+        # Synced lyrics (issue #43)
+        "settings.lyrics_label": "Fetch synced lyrics (.lrc)",
+        "settings.lyrics_desc": "When available, fetch synced lyrics from LRCLIB and drop a "
+                                ".lrc file next to each track for Navidrome to display. Tracks "
+                                "with no match are simply skipped.",
+        "index.lyrics_label": "Fetch lyrics (.lrc)",
         # Playlist subscriptions (issue #21)
         "subs.heading_new": "New playlist subscription",
         "subs.desc": "Automatically sync a playlist on an interval. Each run downloads "

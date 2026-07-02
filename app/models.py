@@ -62,6 +62,10 @@ class UserSettings(SQLModel, table=True):
     # WebDAV-only (a browser ZIP has no persistent library); default off (opt-in).
     dedup_skip_existing: bool = False
 
+    # Synced lyrics (issue #43): fetch `.lrc` synced lyrics per track from LRCLIB and
+    # write them as sidecar files (applies to ZIP and WebDAV); default off (opt-in).
+    fetch_synced_lyrics: bool = False
+
     # Per-user YouTube cookie (issue #9), a Netscape cookies.txt fed to yt-dlp so
     # age-gated / bot-checked / throttled tracks download. Fernet-encrypted; never
     # exposed in plaintext to the client.

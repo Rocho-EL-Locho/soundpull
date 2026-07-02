@@ -23,7 +23,7 @@ from urllib.parse import urlparse
 import httpx
 import yt_dlp
 
-from app import fix_music_tags
+from app import fix_music_tags, lyrics
 from app.config import settings
 
 log = logging.getLogger("pipeline")
@@ -713,7 +713,8 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
                  existing_ref: Callable[[str, str], str | None] | None = None,
                  existing_tracks: list[dict] | None = None,
                  stage_dir: Path | None = None, deliver: bool = True,
-                 album_name: str | None = None) -> Result:
+                 album_name: str | None = None,
+                 fetch_lyrics: bool = False) -> Result:
     """Execute one download end-to-end and return a Result.
 
     Both destinations stage into a temp work dir; then either a ZIP is packaged
@@ -977,6 +978,21 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
             root_name = f"{primary_artist} - {album}"
             webdav_label = f"{primary_artist}/{album}"
 
+        # Synced lyrics (issue #43): best-effort `.lrc` sidecars next to each track. Additive
+        # and non-fatal — a miss/error just skips (never fails the job) and never touches the
+        # frozen tag output. All modes; `.lrc` is neither an image nor audio ext, so it
+        # survives every cleanup glob and is excluded from the m3u/server index (audio-only).
+        # Runs before the `deliver` check so artist sub-runs stage sidecars into the shared
+        # tree for the orchestrator to deliver too; both delivery paths ship whatever is staged.
+        # Fetched concurrently (bounded pool) with a `lyrics` progress phase so a big playlist
+        # doesn't serialise N blocking HTTP round-trips (the artist reporter swallows the phase).
+        if fetch_lyrics:
+            lyric_targets = sorted(p for p in stage_root.rglob("*")
+                                   if p.suffix.lower() in fix_music_tags._SUPPORTED_EXTS)
+            if lyric_targets:
+                reporter.on_phase("lyrics")
+                lyrics.write_lrc_sidecars(lyric_targets, progress=reporter.on_track)
+
         # Artist run (issue #32): the staged, tagged tree stays in the shared dir; the
         # orchestrator delivers the whole tree once. Hand back what we produced so it can
         # accumulate the delivered tracks and combine the delivery.
@@ -1013,7 +1029,8 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
                         tag_options: fix_music_tags.TagOptions = fix_music_tags.TagOptions(),
                         cookies_txt: str | None = None,
                         on_server: Callable[[str, str], bool] | None = None,
-                        max_items: int = 0) -> Result:
+                        max_items: int = 0,
+                        fetch_lyrics: bool = False) -> Result:
     """Download an artist's whole discography (issue #32).
 
     Enumerates the artist's releases (`enumerate_artist`) and stages each through the ordinary
@@ -1059,7 +1076,8 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
                                    mode="album", destination=destination, reporter=album_reporter,
                                    audio_format=audio_format, tag_options=tag_options,
                                    cookies_txt=cookies_txt, on_server=on_server,
-                                   stage_dir=work_base, deliver=False, album_name=album_name)
+                                   stage_dir=work_base, deliver=False, album_name=album_name,
+                                   fetch_lyrics=fetch_lyrics)
                 delivered_all += sub.delivered
                 new_count += sub.new_track_count
             except Exception:  # noqa: BLE001 - one bad release must not abort the whole artist run
