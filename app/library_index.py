@@ -186,13 +186,20 @@ def _walk_remote_files(client, path: str, depth: int, max_depth: int,
                        errors: list | None = None):
     """Yield audio file paths under `path` (recursive, depth-bounded).
 
-    A directory whose listing fails is logged and skipped so one unreadable folder can't
-    abort the whole scan; the failure is also appended to `errors` (when given) so the
+    A *sub*-directory whose listing fails is logged and skipped so one unreadable folder
+    can't abort the whole scan; the failure is also appended to `errors` (when given) so the
     caller can tell the scan was INCOMPLETE and must not prune the index (issue #31).
+
+    A failure at the **root** (``depth == 0``) is different: the target is unreachable or
+    misconfigured, so there is nothing to scan — the exception PROPAGATES rather than being
+    swallowed, so `scan_webdav` fails loudly instead of returning a silent empty no-op that
+    looks like a healthy but empty library (issue #38).
     """
     try:
         entries = client.ls(path or "", detail=True)
     except Exception as exc:  # noqa: BLE001 - a single unreadable dir must not abort the scan
+        if depth == 0:
+            raise  # root unreachable → surface as a hard scan failure, not an empty result
         log.warning("scan: listing %r failed: %s", path, exc)
         if errors is not None:
             errors.append((path, str(exc)))
@@ -238,7 +245,7 @@ def _prune_missing(session: Session, user_id: int, found_paths: set[str]) -> int
     return pruned
 
 
-def scan_webdav(user_id: int, max_depth: int = 8) -> tuple[int, int]:
+def scan_webdav(user_id: int, max_depth: int = 8) -> tuple[int, int, list]:
     """Walk the user's WebDAV target folder and reconcile the index with it (issue #21/#31).
 
     Best-effort and path-based (no remote tag reads): reliably recovers
@@ -246,7 +253,10 @@ def scan_webdav(user_id: int, max_depth: int = 8) -> tuple[int, int]:
     The scan is **authoritative** — after an error-free walk it also PRUNES index rows
     whose file is no longer on the server (so deletions/reorganisations self-heal). If any
     directory listing failed, pruning is skipped (an incomplete walk must not delete valid
-    rows). Returns ``(added, pruned)``. Raises on connection / configuration errors.
+    rows). Returns ``(added, pruned, errors)`` where ``errors`` is the list of
+    ``(path, message)`` sub-directory listing failures — non-empty means the scan was
+    INCOMPLETE (no prune) so the caller can warn the user instead of reporting a clean run
+    (issue #38). Raises on connection / configuration errors (including an unreachable root).
     """
     from app.db import session_scope
     from app.models import UserSettings
@@ -289,4 +299,4 @@ def scan_webdav(user_id: int, max_depth: int = 8) -> tuple[int, int]:
                         "transient error can't delete valid index rows", len(errors))
         else:
             pruned = _prune_missing(session, user_id, found_paths)
-    return added, pruned
+    return added, pruned, errors

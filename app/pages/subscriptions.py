@@ -96,7 +96,9 @@ def subscriptions_page() -> None:
                         ui.label(status_lbl).classes(color)
                     ui.label(last_txt)
                 if not running_phase and status == "error" and error:
-                    ui.label(error).classes("text-red-400 text-xs")
+                    # `error` may be an i18n key (e.g. a failed seed) or a raw message; `t()`
+                    # translates the former and returns the latter unchanged (issue #38).
+                    ui.label(t(error)).classes("text-red-400 text-xs")
                 with ui.row().classes("items-center gap-2"):
                     ui.button(t("subs.sync_now"), icon="sync",
                               on_click=lambda i=sid: _sync_now(i)) \

@@ -75,6 +75,8 @@ def _job_card(js: JobState, delivered: set[str]) -> None:
                         .props("unelevated dense").classes("accent-grad text-white")
                 elif js.destination_type == "webdav" and js.summary:
                     ui.label(js.summary).classes("text-xs text-white/50")
+            if js.warning:  # upload OK but index update failed → surface the re-download risk (#38)
+                ui.label(t(js.warning)).classes("text-amber-400 text-xs")  # warning is an i18n key
             # Auto-start the browser download once, only for a just-finished job.
             if js.result_path and js.id not in delivered and js.finished_at:
                 age = (datetime.now(timezone.utc) - js.finished_at).total_seconds()

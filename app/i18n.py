@@ -78,6 +78,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "index.unknown_error": "Unbekannter Fehler",
         "index.completed": "Abgeschlossen ✓",
         "index.download_zip": "ZIP herunterladen",
+        # job warnings (issue #38) — set as keys by the worker, resolved at render time
+        "jobs.index_update_failed": "Upload erfolgreich, aber die Server-Index-Aktualisierung "
+                                    "ist fehlgeschlagen – diese Titel könnten beim nächsten "
+                                    "Sync erneut geladen werden.",
+        "jobs.seed_failed": "Der Playlist-Index konnte nicht initialisiert werden – der "
+                            "nächste Sync versucht es automatisch erneut.",
         # history page
         "history.heading": "Verlauf",
         "history.empty": "Noch keine Downloads.",
@@ -142,6 +148,9 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "settings.scan_button": "Server einlesen",
         "settings.scan_running": "Server wird eingelesen …",
         "settings.scan_done": "{count} neue Titel erfasst, {removed} veraltete entfernt",
+        "settings.scan_incomplete": "Einlesen unvollständig: {failed} Ordner nicht lesbar, "
+                                    "{count} Titel erfasst – veraltete Einträge wurden nicht "
+                                    "entfernt. Bitte erneut versuchen.",
         "settings.scan_error": "Einlesen fehlgeschlagen: {error}",
         # Dedup (issue #31)
         "settings.dedup_label": "Bereits vorhandene Titel überspringen",
@@ -242,6 +251,11 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "index.unknown_error": "Unknown error",
         "index.completed": "Completed ✓",
         "index.download_zip": "Download ZIP",
+        # job warnings (issue #38) — set as keys by the worker, resolved at render time
+        "jobs.index_update_failed": "Upload succeeded, but updating the server index failed — "
+                                    "these tracks may be downloaded again on the next sync.",
+        "jobs.seed_failed": "The playlist index could not be initialised — the next sync will "
+                            "automatically try again.",
         # history page
         "history.heading": "History",
         "history.empty": "No downloads yet.",
@@ -305,6 +319,9 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "settings.scan_button": "Scan server",
         "settings.scan_running": "Scanning server …",
         "settings.scan_done": "Indexed {count} new tracks, removed {removed} stale",
+        "settings.scan_incomplete": "Scan incomplete: {failed} folder(s) unreadable, "
+                                    "{count} tracks indexed — stale entries were not pruned. "
+                                    "Please try again.",
         "settings.scan_error": "Scan failed: {error}",
         # Dedup (issue #31)
         "settings.dedup_label": "Skip tracks already in my library",

@@ -41,7 +41,7 @@ def history_page() -> None:
                 "album": r.album, "artist": r.artist, "phase": r.phase, "mode": r.mode,
                 "genre": r.genre, "dest": r.destination_type, "url": r.url,
                 "audio": audio_format_short(r.audio_format),
-                "created": r.created_at, "error": r.error,
+                "created": r.created_at, "error": r.error, "warning": r.warning,
             } for r in rows]
 
         ui.label(t("history.heading")).classes("text-xl font-semibold accent-text")
@@ -64,3 +64,7 @@ def history_page() -> None:
                     ui.label(f"{it['mode']} · {genre} · {it['audio']} · {it['dest']}")
                 if it["error"]:
                     ui.label(it["error"]).classes("text-red-400 text-xs")
+                if it["warning"]:  # non-fatal note on a done job (e.g. index update failed, #38)
+                    # `warning` is stored as an i18n key by the worker; resolve it here where
+                    # the request has a language. `t()` returns unknown strings unchanged.
+                    ui.label(t(it["warning"])).classes("text-amber-400 text-xs")
