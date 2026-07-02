@@ -122,3 +122,45 @@ def test_artist_title_from_path_layouts():
     # playlist folder <name>/NNNN - <title>.mp3 → title only (index prefix stripped)
     assert library_index._artist_title_from_path(["My Mix", "0007 - Some Song.mp3"]) \
         == ("", "Some Song")
+
+
+def test_is_skippable_dir():
+    # Decision is on the BASENAME only — independent of the parent path / library layout
+    # (varied parents below). A cache dir is skipped at its top, so the walk never
+    # descends to its "normal-named" children (cf/15/…) at all.
+    assert library_index._is_skippable_dir("any/library/root/__sized__")  # "__" prefix
+    assert library_index._is_skippable_dir("whatever/.trash")             # hidden
+    assert library_index._is_skippable_dir("attachments")                 # even at the root
+    assert library_index._is_skippable_dir("A/B/C/Attachments")           # case-insensitive
+    assert not library_index._is_skippable_dir("root/__sized__/attachments/cf/15")  # basename "15"
+    assert not library_index._is_skippable_dir("root/Drake")              # a real artist folder
+    assert not library_index._is_skippable_dir("Drake/Views")             # a real album folder
+
+
+def test_walk_remote_files_skips_cache_and_hidden_subtrees():
+    # The scan must not descend into a server-side cache tree (e.g. "__sized__/…") or a
+    # hidden dir — those hold no music and would cost thousands of PROPFINDs. A fake
+    # client records which paths get listed.
+    tree = {
+        "": [{"name": "Drake", "type": "directory"},
+             {"name": "__sized__", "type": "directory"},
+             {"name": "attachments", "type": "directory"},
+             {"name": ".trash", "type": "directory"}],
+        "Drake": [{"name": "Drake/Views", "type": "directory"}],
+        "Drake/Views": [{"name": "Drake/Views/Hotline Bling.mp3", "type": "file"}],
+        "__sized__": [{"name": "__sized__/attachments", "type": "directory"}],
+        "attachments": [{"name": "attachments/0d", "type": "directory"}],
+        ".trash": [{"name": ".trash/old.mp3", "type": "file"}],
+    }
+    listed: list[str] = []
+
+    class FakeClient:
+        def ls(self, path, detail=True):
+            listed.append(path)
+            return tree.get(path, [])
+
+    files = list(library_index._walk_remote_files(FakeClient(), "", depth=0, max_depth=8))
+    assert files == ["Drake/Views/Hotline Bling.mp3"]   # only the real music file
+    assert "__sized__" not in listed                    # cache subtree never listed
+    assert "attachments" not in listed                  # attachments store never listed
+    assert ".trash" not in listed                       # hidden subtree never listed

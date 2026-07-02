@@ -156,6 +156,25 @@ def _artist_title_from_path(rel_parts: list[str]) -> tuple[str, str]:
     return artist, title
 
 
+# Directory basenames that are caches / internal state, never music — skipped whole
+# (case-insensitive) so the scan doesn't PROPFIND the hash-sharded subtrees underneath
+# (e.g. an ``attachments/<hash>/…`` store beside the sized-thumbnail cache).
+_SKIP_DIR_NAMES = {"attachments", "thumbnails", "previews", "cache"}
+
+
+def _is_skippable_dir(name: str) -> bool:
+    """True for cache / internal-state dirs that never hold music, so the scan can skip
+    the whole subtree instead of PROPFINDing thousands of irrelevant folders.
+
+    Covers names starting with ``__`` (e.g. a sized-thumbnail cache ``__sized__/…``) or
+    ``.`` (hidden dirs like ``.trash``), plus known cache names in `_SKIP_DIR_NAMES`
+    (e.g. a hash-sharded ``attachments/0d/47/5d/…`` store).
+    """
+    base = name.rstrip("/").rsplit("/", 1)[-1]
+    return (base.startswith("__") or base.startswith(".")
+            or base.casefold() in _SKIP_DIR_NAMES)
+
+
 def _walk_remote_files(client, path: str, depth: int, max_depth: int):
     """Yield audio file paths under `path` (recursive, depth-bounded)."""
     try:
@@ -170,7 +189,7 @@ def _walk_remote_files(client, path: str, depth: int, max_depth: int):
         if not name or name == path.rstrip("/"):
             continue  # skip empties and the directory's self-entry
         if entry.get("type") == "directory":
-            if depth < max_depth:
+            if depth < max_depth and not _is_skippable_dir(name):
                 yield from _walk_remote_files(client, name, depth + 1, max_depth)
         elif name.lower().endswith(fix_music_tags._SUPPORTED_EXTS):
             yield name
