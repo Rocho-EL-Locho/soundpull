@@ -105,14 +105,18 @@ def is_on_server(session: Session, user_id: int, artist: str, title: str) -> boo
     return row is not None
 
 
-def record_tracks(session: Session, user_id: int, pairs) -> int:
+def record_tracks(session: Session, user_id: int, pairs, *, update_path: bool = False) -> int:
     """Add ``(artist, title[, rel_path])`` entries to the index (issue #21 / #31).
 
     `pairs` is an iterable of ``(artist, title)`` OR ``(artist, title, rel_path)`` (a
     library-relative POSIX path); both arities are accepted so old 2-tuple callers keep
-    working. Returns the number of newly inserted rows (a backfill of an existing row's
-    NULL `rel_path` is not counted as new). A pair with no title is skipped — nothing to
-    match on.
+    working. Returns the number of newly inserted rows (updating/backfilling an existing
+    row's path is not counted as new). A pair with no title is skipped — nothing to match on.
+
+    `update_path=True` (used by an authoritative scan) refreshes an existing row's
+    `rel_path` to the freshly-found location, so a moved/retagged file isn't later pruned
+    as missing (its old path is gone but a valid copy exists under the new one). Delivery
+    callers use the default — the first delivered path wins and is never overwritten.
     """
     from app.models import ServerTrack
 
@@ -120,13 +124,16 @@ def record_tracks(session: Session, user_id: int, pairs) -> int:
         select(ServerTrack).where(ServerTrack.user_id == user_id)).all()}
     added = 0
     for entry in pairs:
-        artist, title, path = (entry if len(entry) == 3 else (entry[0], entry[1], None))
+        artist, title, *rest = entry           # tolerate a 2- or 3-element tuple/list
+        path = rest[0] if rest else None
         a, t = track_key(title, artist)
         if not t:
             continue
         row = existing.get((a, t))
         if row is not None:
-            if path and not row.rel_path:  # backfill a path onto a pathless row
+            # Backfill a missing path always; overwrite an existing one only for an
+            # authoritative scan, where the freshly-found path is the source of truth.
+            if path and (not row.rel_path or (update_path and row.rel_path != path)):
                 row.rel_path = path
                 session.add(row)
             continue
@@ -211,6 +218,11 @@ def _prune_missing(session: Session, user_id: int, found_paths: set[str]) -> int
     or moved). Rows without a path (e.g. a `mark_existing` seed) are left untouched — there
     is nothing to verify them against. Only safe after an error-free walk; otherwise a
     transiently-unreadable folder would wrongly prune still-present tracks.
+
+    Precondition: `found_paths` and the stored `rel_path`s must share the same frame
+    (relative to `webdav_folder`). A moved file self-heals because the scan's `record_tracks`
+    ran with `update_path=True` first; a changed `webdav_folder` re-frames everything, so the
+    scan prunes the old-frame rows and re-adds them under the new frame in the same run.
     """
     from app.models import ServerTrack
 
@@ -268,7 +280,9 @@ def scan_webdav(user_id: int, max_depth: int = 8) -> tuple[int, int]:
             pairs.append((artist, title, rel))
 
     with session_scope() as session:
-        added = record_tracks(session, user_id, pairs)
+        # update_path=True: a scan is authoritative, so refresh moved files' paths to the
+        # found location before pruning (else a moved file's stale path would be pruned).
+        added = record_tracks(session, user_id, pairs, update_path=True)
         pruned = 0
         if errors:
             log.warning("scan: %d directory listing(s) failed — skipping prune so a "

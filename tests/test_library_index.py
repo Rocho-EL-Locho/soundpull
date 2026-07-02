@@ -105,7 +105,7 @@ def test_record_tracks_backfills_null_path():
 
 
 def test_record_tracks_keeps_first_known_path():
-    # Once a path is known, a later delivery of the same track does not overwrite it.
+    # Once a path is known, a later DELIVERY of the same track does not overwrite it.
     with _mem_session() as session:
         record_tracks(session, 1, [("Drake", "Hotline Bling", "first/path.mp3")])
         session.commit()
@@ -113,6 +113,35 @@ def test_record_tracks_keeps_first_known_path():
         session.commit()
         assert library_index.load_index_paths(session, 1)[("drake", "hotline bling")] \
             == "first/path.mp3"
+
+
+def test_record_tracks_update_path_refreshes_moved_file():
+    # An authoritative scan (update_path=True) refreshes a moved/retagged file's path,
+    # so the stored path stays valid and won't be pruned as missing (issue #31).
+    with _mem_session() as session:
+        record_tracks(session, 1, [("Drake", "One Dance", "Drake/Views/One Dance.mp3")])
+        session.commit()
+        record_tracks(session, 1, [("Drake", "One Dance", "Drake/More Life/One Dance.mp3")],
+                      update_path=True)
+        session.commit()
+        assert library_index.load_index_paths(session, 1)[("drake", "one dance")] \
+            == "Drake/More Life/One Dance.mp3"
+
+
+def test_authoritative_scan_move_keeps_track():
+    # End-to-end of the bug the update_path fix closes: a file moves on the server; an
+    # authoritative rescan (record update_path=True, then prune) must KEEP the track under
+    # its new path — not lose it. Regression for the record/prune interaction (issue #31).
+    with _mem_session() as session:
+        record_tracks(session, 1, [("Drake", "One Dance", "Drake/Views/One Dance.mp3")])
+        session.commit()
+        # Rescan finds only the NEW path (old one deleted): update, then prune to found set.
+        record_tracks(session, 1, [("Drake", "One Dance", "Drake/More Life/One Dance.mp3")],
+                      update_path=True)
+        pruned = library_index._prune_missing(session, 1, {"Drake/More Life/One Dance.mp3"})
+        session.commit()
+        assert pruned == 0                                  # nothing lost
+        assert is_on_server(session, 1, "Drake", "One Dance")
 
 
 def test_artist_title_from_path_layouts():

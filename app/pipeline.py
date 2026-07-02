@@ -686,6 +686,12 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
     is_sync = is_playlist and on_server is not None  # issue #21: playlist-with-dedup
     dedup = on_server is not None  # issue #21/#31: skip-if-present active for this run
 
+    # Cross-folder m3u references only make sense for a WebDAV library; a browser ZIP has
+    # no library and its tracks are packaged under a single root, so a `../` reference would
+    # point outside the archive. Callers already gate dedup to WebDAV — this hardens it.
+    if destination.type != "webdav":
+        existing_ref = None
+
     # Materialise the cookie to a 0600 file (kept outside work_base so the WebDAV
     # delivery never ships it); cleaned up in `finally`. None when no cookie → the
     # no-cookie path is byte-identical (metadata parity).
