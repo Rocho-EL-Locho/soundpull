@@ -194,11 +194,11 @@ def settings_page() -> None:
 
                 ui.notify(t("settings.scan_running"), type="ongoing")
                 try:
-                    added = await run.io_bound(library_index.scan_webdav, uid)
+                    added, pruned = await run.io_bound(library_index.scan_webdav, uid)
                 except Exception as exc:  # noqa: BLE001 - surface config/connection errors
                     ui.notify(t("settings.scan_error", error=exc), type="negative")
                     return
-                ui.notify(t("settings.scan_done", count=added), type="positive")
+                ui.notify(t("settings.scan_done", count=added, removed=pruned), type="positive")
 
             ui.button(t("settings.scan_button"), icon="cloud_sync", on_click=scan_server) \
                 .props("outline").classes("text-white/90 self-start")

@@ -137,6 +137,52 @@ def test_is_skippable_dir():
     assert not library_index._is_skippable_dir("Drake/Views")             # a real album folder
 
 
+def test_prune_missing_removes_vanished_pathful_keeps_present_and_pathless():
+    # Authoritative scan (issue #31): a row whose file is no longer on the server is
+    # pruned; a still-present file and a pathless (mark_existing) row are kept.
+    with _mem_session() as session:
+        record_tracks(session, 1, [
+            ("Drake", "One Dance", "Drake/Views/One Dance.mp3"),   # still present
+            ("Adele", "Hello", "Adele/25/Hello.mp3"),              # deleted from server
+            ("Ghost", "Marked"),                                   # pathless seed
+        ])
+        session.commit()
+        pruned = library_index._prune_missing(session, 1, {"Drake/Views/One Dance.mp3"})
+        session.commit()
+        assert pruned == 1
+        paths = library_index.load_index_paths(session, 1)
+        assert ("drake", "one dance") in paths      # present → kept
+        assert ("adele", "hello") not in paths       # vanished → pruned
+        assert ("ghost", "marked") in paths          # pathless → untouched
+
+
+def test_prune_missing_is_scoped_per_user():
+    with _mem_session() as session:
+        record_tracks(session, 1, [("A", "T", "A/T.mp3")])
+        record_tracks(session, 2, [("A", "T", "A/T.mp3")])
+        session.commit()
+        # User 1's scan found nothing → prunes only user 1's row, never user 2's.
+        assert library_index._prune_missing(session, 1, set()) == 1
+        session.commit()
+        assert library_index.load_index_paths(session, 1) == {}
+        assert ("a", "t") in library_index.load_index_paths(session, 2)
+
+
+def test_walk_remote_files_records_listing_errors():
+    # A failed directory listing is recorded so scan_webdav knows the walk was
+    # incomplete and must NOT prune (issue #31).
+    class FailingClient:
+        def ls(self, path, detail=True):
+            if path == "":
+                return [{"name": "unreadable", "type": "directory"}]
+            raise OSError("boom")
+
+    errors: list = []
+    files = list(library_index._walk_remote_files(FailingClient(), "", 0, 8, errors))
+    assert files == []
+    assert len(errors) == 1 and errors[0][0] == "unreadable"
+
+
 def test_walk_remote_files_skips_cache_and_hidden_subtrees():
     # The scan must not descend into a server-side cache tree (e.g. "__sized__/…") or a
     # hidden dir — those hold no music and would cost thousands of PROPFINDs. A fake
