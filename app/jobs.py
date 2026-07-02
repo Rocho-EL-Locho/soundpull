@@ -434,7 +434,8 @@ def _run_sync(job_id: str, cfg: _SyncConfig) -> None:
             cookie_path = pipeline._write_cookie_file(job_id, cfg.cookies_txt)
             try:
                 cookiefile = str(cookie_path) if cookie_path else None
-                pl_title, _uploader, _count = pipeline._probe_playlist(cfg.url, cookiefile=cookiefile)
+                pl_title, _uploader, _count, _pl_id = pipeline._probe_playlist(
+                    cfg.url, cookiefile=cookiefile)
                 reporter.on_meta(_uploader, pl_title)
                 pairs = pipeline.enumerate_playlist_tracks(
                     cfg.url, cookiefile=cookiefile, limit=settings.max_playlist_items)

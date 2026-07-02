@@ -147,6 +147,20 @@ AUDIO_FORMATS: dict[str, tuple[str | None, str | None]] = {
 _PLAYLIST_TRACK_TMPL = "%(playlist_index)04d - %(title)s.%(ext)s"
 
 
+def _playlist_folder_name(title: str, playlist_id: str) -> str:
+    """Folder segment for a delivered playlist, disambiguated by its id (issue #39).
+
+    Two different playlists can share a title ("Chill"). Since the delivery folder AND
+    its `.m3u8` are named after the title, same-named playlists would land in the same
+    `<webdav>/Chill/` folder and the second delivery would overwrite the first's manifest
+    (and clobber tracks). Appending the stable playlist id (`… [PLxxxx]`) keeps each
+    playlist in its own folder. The id is stable per URL, so an interval-sync (issue #21)
+    keeps targeting the same folder. Falls back to the bare title when no id is known.
+    """
+    name = f"{title} [{playlist_id}]" if playlist_id else title
+    return _safe_segment(name)
+
+
 def normalize_audio_format(value: str | None) -> str:
     """Return a known audio-format key, falling back to the default."""
     return value if value in AUDIO_FORMATS else DEFAULT_AUDIO_FORMAT
@@ -310,14 +324,16 @@ def _probe_meta(url: str, is_album: bool, cookiefile: str | None = None) -> tupl
     return artist, album
 
 
-def _probe_playlist(url: str, cookiefile: str | None = None) -> tuple[str, str, int]:
-    """Read a playlist's title, uploader and entry count (issue #11).
+def _probe_playlist(url: str, cookiefile: str | None = None) -> tuple[str, str, int, str]:
+    """Read a playlist's title, uploader, entry count and id (issue #11 / #39).
 
     Uses `extract_flat` so we only touch the playlist envelope, not every video —
     fast, and enough to name the download and seed the progress total. A playlist
     spans many artists/albums, so (unlike `_probe_meta`) there is no single
     artist/album to collapse to; each track is tagged from its own metadata later.
-    Returns (title, uploader, count); count is 0 when unknown.
+    Returns (title, uploader, count, playlist_id); count is 0 when unknown and the
+    id is "" when the extractor exposes none. The id disambiguates the delivery
+    folder so two same-named playlists don't collide (issue #39).
     """
     opts = {
         "quiet": True,
@@ -334,7 +350,8 @@ def _probe_playlist(url: str, cookiefile: str | None = None) -> tuple[str, str, 
     uploader = info.get("uploader") or info.get("channel") or "Playlist"
     entries = [e for e in (info.get("entries") or []) if e]
     count = info.get("playlist_count") or len(entries)
-    return title, uploader, int(count or 0)
+    playlist_id = info.get("id") or info.get("playlist_id") or ""
+    return title, uploader, int(count or 0), str(playlist_id)
 
 
 def enumerate_playlist_tracks(url: str, cookiefile: str | None = None,
@@ -774,17 +791,19 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
         work_base.mkdir(parents=True, exist_ok=True)
         pl_title = ""
         if is_playlist:
-            pl_title, pl_uploader, pl_count = _probe_playlist(url, cookiefile=cookiefile)
+            pl_title, pl_uploader, pl_count, pl_id = _probe_playlist(url, cookiefile=cookiefile)
             if settings.max_playlist_items > 0 and pl_count:
                 pl_count = min(pl_count, settings.max_playlist_items)
             reporter.on_meta(pl_uploader, pl_title)
             if pl_count:
                 reporter.on_track(0, pl_count)
-            # A real playlist: ALL tracks in one folder (the playlist name), plus an
-            # .m3u8 written after tagging. `pl_title` is interpolated literally, so
-            # sanitise it into one safe path segment; the track filename is a yt-dlp
-            # template (its fields are sanitised by yt-dlp).
-            playlist_dir = work_base / _safe_segment(pl_title)
+            # A real playlist: ALL tracks in one folder, plus an .m3u8 written after
+            # tagging. The folder is named after the playlist but disambiguated by its
+            # id so two same-named playlists don't collide (issue #39); the name is
+            # interpolated literally, so `_playlist_folder_name` sanitises it into one
+            # safe path segment (the track filename is a yt-dlp template, sanitised by
+            # yt-dlp). The `.m3u8` inside keeps the plain `pl_title` for display.
+            playlist_dir = work_base / _playlist_folder_name(pl_title, pl_id)
             out_tmpl = str(playlist_dir / _PLAYLIST_TRACK_TMPL)
             base_flags = _SINGLE_FLAGS  # per-track tags, no album track-number remap
         else:
