@@ -131,15 +131,27 @@ def _make_reporter(job_id: str, js: JobState) -> Reporter:
 
 
 def _run(job_id: str, url: str, genre: str, mode: str, destination: Destination,
-         audio_format: str, tag_options: TagOptions, cookies_txt: str | None) -> None:
+         audio_format: str, tag_options: TagOptions, cookies_txt: str | None,
+         dedup: bool = False) -> None:
     js = _registry[job_id]
     reporter = _make_reporter(job_id, js)
 
     try:
+        # Dedup (issue #31): skip tracks already in the user's library and reference the
+        # existing copy in a playlist's m3u. WebDAV-only — a browser ZIP has no library to
+        # dedup against / reference into. Both closures share one loaded index snapshot.
+        on_server = existing_ref = None
+        if dedup and destination.type == "webdav":
+            with session_scope() as session:
+                paths = library_index.load_index_paths(session, js.user_id)
+            on_server = lambda a, t: library_index.track_key(t, a) in paths  # noqa: E731
+            existing_ref = lambda a, t: paths.get(library_index.track_key(t, a))  # noqa: E731
+
         result = run_download(job_id=job_id, url=url, genre=genre, mode=mode,
                               destination=destination, reporter=reporter,
                               audio_format=audio_format, tag_options=tag_options,
-                              cookies_txt=cookies_txt)
+                              cookies_txt=cookies_txt, on_server=on_server,
+                              existing_ref=existing_ref)
         # A WebDAV upload actually puts tracks "on the server" → index them so a later
         # playlist sync recognises them (issue #21). Browser ZIPs are not on the server.
         # Best-effort: a failed index write (e.g. a unique-constraint race between two
@@ -164,11 +176,13 @@ def _run(job_id: str, url: str, genre: str, mode: str, destination: Destination,
 
 def start_job(*, user_id: int, url: str, genre: str, mode: str, destination_type: str,
               audio_format: str = DEFAULT_AUDIO_FORMAT,
-              tag_options: TagOptions | None = None) -> str:
+              tag_options: TagOptions | None = None, dedup: bool = False) -> str:
     """Queue a download for a user. Returns the job id. Raises on bad config.
 
     `tag_options` is the per-download field selection; when omitted it falls back
-    to the user's saved defaults (issue #7).
+    to the user's saved defaults (issue #7). `dedup` skips tracks already in the
+    user's library and references them in a playlist m3u (issue #31); it only takes
+    effect for the WebDAV destination.
     """
     job_id = uuid.uuid4().hex
     audio_format = normalize_audio_format(audio_format)
@@ -201,7 +215,8 @@ def start_job(*, user_id: int, url: str, genre: str, mode: str, destination_type
                   tag_options=tag_options)
     with _lock:
         _registry[job_id] = js
-    _executor.submit(_run, job_id, url, genre, mode, destination, audio_format, tag_options, cookies_txt)
+    _executor.submit(_run, job_id, url, genre, mode, destination, audio_format,
+                     tag_options, cookies_txt, dedup)
     return job_id
 
 
@@ -335,25 +350,33 @@ def _run_sync(job_id: str, cfg: _SyncConfig) -> None:
                             name=pl_title or None)
             summary = f"{len(pairs)} Titel als vorhanden markiert"
         else:
+            # One loaded index snapshot serves both the skip decision and, for a track
+            # that lives elsewhere in the library (e.g. an album track), the cross-folder
+            # m3u reference so the synced playlist stays complete without a duplicate (#31).
             with session_scope() as session:
-                known = library_index.load_index(session, cfg.user_id)
+                paths = library_index.load_index_paths(session, cfg.user_id)
 
             def on_server(artist: str, title: str) -> bool:
-                return library_index.track_key(title, artist) in known
+                return library_index.track_key(title, artist) in paths
+
+            def existing_ref(artist: str, title: str) -> str | None:
+                return paths.get(library_index.track_key(title, artist))
 
             result = run_download(
                 job_id=job_id, url=cfg.url, genre=cfg.genre, mode="playlist",
                 destination=cfg.destination, reporter=reporter,
                 audio_format=cfg.audio_format, tag_options=cfg.tag_options,
-                cookies_txt=cfg.cookies_txt, on_server=on_server,
+                cookies_txt=cfg.cookies_txt, on_server=on_server, existing_ref=existing_ref,
                 existing_tracks=cfg.existing_tracks,
             )
             if result.delivered:  # best-effort; must not roll back the status write below
                 _record_delivered_safe(job_id, cfg.user_id, result.delivered)
             with session_scope() as session:
+                # Persist whenever we have a manifest (new downloads OR new references), so
+                # the complete rebuilt playlist — including cross-folder refs — is kept (#31).
                 _sub_result(session, cfg.subscription_id, status="ok",
                             new_count=result.new_track_count,
-                            playlist_files=result.playlist_files if result.new_track_count else None,
+                            playlist_files=result.playlist_files or None,
                             name=result.playlist_name or None)
             summary = result.summary
 

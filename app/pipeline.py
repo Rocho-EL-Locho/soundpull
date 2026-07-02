@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -229,8 +230,10 @@ class Result:
     summary: str = ""
     zip_path: str | None = None   # set for browser destination
     zip_name: str | None = None
-    # (artist, title) of every track uploaded to WebDAV — fed to the server index
-    # (issue #21). Populated for all modes; the caller records it only for WebDAV.
+    # (artist, title, rel_path) of every track uploaded to WebDAV — fed to the server
+    # index (issue #21/#31). `rel_path` is the file's path relative to the WebDAV base
+    # folder, stored so a later playlist can reference it. Populated for all modes; the
+    # caller records it only for WebDAV.
     delivered: list = field(default_factory=list)
     new_track_count: int = 0      # tracks actually downloaded (relevant for sync)
     # Updated ordered m3u manifest for a playlist SYNC (see `existing_tracks`); the
@@ -544,13 +547,43 @@ def _merge_manifest(existing: list[dict] | None, new: list[dict]) -> list[dict]:
     return list(by_name.values())
 
 
-def _make_match_filter(on_server: Callable[[str, str], bool]):
-    """yt-dlp match_filter: reject a track already on the server (issue #21).
+def _entry_key(entry: dict) -> tuple[str, str]:
+    """Normalised (artist, title) of a manifest entry — matches the server-index key."""
+    from app.library_index import track_key
+
+    return track_key(entry.get("title", ""), entry.get("artist", ""))
+
+
+def _build_playlist_manifest(existing: list[dict] | None, new_entries: list[dict],
+                             ref_entries: list[dict], is_sync: bool) -> list[dict]:
+    """Combine downloaded + referenced (+ prior, for sync) tracks into one m3u manifest.
+
+    A cross-folder reference (issue #31) is dropped when the same track — by normalised
+    `(artist, title)` — is already downloaded this run or present in the prior manifest:
+    the in-folder copy wins, so a track is never listed twice. `_write_m3u_entries` orders
+    the result by playlist index. Non-sync one-shot downloads have no prior manifest.
+    """
+    have = {_entry_key(e) for e in new_entries}
+    if is_sync:
+        have |= {_entry_key(e) for e in (existing or [])}
+    refs = [e for e in ref_entries if _entry_key(e) not in have]
+    combined = new_entries + refs
+    return _merge_manifest(existing, combined) if is_sync else combined
+
+
+def _make_match_filter(on_server: Callable[[str, str], bool],
+                       on_skip: Callable[[int | None, str, str], None] | None = None):
+    """yt-dlp match_filter: reject a track already on the server (issue #21/#31).
 
     yt-dlp extracts each entry's full metadata (artist/track) BEFORE downloading the
     media, then calls this; returning a string skips the entry. `incomplete` is True
     during playlist enumeration when tags aren't final — we defer (return None) so the
     real check runs on the complete info_dict.
+
+    `on_skip(playlist_index, artist, title)` (issue #31) is invoked once, on the
+    effective (non-incomplete) call, for every track we skip — so the pipeline can
+    reference the already-present copy in a playlist's .m3u8. yt-dlp has merged a stable
+    1-based `playlist_index` into the info_dict by this point, even for skipped entries.
     """
     def _filter(info_dict: dict, incomplete: bool = False) -> str | None:
         if incomplete or info_dict.get("_type") in ("playlist", "multi_video"):
@@ -560,6 +593,8 @@ def _make_match_filter(on_server: Callable[[str, str], bool]):
         first = artists[0] if isinstance(artists, list) and artists else ""
         artist = info_dict.get("artist") or first or info_dict.get("uploader") or ""
         if title and on_server(artist, title):
+            if on_skip is not None:
+                on_skip(info_dict.get("playlist_index"), artist, title)
             return f"schon auf dem Server: {artist} - {title}".strip()
         return None
     return _filter
@@ -611,6 +646,7 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
                  tag_options: fix_music_tags.TagOptions = fix_music_tags.TagOptions(),
                  cookies_txt: str | None = None,
                  on_server: Callable[[str, str], bool] | None = None,
+                 existing_ref: Callable[[str, str], str | None] | None = None,
                  existing_tracks: list[dict] | None = None) -> Result:
     """Execute one download end-to-end and return a Result.
 
@@ -630,18 +666,25 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
     forced artist+album — each track lands in and is tagged from its OWN
     metadata; unknown/legacy modes fall back to album.
 
-    `on_server(artist, title) -> bool` turns this into a playlist SYNC (issue #21):
-    it becomes a yt-dlp match_filter that skips tracks already on the server, so only
-    new ones download (zero new tracks is then a normal, non-error outcome). It is
-    parity-safe — the filter only selects which entries download, never how the
-    downloaded ones are tagged. When None (every non-sync call) the behaviour and
-    output are unchanged. `existing_tracks` is the subscription's prior m3u manifest,
-    merged with the new tracks to rebuild the COMPLETE `<name>.m3u8`.
+    `on_server(artist, title) -> bool` enables DEDUP (issue #21/#31): it becomes a yt-dlp
+    match_filter that skips tracks already on the server, so only new ones download (zero
+    new tracks is then a normal, non-error outcome — for any mode). It is parity-safe: the
+    filter only selects which entries download, never how the downloaded ones are tagged.
+    When None (a plain download) the behaviour and output are unchanged.
+
+    `existing_ref(artist, title) -> rel_path | None` (issue #31) resolves a skipped
+    playlist track to the library-relative path of its existing copy; the pipeline then
+    writes a cross-folder relative reference into the `.m3u8` so the playlist stays
+    complete with no duplicate file (a skipped track with no known path is omitted, never
+    re-downloaded). Ignored for album/single (no m3u). `existing_tracks` is a
+    subscription's prior m3u manifest, merged with new+referenced tracks to rebuild the
+    COMPLETE `<name>.m3u8`.
     """
     is_playlist = mode == "playlist"
     is_single = mode == "single"
     is_album = not is_playlist and not is_single  # unknown/legacy modes → album
-    is_sync = is_playlist and on_server is not None  # issue #21: only-new-tracks sync
+    is_sync = is_playlist and on_server is not None  # issue #21: playlist-with-dedup
+    dedup = on_server is not None  # issue #21/#31: skip-if-present active for this run
 
     # Materialise the cookie to a 0600 file (kept outside work_base so the WebDAV
     # delivery never ships it); cleaned up in `finally`. None when no cookie → the
@@ -707,8 +750,12 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
             # whole run — skip it and download the rest (issue #21). Set on the opts dict
             # (not the frozen flag lists) so album/single stay strict and tag parity holds.
             opts["ignoreerrors"] = True
-        if on_server is not None:  # sync: skip tracks already on the server (issue #21)
-            opts["match_filter"] = _make_match_filter(on_server)
+        # Dedup: skip tracks already on the server, capturing each skip so a playlist can
+        # reference the existing copy afterwards (issue #21/#31).
+        skipped: list[tuple[int | None, str, str]] = []  # (playlist_index, artist, title)
+        if on_server is not None:
+            opts["match_filter"] = _make_match_filter(
+                on_server, on_skip=lambda idx, a, t: skipped.append((idx, a, t)))
 
         finished_dirs: Counter[str] = Counter()
 
@@ -732,14 +779,38 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
 
+        # Resolve dedup-skipped playlist tracks into cross-folder .m3u8 references
+        # (issue #31): a skipped track whose existing library path is known is listed at a
+        # relative path from the playlist folder (a bare filename when it is already in the
+        # same folder); one with no known path is left out — never re-downloaded.
+        ref_entries: list[dict] = []
+        if is_playlist and existing_ref is not None and skipped:
+            playlist_rel = playlist_dir.relative_to(work_base).as_posix()
+            for idx, artist, title in skipped:
+                rel = existing_ref(artist, title)
+                if not rel:
+                    continue
+                ref_entries.append({"index": int(idx or 0),
+                                    "name": posixpath.relpath(rel, playlist_rel),
+                                    "title": title, "artist": artist, "dur": -1})
+
         if not finished_dirs:
-            if is_sync:
-                # Nothing new on the playlist — a normal sync outcome, not an error.
-                # Return the prior manifest unchanged so the subscription keeps it.
+            if not dedup:
+                raise RuntimeError("Download lieferte keine Dateien (siehe Logs).")
+            # Dedup active and nothing NEW downloaded — a normal outcome (issue #21/#31).
+            if is_playlist:
+                manifest = _build_playlist_manifest(existing_tracks, [], ref_entries, is_sync)
+                if ref_entries:
+                    # New cross-folder references complete the playlist though nothing was
+                    # downloaded: regenerate + upload just the .m3u8 (no duplicate files).
+                    playlist_dir.mkdir(parents=True, exist_ok=True)
+                    _write_m3u_entries(playlist_dir, pl_title, manifest)
+                    if destination.type == "webdav":
+                        reporter.on_phase("upload")
+                        _upload_tree(destination, work_base)
                 return Result(summary="Keine neuen Titel", new_track_count=0,
-                              playlist_files=list(existing_tracks or []),
-                              playlist_name=pl_title)
-            raise RuntimeError("Download lieferte keine Dateien (siehe Logs).")
+                              playlist_files=manifest, playlist_name=pl_title)
+            return Result(summary="Keine neuen Titel", new_track_count=0)
 
         # 3) Navidrome tag correction (frozen fix_music_tags logic), gated per
         #    tag_options — all-on keeps the original behaviour. A playlist tags
@@ -767,15 +838,17 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
                 str(playlist_dir), tag_options, cover_for=cover_for)]
             for src in thumb_by_stem.values():
                 src.unlink(missing_ok=True)  # don't ship the standalone thumbnails
-            # Record what we're delivering (issue #21): (artist, title) per track,
-            # read from the FINAL tags so the server index matches later lookups.
+            # Record what we're delivering (issue #21/#31): (artist, title, rel_path) per
+            # track, read from the FINAL tags so the server index matches later lookups;
+            # rel_path (relative to the WebDAV base) lets a future playlist reference it.
             new_entries = _m3u_entries_from_paths(tracks)
-            delivered = [(e["artist"], e["title"]) for e in new_entries]
-            if is_sync:
-                # Incremental sync: rebuild the COMPLETE playlist from prior + new
-                # tracks so Navidrome shows every track, though we upload only the new
-                # files (+ the regenerated m3u8). Prior tracks already sit in the folder.
-                manifest = _merge_manifest(existing_tracks, new_entries)
+            delivered = [(e["artist"], e["title"], p.relative_to(work_base).as_posix())
+                         for p, e in zip(tracks, new_entries)]
+            if dedup:
+                # Rebuild the COMPLETE playlist: new downloads + cross-folder references to
+                # already-present tracks (+ the prior manifest for a sync). We upload only
+                # the new files (+ regenerated m3u8); referenced/prior tracks stay in place.
+                manifest = _build_playlist_manifest(existing_tracks, new_entries, ref_entries, is_sync)
                 _write_m3u_entries(playlist_dir, pl_title, manifest)
             else:
                 manifest = new_entries
@@ -797,11 +870,13 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
                 primary_artist,
                 tag_options,
             )
-            # Record delivered tracks for the server index (issue #21). Album/single
-            # force one primary artist, so pair each track's title with it.
+            # Record delivered tracks for the server index (issue #21/#31). Album/single
+            # force one primary artist, so pair each track's title with it; rel_path
+            # (relative to the WebDAV base) lets a future playlist reference it.
             audio_files = sorted(p for p in album_dir.glob("*")
                                  if p.suffix.lower() in fix_music_tags._SUPPORTED_EXTS)
-            delivered = [(primary_artist, _track_meta(p)[0]) for p in audio_files]
+            delivered = [(primary_artist, _track_meta(p)[0], p.relative_to(work_base).as_posix())
+                         for p in audio_files]
             manifest = []
             stage_root = album_dir
             root_name = f"{primary_artist} - {album}"

@@ -1,5 +1,6 @@
 """Guards metadata parity: parse_options must turn the original flag lists into
 the exact yt-dlp options the bash scripts produced."""
+import posixpath
 import shutil
 import stat
 import subprocess
@@ -16,6 +17,7 @@ from app.pipeline import (
     _apply_audio_format,
     _apply_cookie_policy,
     _apply_tag_options,
+    _build_playlist_manifest,
     _build_ydl_opts,
     _genre_flags,
     _index_from_name,
@@ -290,6 +292,76 @@ def test_match_filter_rejects_tracks_on_server():
     assert mf({"title": "hotline bling", "artist": "drake"}, incomplete=True) is None
     # the playlist container itself is never filtered out
     assert mf({"_type": "playlist", "title": "hotline bling"}) is None
+
+
+def test_match_filter_captures_skipped_for_reference():
+    # Dedup (issue #31): every skipped track is captured (index, artist, title) so the
+    # playlist can reference the existing copy — but only on the effective (non-incomplete)
+    # call, and never for a track that is downloaded.
+    known = {("drake", "hotline bling")}
+    captured: list = []
+    mf = _make_match_filter(
+        lambda a, t: (a.split(",")[0].strip().casefold(), t.casefold()) in known,
+        on_skip=lambda idx, a, t: captured.append((idx, a, t)))
+
+    assert mf({"_type": "video", "title": "hotline bling", "artist": "drake",
+               "playlist_index": 5}) is not None
+    assert captured == [(5, "drake", "hotline bling")]        # skipped → captured with index
+
+    captured.clear()
+    assert mf({"_type": "video", "title": "gods plan", "artist": "drake"}) is None
+    assert captured == []                                     # a new track is not captured
+
+    captured.clear()
+    assert mf({"title": "hotline bling", "artist": "drake"}, incomplete=True) is None
+    assert captured == []                                     # incomplete call never captures
+
+
+def test_build_playlist_manifest_keeps_fresh_reference():
+    # A downloaded track plus a cross-folder reference to a DIFFERENT already-present
+    # track → both appear, the reference keeping its relative path (issue #31).
+    new_entries = [{"index": 1, "name": "0001 - A.mp3", "title": "A", "artist": "X", "dur": 10}]
+    refs = [{"index": 2, "name": "../Drake/Views/B.mp3", "title": "B", "artist": "Drake", "dur": -1}]
+    manifest = _build_playlist_manifest(None, new_entries, refs, is_sync=False)
+    assert {e["name"] for e in manifest} == {"0001 - A.mp3", "../Drake/Views/B.mp3"}
+
+
+def test_build_playlist_manifest_drops_reference_already_downloaded():
+    # Same track both downloaded and "referenced" (raw feat form) → the in-folder
+    # download wins, the cross-folder reference is dropped (no double-listing).
+    new_entries = [{"index": 1, "name": "0001 - Hotline Bling.mp3",
+                    "title": "Hotline Bling", "artist": "Drake", "dur": 10}]
+    refs = [{"index": 1, "name": "../Drake/Views/Hotline Bling.mp3",
+             "title": "Hotline Bling (feat. X)", "artist": "Drake, X", "dur": -1}]
+    manifest = _build_playlist_manifest(None, new_entries, refs, is_sync=False)
+    assert [e["name"] for e in manifest] == ["0001 - Hotline Bling.mp3"]
+
+
+def test_build_playlist_manifest_prior_track_wins_over_reference_on_sync():
+    # On a sync, a track already in the prior manifest (bare filename, in-folder) wins
+    # over a freshly-resolved cross-folder reference to the same track (issue #31).
+    existing = [{"index": 3, "name": "0003 - Song.mp3", "title": "Song", "artist": "Y", "dur": 30}]
+    refs = [{"index": 3, "name": "../Y/Album/Song.mp3", "title": "Song", "artist": "Y", "dur": -1}]
+    manifest = _build_playlist_manifest(existing, [], refs, is_sync=True)
+    assert [e["name"] for e in manifest] == ["0003 - Song.mp3"]
+
+
+def test_playlist_reference_relpath_frame(tmp_path):
+    # The reference frame (issue #31): a track stored relative to the WebDAV base folder
+    # is referenced from the playlist folder via posixpath.relpath — a cross-folder track
+    # becomes ../…, an in-folder track becomes a bare filename (one code path, both cases).
+    assert posixpath.relpath("Drake/Views/Hotline Bling.mp3", "My Mix") \
+        == "../Drake/Views/Hotline Bling.mp3"
+    assert posixpath.relpath("My Mix/0007 - X.mp3", "My Mix") == "0007 - X.mp3"
+
+    # …and _write_m3u_entries writes that relative path verbatim as the location line.
+    ref = posixpath.relpath("Drake/Views/Hotline Bling.mp3", "My Mix")
+    m3u = _write_m3u_entries(tmp_path, "My Mix",
+                             [{"index": 1, "name": ref, "title": "Hotline Bling",
+                               "artist": "Drake", "dur": -1}])
+    track_lines = [ln for ln in m3u.read_text(encoding="utf-8").splitlines()
+                   if not ln.startswith("#")]
+    assert track_lines == ["../Drake/Views/Hotline Bling.mp3"]
 
 
 def test_merge_manifest_dedupes_by_name_new_wins():

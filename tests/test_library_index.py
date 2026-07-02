@@ -67,6 +67,54 @@ def test_record_tracks_skips_titleless():
         assert record_tracks(session, 1, [("Drake", "")]) == 0
 
 
+def test_record_tracks_stores_and_loads_rel_path():
+    # Dedup (issue #31): a delivered track's library-relative path is stored and returned
+    # by load_index_paths so a later playlist can reference the existing file.
+    with _mem_session() as session:
+        added = record_tracks(session, 1, [
+            ("Drake", "Hotline Bling", "Drake/Views/Hotline Bling.mp3")])
+        session.commit()
+        assert added == 1
+        paths = library_index.load_index_paths(session, 1)
+        assert paths == {("drake", "hotline bling"): "Drake/Views/Hotline Bling.mp3"}
+
+
+def test_record_tracks_accepts_mixed_2_and_3_tuples():
+    # 2-tuple callers (mark_existing seed) keep working alongside 3-tuple (path) callers.
+    with _mem_session() as session:
+        record_tracks(session, 1, [("Adele", "Hello"),
+                                   ("Drake", "One Dance", "Drake/Views/One Dance.mp3")])
+        session.commit()
+        paths = library_index.load_index_paths(session, 1)
+        assert paths[("adele", "hello")] is None            # no path known
+        assert paths[("drake", "one dance")] == "Drake/Views/One Dance.mp3"
+
+
+def test_record_tracks_backfills_null_path():
+    # A track first seen without a path (mark_existing) gets its path backfilled when it
+    # is later actually delivered — even in raw feat form (issue #31).
+    with _mem_session() as session:
+        record_tracks(session, 1, [("Drake", "Hotline Bling")])
+        session.commit()
+        added = record_tracks(session, 1, [
+            ("Drake", "Hotline Bling (feat. X)", "Drake/Views/Hotline Bling.mp3")])
+        session.commit()
+        assert added == 0                                   # backfill, not a new row
+        paths = library_index.load_index_paths(session, 1)
+        assert paths[("drake", "hotline bling")] == "Drake/Views/Hotline Bling.mp3"
+
+
+def test_record_tracks_keeps_first_known_path():
+    # Once a path is known, a later delivery of the same track does not overwrite it.
+    with _mem_session() as session:
+        record_tracks(session, 1, [("Drake", "Hotline Bling", "first/path.mp3")])
+        session.commit()
+        record_tracks(session, 1, [("Drake", "Hotline Bling", "second/path.mp3")])
+        session.commit()
+        assert library_index.load_index_paths(session, 1)[("drake", "hotline bling")] \
+            == "first/path.mp3"
+
+
 def test_artist_title_from_path_layouts():
     # <artist>/<album>/<title>.mp3 → artist + title
     assert library_index._artist_title_from_path(["Drake", "Views", "Hotline Bling.mp3"]) \

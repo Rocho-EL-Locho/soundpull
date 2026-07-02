@@ -72,6 +72,22 @@ def load_index(session: Session, user_id: int) -> set[tuple[str, str]]:
     return {(a, t) for a, t in rows}
 
 
+def load_index_paths(session: Session, user_id: int) -> dict[tuple[str, str], str | None]:
+    """All ``(artist_norm, title_norm) -> rel_path`` for a user (issue #31).
+
+    One query that serves both dedup needs: the skip decision is ``key in dict`` and the
+    playlist m3u reference is ``dict.get(key)`` (the delivered file's library-relative path,
+    or ``None`` when the track is known but its path isn't — then it's skipped, not referenced).
+    """
+    from app.models import ServerTrack
+
+    rows = session.exec(
+        select(ServerTrack.artist_norm, ServerTrack.title_norm, ServerTrack.rel_path)
+        .where(ServerTrack.user_id == user_id)
+    ).all()
+    return {(a, t): p for a, t, p in rows}
+
+
 def is_on_server(session: Session, user_id: int, artist: str, title: str) -> bool:
     """True if this user already has `<artist> - <title>` on the server."""
     from app.models import ServerTrack
@@ -90,22 +106,33 @@ def is_on_server(session: Session, user_id: int, artist: str, title: str) -> boo
 
 
 def record_tracks(session: Session, user_id: int, pairs) -> int:
-    """Add ``(artist, title)`` pairs to the index, skipping ones already present.
+    """Add ``(artist, title[, rel_path])`` entries to the index (issue #21 / #31).
 
-    `pairs` is an iterable of raw ``(artist, title)`` tuples (normalised here via
-    `track_key`). Returns the number of newly inserted rows. A pair with no title is
-    skipped — there is nothing to match on.
+    `pairs` is an iterable of ``(artist, title)`` OR ``(artist, title, rel_path)`` (a
+    library-relative POSIX path); both arities are accepted so old 2-tuple callers keep
+    working. Returns the number of newly inserted rows (a backfill of an existing row's
+    NULL `rel_path` is not counted as new). A pair with no title is skipped — nothing to
+    match on.
     """
     from app.models import ServerTrack
 
-    known = load_index(session, user_id)
+    existing = {(r.artist_norm, r.title_norm): r for r in session.exec(
+        select(ServerTrack).where(ServerTrack.user_id == user_id)).all()}
     added = 0
-    for artist, title in pairs:
+    for entry in pairs:
+        artist, title, path = (entry if len(entry) == 3 else (entry[0], entry[1], None))
         a, t = track_key(title, artist)
-        if not t or (a, t) in known:
+        if not t:
             continue
-        session.add(ServerTrack(user_id=user_id, artist_norm=a, title_norm=t))
-        known.add((a, t))
+        row = existing.get((a, t))
+        if row is not None:
+            if path and not row.rel_path:  # backfill a path onto a pathless row
+                row.rel_path = path
+                session.add(row)
+            continue
+        row = ServerTrack(user_id=user_id, artist_norm=a, title_norm=t, rel_path=path or None)
+        session.add(row)
+        existing[(a, t)] = row
         added += 1
     return added
 
@@ -173,7 +200,7 @@ def scan_webdav(user_id: int, max_depth: int = 8) -> int:
 
     client = make_client(url, username, password)
     prefix = f"{base}/" if base else ""
-    pairs: list[tuple[str, str]] = []
+    pairs: list[tuple[str, str, str]] = []
     for full in _walk_remote_files(client, base, depth=0, max_depth=max_depth):
         rel = full[len(prefix):] if prefix and full.startswith(prefix) else full
         parts = [p for p in rel.split("/") if p]
@@ -181,7 +208,9 @@ def scan_webdav(user_id: int, max_depth: int = 8) -> int:
             continue
         artist, title = _artist_title_from_path(parts)
         if title:
-            pairs.append((artist, title))
+            # `rel` is the file's path relative to the WebDAV base folder — the exact
+            # frame a playlist m3u references across folders (issue #31).
+            pairs.append((artist, title, rel))
 
     with session_scope() as session:
         return record_tracks(session, user_id, pairs)
