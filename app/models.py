@@ -57,6 +57,11 @@ class UserSettings(SQLModel, table=True):
     webdav_username: str | None = None
     webdav_password_enc: str | None = None  # Fernet-encrypted; never exposed in plaintext
 
+    # Dedup (issue #31): skip tracks already in the user's library on a download, and
+    # reference the existing copy in a playlist's .m3u8 instead of storing a duplicate.
+    # WebDAV-only (a browser ZIP has no persistent library); default off (opt-in).
+    dedup_skip_existing: bool = False
+
     # Per-user YouTube cookie (issue #9), a Netscape cookies.txt fed to yt-dlp so
     # age-gated / bot-checked / throttled tracks download. Fernet-encrypted; never
     # exposed in plaintext to the client.
@@ -105,6 +110,15 @@ class ServerTrack(SQLModel, table=True):
     delivered to WebDAV (populated on every successful WebDAV upload; seedable via a
     directory scan). The keys are normalised by `app.library_index.track_key`, so a
     lookup matches regardless of feat-suffixes or the raw-vs-tagged artist form.
+
+    `rel_path` (issue #31) is the delivered file's path RELATIVE TO the user's WebDAV
+    base folder (`UserSettings.webdav_folder`), stored so a playlist can reference an
+    already-present track by a cross-folder relative path in its .m3u8 instead of
+    re-downloading a duplicate. It is nullable: rows seeded without a download
+    (mark_existing) or from before this feature have no path (→ skip, but no reference).
+    Caveat: the frame is `webdav_folder` at record time; if the user later changes that
+    folder the stored path can be stale — the skip stays correct, only the reference may
+    point wrong. Self-heals on the next full scan/sync.
     """
     __table_args__ = (
         UniqueConstraint("user_id", "artist_norm", "title_norm",
@@ -115,6 +129,7 @@ class ServerTrack(SQLModel, table=True):
     user_id: int = Field(foreign_key="user.id", index=True)
     artist_norm: str = Field(index=True)
     title_norm: str = Field(index=True)
+    rel_path: str | None = None  # library-relative POSIX path; None if unknown (issue #31)
     created_at: datetime = Field(default_factory=_utcnow)
 
 

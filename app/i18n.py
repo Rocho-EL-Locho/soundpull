@@ -139,8 +139,15 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
                               "Titel schon auf dem Server liegen, und lädt nur neue.",
         "settings.scan_button": "Server einlesen",
         "settings.scan_running": "Server wird eingelesen …",
-        "settings.scan_done": "{count} neue Titel im Bestand erfasst",
+        "settings.scan_done": "{count} neue Titel erfasst, {removed} veraltete entfernt",
         "settings.scan_error": "Einlesen fehlgeschlagen: {error}",
+        # Dedup (issue #31)
+        "settings.dedup_label": "Bereits vorhandene Titel überspringen",
+        "settings.dedup_desc": "Titel, die schon in deinem Bestand liegen, nicht erneut "
+                               "herunterladen. In Playlists wird stattdessen auf die "
+                               "vorhandene Datei verwiesen (kein Duplikat). Nur bei WebDAV.",
+        "index.dedup_label": "Vorhandene Titel überspringen",
+        "index.dedup_hint": "Nur bei Ziel „WebDAV“ verfügbar.",
         # Playlist-Abos (issue #21)
         "subs.heading_new": "Neues Playlist-Abo",
         "subs.desc": "Eine Playlist in einem Intervall automatisch synchronisieren. "
@@ -293,8 +300,15 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
                               "already on the server and fetch only new ones.",
         "settings.scan_button": "Scan server",
         "settings.scan_running": "Scanning server …",
-        "settings.scan_done": "Indexed {count} new tracks",
+        "settings.scan_done": "Indexed {count} new tracks, removed {removed} stale",
         "settings.scan_error": "Scan failed: {error}",
+        # Dedup (issue #31)
+        "settings.dedup_label": "Skip tracks already in my library",
+        "settings.dedup_desc": "Don't re-download tracks already in your library. In "
+                               "playlists the existing file is referenced instead (no "
+                               "duplicate). WebDAV only.",
+        "index.dedup_label": "Skip tracks I already have",
+        "index.dedup_hint": "Only available with the WebDAV destination.",
         # Playlist subscriptions (issue #21)
         "subs.heading_new": "New playlist subscription",
         "subs.desc": "Automatically sync a playlist on an interval. Each run downloads "

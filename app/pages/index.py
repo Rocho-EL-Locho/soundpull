@@ -94,6 +94,7 @@ def index_page(url: str = "") -> None:
             if d_dest not in ("browser", "webdav"):
                 d_dest = "browser"
             has_webdav = bool(us and us.webdav_url)
+            d_dedup = bool(us and us.dedup_skip_existing)
 
         delivered: set[str] = set()  # browser downloads already auto-started
 
@@ -125,6 +126,15 @@ def index_page(url: str = "") -> None:
             dest_sel = ui.select({"browser": t("dest.browser"), "webdav": dest_label}, value=d_dest,
                                  label=t("index.dest_label")).props("outlined dense dark").classes("w-full")
 
+            # Dedup (issue #31): only meaningful for WebDAV — a browser ZIP has no library
+            # to skip against / reference into. Enable the switch only when WebDAV is chosen.
+            with ui.row().classes("w-full items-center gap-2"):
+                dedup_sw = ui.switch(t("index.dedup_label"), value=d_dedup) \
+                    .props("dense color=primary").classes("text-sm") \
+                    .bind_enabled_from(dest_sel, "value", backward=lambda v: v == "webdav")
+                ui.label(t("index.dedup_hint")).classes("text-xs text-white/40") \
+                    .bind_visibility_from(dest_sel, "value", backward=lambda v: v != "webdav")
+
             with ui.expansion(t("meta.heading"), icon="tune").classes("w-full glass rounded-lg") \
                     .props("dense"):
                 with ui.column().classes("w-full gap-1 p-2"):
@@ -140,9 +150,11 @@ def index_page(url: str = "") -> None:
                     return
                 try:
                     chosen_tags = TagOptions(**{f: bool(sw.value) for f, sw in tag_switches.items()})
+                    # Dedup only applies to WebDAV (browser ZIP has no library).
+                    dedup = bool(dedup_sw.value) and dest_sel.value == "webdav"
                     start_job(user_id=uid, url=target, genre=genre_sel.value,
                               mode=mode_tgl.value, destination_type=dest_sel.value,
-                              audio_format=audio_sel.value, tag_options=chosen_tags)
+                              audio_format=audio_sel.value, tag_options=chosen_tags, dedup=dedup)
                     ui.notify(t("index.notify_started"), type="positive")
                     url_in.value = ""
                     render_jobs.refresh()

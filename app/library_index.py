@@ -72,6 +72,22 @@ def load_index(session: Session, user_id: int) -> set[tuple[str, str]]:
     return {(a, t) for a, t in rows}
 
 
+def load_index_paths(session: Session, user_id: int) -> dict[tuple[str, str], str | None]:
+    """All ``(artist_norm, title_norm) -> rel_path`` for a user (issue #31).
+
+    One query that serves both dedup needs: the skip decision is ``key in dict`` and the
+    playlist m3u reference is ``dict.get(key)`` (the delivered file's library-relative path,
+    or ``None`` when the track is known but its path isn't — then it's skipped, not referenced).
+    """
+    from app.models import ServerTrack
+
+    rows = session.exec(
+        select(ServerTrack.artist_norm, ServerTrack.title_norm, ServerTrack.rel_path)
+        .where(ServerTrack.user_id == user_id)
+    ).all()
+    return {(a, t): p for a, t, p in rows}
+
+
 def is_on_server(session: Session, user_id: int, artist: str, title: str) -> bool:
     """True if this user already has `<artist> - <title>` on the server."""
     from app.models import ServerTrack
@@ -89,23 +105,41 @@ def is_on_server(session: Session, user_id: int, artist: str, title: str) -> boo
     return row is not None
 
 
-def record_tracks(session: Session, user_id: int, pairs) -> int:
-    """Add ``(artist, title)`` pairs to the index, skipping ones already present.
+def record_tracks(session: Session, user_id: int, pairs, *, update_path: bool = False) -> int:
+    """Add ``(artist, title[, rel_path])`` entries to the index (issue #21 / #31).
 
-    `pairs` is an iterable of raw ``(artist, title)`` tuples (normalised here via
-    `track_key`). Returns the number of newly inserted rows. A pair with no title is
-    skipped — there is nothing to match on.
+    `pairs` is an iterable of ``(artist, title)`` OR ``(artist, title, rel_path)`` (a
+    library-relative POSIX path); both arities are accepted so old 2-tuple callers keep
+    working. Returns the number of newly inserted rows (updating/backfilling an existing
+    row's path is not counted as new). A pair with no title is skipped — nothing to match on.
+
+    `update_path=True` (used by an authoritative scan) refreshes an existing row's
+    `rel_path` to the freshly-found location, so a moved/retagged file isn't later pruned
+    as missing (its old path is gone but a valid copy exists under the new one). Delivery
+    callers use the default — the first delivered path wins and is never overwritten.
     """
     from app.models import ServerTrack
 
-    known = load_index(session, user_id)
+    existing = {(r.artist_norm, r.title_norm): r for r in session.exec(
+        select(ServerTrack).where(ServerTrack.user_id == user_id)).all()}
     added = 0
-    for artist, title in pairs:
+    for entry in pairs:
+        artist, title, *rest = entry           # tolerate a 2- or 3-element tuple/list
+        path = rest[0] if rest else None
         a, t = track_key(title, artist)
-        if not t or (a, t) in known:
+        if not t:
             continue
-        session.add(ServerTrack(user_id=user_id, artist_norm=a, title_norm=t))
-        known.add((a, t))
+        row = existing.get((a, t))
+        if row is not None:
+            # Backfill a missing path always; overwrite an existing one only for an
+            # authoritative scan, where the freshly-found path is the source of truth.
+            if path and (not row.rel_path or (update_path and row.rel_path != path)):
+                row.rel_path = path
+                session.add(row)
+            continue
+        row = ServerTrack(user_id=user_id, artist_norm=a, title_norm=t, rel_path=path or None)
+        session.add(row)
+        existing[(a, t)] = row
         added += 1
     return added
 
@@ -129,12 +163,39 @@ def _artist_title_from_path(rel_parts: list[str]) -> tuple[str, str]:
     return artist, title
 
 
-def _walk_remote_files(client, path: str, depth: int, max_depth: int):
-    """Yield audio file paths under `path` (recursive, depth-bounded)."""
+# Directory basenames that are caches / internal state, never music — skipped whole
+# (case-insensitive) so the scan doesn't PROPFIND the hash-sharded subtrees underneath
+# (e.g. an ``attachments/<hash>/…`` store beside the sized-thumbnail cache).
+_SKIP_DIR_NAMES = {"attachments", "thumbnails", "previews", "cache"}
+
+
+def _is_skippable_dir(name: str) -> bool:
+    """True for cache / internal-state dirs that never hold music, so the scan can skip
+    the whole subtree instead of PROPFINDing thousands of irrelevant folders.
+
+    Covers names starting with ``__`` (e.g. a sized-thumbnail cache ``__sized__/…``) or
+    ``.`` (hidden dirs like ``.trash``), plus known cache names in `_SKIP_DIR_NAMES`
+    (e.g. a hash-sharded ``attachments/0d/47/5d/…`` store).
+    """
+    base = name.rstrip("/").rsplit("/", 1)[-1]
+    return (base.startswith("__") or base.startswith(".")
+            or base.casefold() in _SKIP_DIR_NAMES)
+
+
+def _walk_remote_files(client, path: str, depth: int, max_depth: int,
+                       errors: list | None = None):
+    """Yield audio file paths under `path` (recursive, depth-bounded).
+
+    A directory whose listing fails is logged and skipped so one unreadable folder can't
+    abort the whole scan; the failure is also appended to `errors` (when given) so the
+    caller can tell the scan was INCOMPLETE and must not prune the index (issue #31).
+    """
     try:
         entries = client.ls(path or "", detail=True)
     except Exception as exc:  # noqa: BLE001 - a single unreadable dir must not abort the scan
         log.warning("scan: listing %r failed: %s", path, exc)
+        if errors is not None:
+            errors.append((path, str(exc)))
         return
     for entry in entries:
         if not isinstance(entry, dict):
@@ -143,19 +204,49 @@ def _walk_remote_files(client, path: str, depth: int, max_depth: int):
         if not name or name == path.rstrip("/"):
             continue  # skip empties and the directory's self-entry
         if entry.get("type") == "directory":
-            if depth < max_depth:
-                yield from _walk_remote_files(client, name, depth + 1, max_depth)
+            if depth < max_depth and not _is_skippable_dir(name):
+                yield from _walk_remote_files(client, name, depth + 1, max_depth, errors)
         elif name.lower().endswith(fix_music_tags._SUPPORTED_EXTS):
             yield name
 
 
-def scan_webdav(user_id: int, max_depth: int = 8) -> int:
-    """Walk the user's WebDAV target folder and seed the index from file paths.
+def _prune_missing(session: Session, user_id: int, found_paths: set[str]) -> int:
+    """Delete index rows whose stored `rel_path` was not seen in a COMPLETE scan (issue #31).
+
+    Path-based (not key-based), so it's unaffected by artist/title normalisation: a row is
+    removed only when its concrete delivered path is no longer on the server (file deleted
+    or moved). Rows without a path (e.g. a `mark_existing` seed) are left untouched — there
+    is nothing to verify them against. Only safe after an error-free walk; otherwise a
+    transiently-unreadable folder would wrongly prune still-present tracks.
+
+    Precondition: `found_paths` and the stored `rel_path`s must share the same frame
+    (relative to `webdav_folder`). A moved file self-heals because the scan's `record_tracks`
+    ran with `update_path=True` first; a changed `webdav_folder` re-frames everything, so the
+    scan prunes the old-frame rows and re-adds them under the new frame in the same run.
+    """
+    from app.models import ServerTrack
+
+    rows = session.exec(
+        select(ServerTrack).where(ServerTrack.user_id == user_id,
+                                  ServerTrack.rel_path.is_not(None))
+    ).all()
+    pruned = 0
+    for row in rows:
+        if row.rel_path not in found_paths:
+            session.delete(row)
+            pruned += 1
+    return pruned
+
+
+def scan_webdav(user_id: int, max_depth: int = 8) -> tuple[int, int]:
+    """Walk the user's WebDAV target folder and reconcile the index with it (issue #21/#31).
 
     Best-effort and path-based (no remote tag reads): reliably recovers
-    ``(artist, title)`` for the album/single layout and title-only for playlist
-    folders. Returns the number of newly indexed tracks. Raises on connection /
-    configuration errors so the caller can surface them.
+    ``(artist, title)`` for the album/single layout and title-only for playlist folders.
+    The scan is **authoritative** — after an error-free walk it also PRUNES index rows
+    whose file is no longer on the server (so deletions/reorganisations self-heal). If any
+    directory listing failed, pruning is skipped (an incomplete walk must not delete valid
+    rows). Returns ``(added, pruned)``. Raises on connection / configuration errors.
     """
     from app.db import session_scope
     from app.models import UserSettings
@@ -173,15 +264,29 @@ def scan_webdav(user_id: int, max_depth: int = 8) -> int:
 
     client = make_client(url, username, password)
     prefix = f"{base}/" if base else ""
-    pairs: list[tuple[str, str]] = []
-    for full in _walk_remote_files(client, base, depth=0, max_depth=max_depth):
+    pairs: list[tuple[str, str, str]] = []
+    found_paths: set[str] = set()
+    errors: list = []
+    for full in _walk_remote_files(client, base, depth=0, max_depth=max_depth, errors=errors):
         rel = full[len(prefix):] if prefix and full.startswith(prefix) else full
         parts = [p for p in rel.split("/") if p]
         if not parts:
             continue
+        found_paths.add(rel)  # every audio file present (even if its title didn't parse)
         artist, title = _artist_title_from_path(parts)
         if title:
-            pairs.append((artist, title))
+            # `rel` is the file's path relative to the WebDAV base folder — the exact
+            # frame a playlist m3u references across folders (issue #31).
+            pairs.append((artist, title, rel))
 
     with session_scope() as session:
-        return record_tracks(session, user_id, pairs)
+        # update_path=True: a scan is authoritative, so refresh moved files' paths to the
+        # found location before pruning (else a moved file's stale path would be pruned).
+        added = record_tracks(session, user_id, pairs, update_path=True)
+        pruned = 0
+        if errors:
+            log.warning("scan: %d directory listing(s) failed — skipping prune so a "
+                        "transient error can't delete valid index rows", len(errors))
+        else:
+            pruned = _prune_missing(session, user_id, found_paths)
+    return added, pruned

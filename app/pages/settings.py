@@ -41,6 +41,7 @@ def settings_page() -> None:
                 "tags": {f: bool(getattr(us, f"tag_{f}")) for f in TAG_OPTION_FIELDS},
                 "wd_url": us.webdav_url or "", "wd_user": us.webdav_username or "",
                 "wd_folder": us.webdav_folder or "", "has_pw": us.has_webdav_password,
+                "dedup": bool(us.dedup_skip_existing),
                 # Only the "is one stored?" flag — never the plaintext cookie (issue #9).
                 "has_cookie": us.has_youtube_cookies,
             }
@@ -193,14 +194,19 @@ def settings_page() -> None:
 
                 ui.notify(t("settings.scan_running"), type="ongoing")
                 try:
-                    added = await run.io_bound(library_index.scan_webdav, uid)
+                    added, pruned = await run.io_bound(library_index.scan_webdav, uid)
                 except Exception as exc:  # noqa: BLE001 - surface config/connection errors
                     ui.notify(t("settings.scan_error", error=exc), type="negative")
                     return
-                ui.notify(t("settings.scan_done", count=added), type="positive")
+                ui.notify(t("settings.scan_done", count=added, removed=pruned), type="positive")
 
             ui.button(t("settings.scan_button"), icon="cloud_sync", on_click=scan_server) \
                 .props("outline").classes("text-white/90 self-start")
+
+            # Dedup (issue #31): skip already-present tracks; reference them in playlist m3u.
+            ui.label(t("settings.dedup_desc")).classes("text-xs text-white/50 mt-2")
+            dedup_sw = ui.switch(t("settings.dedup_label"), value=snap["dedup"]) \
+                .props("dark").classes("text-sm")
 
             def save() -> None:
                 with session_scope() as session:
@@ -217,6 +223,7 @@ def settings_page() -> None:
                     row.webdav_url = (wd_url.value or "").strip() or None
                     row.webdav_folder = folder_state["path"] or None
                     row.webdav_username = (wd_user.value or "").strip() or None
+                    row.dedup_skip_existing = bool(dedup_sw.value)
                     if (wd_pass.value or "").strip():
                         row.webdav_password_enc = encrypt_secret(wd_pass.value.strip())
                     # YouTube cookie (issue #9): remove wins; else store new; else keep.
