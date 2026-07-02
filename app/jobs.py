@@ -24,7 +24,10 @@ from app.config import settings
 from app.db import session_scope
 from app.fix_music_tags import TAG_OPTION_FIELDS, TagOptions
 from app.models import DownloadHistory, PlaylistSubscription, UserSettings
-from app.pipeline import DEFAULT_AUDIO_FORMAT, Destination, Reporter, normalize_audio_format, run_download
+from app.pipeline import (
+    DEFAULT_AUDIO_FORMAT, Destination, Reporter, normalize_audio_format, run_artist_download,
+    run_download,
+)
 from app.security import decrypt_secret
 
 log = logging.getLogger("jobs")
@@ -68,6 +71,9 @@ class JobState:
     album: str | None = None
     current_track: int = 0
     total_tracks: int = 0
+    # Album-level progress for an artist run (issue #32); 0 for other modes.
+    current_album: int = 0
+    total_albums: int = 0
     error: str | None = None
     created_at: datetime = field(default_factory=_utcnow)
     finished_at: datetime | None = None
@@ -128,6 +134,58 @@ def _make_reporter(job_id: str, js: JobState) -> Reporter:
                 js.total_tracks = tot
 
     return Reporter(on_phase=on_phase, on_meta=on_meta, on_track=on_track)
+
+
+def _make_artist_reporter(job_id: str, js: JobState) -> Reporter:
+    """Reporter for an artist run (issue #32): base wiring + two-level album progress."""
+    base = _make_reporter(job_id, js)
+
+    def on_album(current: int, total: int, name: str) -> None:
+        with _lock:
+            js.current_album, js.total_albums, js.album = current, total, name
+        _persist(job_id, album=name)
+
+    return Reporter(on_phase=base.on_phase, on_meta=base.on_meta,
+                    on_track=base.on_track, on_album=on_album)
+
+
+def _run_artist(job_id: str, url: str, genre: str, destination: Destination,
+                audio_format: str, tag_options: TagOptions, cookies_txt: str | None,
+                dedup: bool = False) -> None:
+    js = _registry[job_id]
+    reporter = _make_artist_reporter(job_id, js)
+
+    try:
+        # Dedup (issue #31): skip tracks already in the user's library so an artist re-run is
+        # cheap. WebDAV-only — a browser ZIP has no library to dedup against. `existing_ref` is
+        # playlist-only (m3u cross-refs), so it is unused here (albums write no m3u).
+        on_server = None
+        if dedup and destination.type == "webdav":
+            with session_scope() as session:
+                paths = library_index.load_index_paths(session, js.user_id)
+            on_server = lambda a, t: library_index.track_key(t, a) in paths  # noqa: E731
+
+        result = run_artist_download(job_id=job_id, url=url, genre=genre,
+                                     destination=destination, reporter=reporter,
+                                     audio_format=audio_format, tag_options=tag_options,
+                                     cookies_txt=cookies_txt, on_server=on_server,
+                                     max_items=settings.max_artist_items)
+        if destination.type == "webdav" and result.delivered:
+            _record_delivered_safe(job_id, js.user_id, result.delivered)
+        with _lock:
+            js.phase, js.finished_at = "done", _utcnow()
+            js.result_path = result.zip_path
+            js.result_name = result.zip_name
+            js.summary = result.summary
+        _persist(job_id, phase="done", finished_at=js.finished_at,
+                 artist=js.artist, album=js.album,
+                 current_track=js.current_track, total_tracks=js.total_tracks)
+    except Exception as exc:  # noqa: BLE001 - surface any failure to the user
+        log.exception("artist download %s failed", job_id)
+        err = _clean_error(exc)
+        with _lock:
+            js.phase, js.error, js.finished_at = "error", err, _utcnow()
+        _persist(job_id, phase="error", error=err, finished_at=js.finished_at)
 
 
 def _run(job_id: str, url: str, genre: str, mode: str, destination: Destination,
@@ -215,8 +273,13 @@ def start_job(*, user_id: int, url: str, genre: str, mode: str, destination_type
                   tag_options=tag_options)
     with _lock:
         _registry[job_id] = js
-    _executor.submit(_run, job_id, url, genre, mode, destination, audio_format,
-                     tag_options, cookies_txt, dedup)
+    if mode == "artist":
+        # An artist run (issue #32) fans out into N album downloads under one job.
+        _executor.submit(_run_artist, job_id, url, genre, destination, audio_format,
+                         tag_options, cookies_txt, dedup)
+    else:
+        _executor.submit(_run, job_id, url, genre, mode, destination, audio_format,
+                         tag_options, cookies_txt, dedup)
     return job_id
 
 
