@@ -51,6 +51,13 @@ def _job_card(js: JobState, delivered: set[str]) -> None:
                     if i < len(order) - 1:
                         ui.element("div").classes("w-4 h-px bg-white/15")
 
+        # Artist run (issue #32): show album i/N above the within-album track progress.
+        if js.mode == "artist" and js.phase == "download" and js.total_albums:
+            ui.linear_progress(value=js.current_album / js.total_albums, show_value=False) \
+                .props("rounded color=accent").classes("w-full")
+            ui.label(t("index.album_progress", current=js.current_album, total=js.total_albums)) \
+                .classes("text-xs text-white/60")
+
         if js.phase == "download" and js.total_tracks:
             ui.linear_progress(value=js.current_track / js.total_tracks, show_value=False) \
                 .props("rounded color=primary").classes("w-full")
@@ -118,7 +125,8 @@ def index_page(url: str = "") -> None:
                 with ui.column().classes("gap-1"):
                     ui.label(t("index.mode_label")).classes("text-xs text-white/50")
                     mode_tgl = ui.toggle({"album": t("common.album"), "single": t("common.single"),
-                                          "playlist": t("common.playlist")}, value=d_mode) \
+                                          "playlist": t("common.playlist"),
+                                          "artist": t("common.artist")}, value=d_mode) \
                         .props("toggle-color=primary unelevated no-caps").classes("glass rounded-lg")
             audio_sel = ui.select(audio_format_labels(), value=d_audio, label=t("index.audio_label")) \
                 .props("outlined dense dark").classes("w-full")

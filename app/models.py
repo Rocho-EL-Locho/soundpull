@@ -37,7 +37,7 @@ class UserSettings(SQLModel, table=True):
     user_id: int = Field(foreign_key="user.id", unique=True, index=True)
 
     default_genre: str = DEFAULT_GENRE
-    default_mode: str = "album"  # album | single | playlist
+    default_mode: str = "album"  # album | single | playlist | artist
     # Audio quality/format key (validated in app.pipeline.AUDIO_FORMATS).
     default_audio_format: str = "mp3_320"
     destination_type: str = "browser"  # browser (ZIP download) | webdav (direct upload)
@@ -87,7 +87,7 @@ class DownloadHistory(SQLModel, table=True):
 
     url: str
     genre: str
-    mode: str  # album | single | playlist
+    mode: str  # album | single | playlist | artist
     audio_format: str = "mp3_320"  # audio quality/format key (see app.pipeline)
     destination_type: str  # browser | webdav
 

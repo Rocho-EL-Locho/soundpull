@@ -11,9 +11,14 @@ import yt_dlp
 from app.fix_music_tags import TagOptions
 from app.pipeline import (
     DEFAULT_AUDIO_FORMAT,
+    Destination,
+    Reporter,
+    Result,
     _ALBUM_FLAGS,
     _PLAYLIST_TRACK_TMPL,
     _SINGLE_FLAGS,
+    enumerate_artist,
+    run_artist_download,
     _apply_audio_format,
     _apply_cookie_policy,
     _apply_tag_options,
@@ -413,3 +418,198 @@ def test_write_cookie_file_writes_verbatim_0600(tmp_path, monkeypatch):
     # kept OUTSIDE the per-job work dir so the WebDAV upload never ships it
     assert path.name == "job-42.cookies.txt"
     assert (pipeline._WORK_ROOT / "job-42") not in path.parents
+
+
+# --- Artist mode (issue #32) -------------------------------------------------
+
+class _RecordingYDL:
+    """A fake yt_dlp.YoutubeDL: returns canned info per URL and records extraction order."""
+    def __init__(self, responses: dict):
+        self.responses = responses
+        self.seen: list[str] = []
+
+    def factory(self):
+        responses, seen = self.responses, self.seen
+
+        # Subclass the real YoutubeDL so inherited classmethods (validate_outtmpl, used by
+        # parse_options via _extractor_args) keep working; only extract_info is faked.
+        class _YDL(yt_dlp.YoutubeDL):
+            def __init__(self, opts):
+                self.opts = opts                      # intentionally skip super().__init__
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def extract_info(self, url, download=False):
+                seen.append(url)
+                return responses.get(url, {})
+
+        return _YDL
+
+
+def test_enumerate_artist_resolves_releases_and_parses(monkeypatch):
+    # A bare artist URL is flat-probed for its channel_url, then the /releases tab is
+    # enumerated: valid releases parsed (title→"Album" fallback), None/URL-less entries dropped.
+    import app.pipeline as pipeline
+    responses = {
+        "https://music.youtube.com/channel/UCabc": {
+            "channel_url": "https://www.youtube.com/channel/UCabc"},
+        "https://www.youtube.com/channel/UCabc/releases": {
+            "channel": "Rick Astley",
+            "entries": [
+                {"title": "Album A", "url": "https://x/OLAK5uy_A"},
+                {"title": "Album B", "url": "https://x/OLAK5uy_B"},
+                None,                                    # dead entry → skipped
+                {"url": "https://x/OLAK5uy_C"},          # no title → "Album"
+                {"title": "No URL"},                     # no url → skipped
+            ],
+        },
+    }
+    rec = _RecordingYDL(responses)
+    monkeypatch.setattr(pipeline.yt_dlp, "YoutubeDL", rec.factory())
+
+    artist, releases = pipeline.enumerate_artist("https://music.youtube.com/channel/UCabc")
+
+    assert artist == "Rick Astley"
+    assert releases == [
+        {"title": "Album A", "url": "https://x/OLAK5uy_A"},
+        {"title": "Album B", "url": "https://x/OLAK5uy_B"},
+        {"title": "Album", "url": "https://x/OLAK5uy_C"},
+    ]
+    assert rec.seen == ["https://music.youtube.com/channel/UCabc",
+                        "https://www.youtube.com/channel/UCabc/releases"]
+
+
+def test_enumerate_artist_direct_releases_url_and_limit(monkeypatch):
+    # A URL that is already a /releases tab is used directly (no channel probe); `limit`
+    # caps the release count; the artist name falls back to the title minus " - Releases".
+    import app.pipeline as pipeline
+    responses = {
+        "https://www.youtube.com/channel/UCabc/releases": {
+            "title": "Foo Bar - Releases",
+            "entries": [{"title": f"R{i}", "url": f"u{i}"} for i in range(5)],
+        },
+    }
+    rec = _RecordingYDL(responses)
+    monkeypatch.setattr(pipeline.yt_dlp, "YoutubeDL", rec.factory())
+
+    artist, releases = enumerate_artist(
+        "https://www.youtube.com/channel/UCabc/releases", limit=2)
+
+    assert artist == "Foo Bar"
+    assert [r["url"] for r in releases] == ["u0", "u1"]                    # capped to 2
+    assert rec.seen == ["https://www.youtube.com/channel/UCabc/releases"]  # no extra probe
+
+
+def test_run_artist_download_browser_stages_and_zips_once(monkeypatch, tmp_path):
+    # An artist run stages every release through the album path (deliver=False into ONE
+    # shared dir, dedup passed through), tolerates a failed release, reports album i/N,
+    # and delivers a single combined ZIP under the artist name.
+    import app.pipeline as pipeline
+    monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
+    monkeypatch.setattr(pipeline, "enumerate_artist",
+                        lambda url, cookiefile=None, limit=0: ("Artist", [
+                            {"title": "A", "url": "uA"},
+                            {"title": "B", "url": "uB"},
+                            {"title": "C", "url": "uC"}]))
+    calls = []
+
+    def fake_run_download(**kw):
+        calls.append(kw)
+        if kw["url"] == "uB":
+            raise RuntimeError("boom")                     # one release fails
+        d = kw["stage_dir"] / "Artist" / kw["url"]
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "track.mp3").write_bytes(b"x")                # simulate a staged track
+        return Result(delivered=[("Artist", kw["url"], f"Artist/{kw['url']}/track.mp3")],
+                      new_track_count=1)
+
+    monkeypatch.setattr(pipeline, "run_download", fake_run_download)
+    zipped = {}
+    monkeypatch.setattr(pipeline, "_zip_dir",
+                        lambda src, zp, name: zipped.update(src=src, name=name))
+    albums = []
+    reporter = Reporter(on_album=lambda c, t, n: albums.append((c, t, n)))
+    sentinel = lambda a, t: False                          # dedup closure
+
+    res = run_artist_download(job_id="job1", url="uArtist", genre="Rap",
+                              destination=Destination(type="browser"),
+                              reporter=reporter, on_server=sentinel, max_items=0)
+
+    assert len(calls) == 3
+    assert all(c["mode"] == "album" and c["deliver"] is False for c in calls)
+    assert all(c["stage_dir"] == tmp_path / ".work" / "job1" for c in calls)
+    assert all(c["on_server"] is sentinel for c in calls)   # dedup passed to every release
+    # each release's title is forced as its album name → distinct per-release folders
+    assert [c["album_name"] for c in calls] == ["A", "B", "C"]
+    assert res.new_track_count == 2 and len(res.delivered) == 2   # A + C; B skipped
+    assert res.zip_name == "Artist.zip"
+    assert "übersprungen" in res.summary                    # failure surfaced, run continued
+    assert albums == [(1, 3, "A"), (2, 3, "B"), (3, 3, "C")]
+    assert zipped["name"] == "Artist"
+    assert zipped["src"] == tmp_path / ".work" / "job1" / "Artist"   # single artist level
+
+
+def test_run_artist_download_webdav_uploads_whole_tree_once(monkeypatch, tmp_path):
+    import app.pipeline as pipeline
+    monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
+    monkeypatch.setattr(pipeline, "enumerate_artist",
+                        lambda url, cookiefile=None, limit=0: ("Artist", [{"title": "A", "url": "uA"}]))
+
+    def fake_run_download(**kw):
+        d = kw["stage_dir"] / "Artist" / "A"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "t.mp3").write_bytes(b"x")
+        return Result(delivered=[("Artist", "A", "Artist/A/t.mp3")], new_track_count=1)
+
+    monkeypatch.setattr(pipeline, "run_download", fake_run_download)
+    uploads = []
+    monkeypatch.setattr(pipeline, "_upload_tree", lambda dest, root: uploads.append(root))
+
+    res = run_artist_download(job_id="j2", url="u", genre="Rap",
+                              destination=Destination(type="webdav"), reporter=Reporter())
+
+    assert uploads == [tmp_path / ".work" / "j2"]           # whole tree uploaded exactly once
+    assert res.new_track_count == 1 and len(res.delivered) == 1
+    assert res.zip_path is None                             # WebDAV → no ZIP
+    assert "WebDAV" in res.summary
+
+
+def test_run_artist_download_disambiguates_duplicate_release_titles(monkeypatch, tmp_path):
+    # Two releases sharing a title must not stage into the same folder (clobbering covers /
+    # re-tagging each other): the second gets a disambiguated album name.
+    import app.pipeline as pipeline
+    monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
+    monkeypatch.setattr(pipeline, "enumerate_artist",
+                        lambda url, cookiefile=None, limit=0: ("Artist", [
+                            {"title": "Live", "url": "u1"},
+                            {"title": "Live", "url": "u2"}]))
+    seen = []
+
+    def fake_run_download(**kw):
+        seen.append(kw["album_name"])
+        d = kw["stage_dir"] / "Artist" / kw["album_name"]
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "t.mp3").write_bytes(b"x")
+        return Result(delivered=[], new_track_count=1)
+
+    monkeypatch.setattr(pipeline, "run_download", fake_run_download)
+    monkeypatch.setattr(pipeline, "_zip_dir", lambda src, zp, name: None)
+
+    run_artist_download(job_id="jd", url="u", genre="Rap",
+                        destination=Destination(type="browser"), reporter=Reporter())
+
+    assert seen == ["Live", "Live (2)"]                     # second release disambiguated
+
+
+def test_run_artist_download_raises_when_no_releases(monkeypatch, tmp_path):
+    import app.pipeline as pipeline
+    monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
+    monkeypatch.setattr(pipeline, "enumerate_artist",
+                        lambda url, cookiefile=None, limit=0: ("Artist", []))
+    with pytest.raises(RuntimeError):
+        run_artist_download(job_id="j3", url="u", genre="Rap",
+                            destination=Destination(type="browser"), reporter=Reporter())
