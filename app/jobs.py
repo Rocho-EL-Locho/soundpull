@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
 from app import library_index, pipeline
@@ -55,6 +56,14 @@ def _clean_error(exc: object) -> str:
     return _ANSI_RE.sub("", str(exc)).strip()
 
 
+# Non-fatal warnings surfaced on a completed job when the server-index write failed (#38).
+# These are i18n KEYS, not text — the worker runs off the request thread where `t()` can't
+# resolve the active language, so the page resolves them via `t()` at render time. `t()`
+# returns an unknown string unchanged, so storing a key stays backward-safe.
+_INDEX_WARNING_KEY = "jobs.index_update_failed"  # delivery OK, but the index wasn't updated
+_SEED_FAILED_KEY = "jobs.seed_failed"            # mark_existing seed couldn't be persisted
+
+
 @dataclass
 class JobState:
     id: str
@@ -75,6 +84,7 @@ class JobState:
     current_album: int = 0
     total_albums: int = 0
     error: str | None = None
+    warning: str | None = None   # non-fatal note on a done job (e.g. index update failed, #38)
     created_at: datetime = field(default_factory=_utcnow)
     finished_at: datetime | None = None
     result_path: str | None = None   # ZIP path for browser destination
@@ -101,18 +111,35 @@ def _persist(job_id: str, **fields) -> None:
         session.add(row)
 
 
-def _record_delivered_safe(job_id: str, user_id: int, delivered: list) -> None:
+def _record_delivered_safe(job_id: str, user_id: int, delivered: list) -> bool:
     """Record delivered tracks into the server index, isolated as a side effect.
 
-    Indexing must never fail an already-completed download/sync — a unique-constraint
-    race (two concurrent deliveries of the same track) or a locked DB is logged and
-    swallowed rather than propagated (issue #21).
+    Indexing must never *fail* an already-completed download/sync — a locked DB or a
+    unique-constraint race is logged and swallowed rather than propagated (issue #21).
+    Returns ``True`` when the index reflects the tracks, ``False`` when the write genuinely
+    failed — the caller keeps the job ``done`` but surfaces a warning so the stale-index
+    risk is visible (issue #38).
+
+    A `UniqueConstraint` race (a concurrent delivery inserted an overlapping
+    ``(user, artist, title)`` key, rolling back our whole batch) is **benign**: we retry
+    once, and on the retry `record_tracks` sees the now-committed rows, skips them, and
+    still inserts our genuinely-new ones. So a benign race resolves to ``True`` (no false
+    warning) instead of dropping the rest of the batch — only a persistent conflict warns.
     """
-    try:
-        with session_scope() as session:
-            library_index.record_tracks(session, user_id, delivered)
-    except Exception:  # noqa: BLE001 - best-effort; a completed upload stays successful
-        log.exception("server-index update failed for %s", job_id)
+    for attempt in (1, 2):
+        try:
+            with session_scope() as session:
+                library_index.record_tracks(session, user_id, delivered)
+            return True
+        except IntegrityError:
+            if attempt == 1:
+                continue  # a concurrent insert won the race → re-record the remainder
+            log.exception("server-index update kept conflicting for %s", job_id)
+            return False
+        except Exception:  # noqa: BLE001 - best-effort; a completed upload stays successful
+            log.exception("server-index update failed for %s", job_id)
+            return False
+    return False  # unreachable (the loop always returns), kept for a total function
 
 
 def _make_reporter(job_id: str, js: JobState) -> Reporter:
@@ -170,14 +197,17 @@ def _run_artist(job_id: str, url: str, genre: str, destination: Destination,
                                      audio_format=audio_format, tag_options=tag_options,
                                      cookies_txt=cookies_txt, on_server=on_server,
                                      max_items=settings.max_artist_items)
+        indexed = True
         if destination.type == "webdav" and result.delivered:
-            _record_delivered_safe(job_id, js.user_id, result.delivered)
+            indexed = _record_delivered_safe(job_id, js.user_id, result.delivered)
+        warning = None if indexed else _INDEX_WARNING_KEY
         with _lock:
             js.phase, js.finished_at = "done", _utcnow()
             js.result_path = result.zip_path
             js.result_name = result.zip_name
             js.summary = result.summary
-        _persist(job_id, phase="done", finished_at=js.finished_at,
+            js.warning = warning
+        _persist(job_id, phase="done", finished_at=js.finished_at, warning=warning,
                  artist=js.artist, album=js.album,
                  current_track=js.current_track, total_tracks=js.total_tracks)
     except Exception as exc:  # noqa: BLE001 - surface any failure to the user
@@ -214,14 +244,17 @@ def _run(job_id: str, url: str, genre: str, mode: str, destination: Destination,
         # playlist sync recognises them (issue #21). Browser ZIPs are not on the server.
         # Best-effort: a failed index write (e.g. a unique-constraint race between two
         # concurrent downloads) must NOT flip a completed upload to "error".
+        indexed = True
         if destination.type == "webdav" and result.delivered:
-            _record_delivered_safe(job_id, js.user_id, result.delivered)
+            indexed = _record_delivered_safe(job_id, js.user_id, result.delivered)
+        warning = None if indexed else _INDEX_WARNING_KEY
         with _lock:
             js.phase, js.finished_at = "done", _utcnow()
             js.result_path = result.zip_path
             js.result_name = result.zip_name
             js.summary = result.summary
-        _persist(job_id, phase="done", finished_at=js.finished_at,
+            js.warning = warning
+        _persist(job_id, phase="done", finished_at=js.finished_at, warning=warning,
                  artist=js.artist, album=js.album,
                  current_track=js.current_track, total_tracks=js.total_tracks)
     except Exception as exc:  # noqa: BLE001 - surface any failure to the user
@@ -393,6 +426,7 @@ def _run_sync(job_id: str, cfg: _SyncConfig) -> None:
     js = _registry[job_id]
     reporter = _make_reporter(job_id, js)
     try:
+        warning = None  # set to an i18n key below when an index write fails (issue #38)
         # "mark existing" first run: seed the index from the current playlist and
         # download nothing, so only FUTURE additions are ever fetched (issue #21).
         if cfg.first_run and cfg.initial_mode == "mark_existing":
@@ -407,10 +441,19 @@ def _run_sync(job_id: str, cfg: _SyncConfig) -> None:
             finally:
                 if cookie_path:
                     cookie_path.unlink(missing_ok=True)
-            _record_delivered_safe(job_id, cfg.user_id, pairs)  # best-effort seed
+            seeded = _record_delivered_safe(job_id, cfg.user_id, pairs)
             with session_scope() as session:
-                _sub_result(session, cfg.subscription_id, status="ok", new_count=0,
-                            name=pl_title or None)
+                if seeded:
+                    _sub_result(session, cfg.subscription_id, status="ok", new_count=0,
+                                name=pl_title or None)
+                else:
+                    # The seed WRITE failed → the index is NOT populated. Do not mark the
+                    # subscription synced: that would leave first_run False, so the next sync
+                    # treats the whole playlist as new and re-downloads ALL of it. Record an
+                    # error instead (last_synced_at stays None → it re-seeds next interval) (#38).
+                    warning = _SEED_FAILED_KEY
+                    _sub_result(session, cfg.subscription_id, status="error",
+                                error=_SEED_FAILED_KEY, name=pl_title or None)
             summary = f"{len(pairs)} Titel als vorhanden markiert"
         else:
             # One loaded index snapshot serves both the skip decision and, for a track
@@ -432,8 +475,12 @@ def _run_sync(job_id: str, cfg: _SyncConfig) -> None:
                 cookies_txt=cfg.cookies_txt, on_server=on_server, existing_ref=existing_ref,
                 existing_tracks=cfg.existing_tracks,
             )
-            if result.delivered:  # best-effort; must not roll back the status write below
-                _record_delivered_safe(job_id, cfg.user_id, result.delivered)
+            if result.delivered and not _record_delivered_safe(
+                    job_id, cfg.user_id, result.delivered):
+                # Delivery succeeded and the manifest is saved below, so the sync stays "ok";
+                # only the ServerTrack index is stale → those tracks re-download next sync.
+                # Surface it on the job (durable in the history), not on the subscription (#38).
+                warning = _INDEX_WARNING_KEY
             with session_scope() as session:
                 # Persist whenever we have a manifest (new downloads OR new references), so
                 # the complete rebuilt playlist — including cross-folder refs — is kept (#31).
@@ -445,7 +492,8 @@ def _run_sync(job_id: str, cfg: _SyncConfig) -> None:
 
         with _lock:
             js.phase, js.finished_at, js.summary = "done", _utcnow(), summary
-        _persist(job_id, phase="done", finished_at=js.finished_at,
+            js.warning = warning
+        _persist(job_id, phase="done", finished_at=js.finished_at, warning=warning,
                  artist=js.artist, album=js.album,
                  current_track=js.current_track, total_tracks=js.total_tracks)
     except Exception as exc:  # noqa: BLE001 - surface any failure to the user

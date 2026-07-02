@@ -97,6 +97,10 @@ class DownloadHistory(SQLModel, table=True):
     current_track: int = 0
     total_tracks: int = 0
     error: str | None = None
+    # Non-fatal note on a completed job (issue #38): e.g. the WebDAV upload succeeded but the
+    # server-index update failed, so those tracks may be re-downloaded on the next sync. The
+    # job still ends `done` (files are delivered); this just surfaces the risk in the history.
+    warning: str | None = None
 
     created_at: datetime = Field(default_factory=_utcnow, index=True)
     finished_at: datetime | None = None

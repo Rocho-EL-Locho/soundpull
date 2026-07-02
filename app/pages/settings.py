@@ -195,9 +195,15 @@ def settings_page() -> None:
 
                 ui.notify(t("settings.scan_running"), type="ongoing")
                 try:
-                    added, pruned = await run.io_bound(library_index.scan_webdav, uid)
+                    added, pruned, errors = await run.io_bound(library_index.scan_webdav, uid)
                 except Exception as exc:  # noqa: BLE001 - surface config/connection errors
                     ui.notify(t("settings.scan_error", error=exc), type="negative")
+                    return
+                # Distinguish a healthy-but-empty scan from an INCOMPLETE one: unreadable
+                # sub-folders mean the index may be stale and pruning was skipped (issue #38).
+                if errors:
+                    ui.notify(t("settings.scan_incomplete", count=added, failed=len(errors)),
+                              type="warning")
                     return
                 ui.notify(t("settings.scan_done", count=added, removed=pruned), type="positive")
 
