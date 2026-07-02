@@ -42,6 +42,7 @@ def settings_page() -> None:
                 "wd_url": us.webdav_url or "", "wd_user": us.webdav_username or "",
                 "wd_folder": us.webdav_folder or "", "has_pw": us.has_webdav_password,
                 "dedup": bool(us.dedup_skip_existing),
+                "lyrics": bool(us.fetch_synced_lyrics),
                 # Only the "is one stored?" flag — never the plaintext cookie (issue #9).
                 "has_cookie": us.has_youtube_cookies,
             }
@@ -68,6 +69,10 @@ def settings_page() -> None:
         with ui.card().classes("glass w-full rounded-2xl p-6 gap-3"):
             ui.label(t("meta.heading")).classes("text-lg font-semibold")
             tag_switches = tag_option_switches(TagOptions(**snap["tags"]))
+            # Synced lyrics (issue #43): fetch `.lrc` sidecars from LRCLIB; both destinations.
+            lyrics_sw = ui.switch(t("settings.lyrics_label"), value=snap["lyrics"]) \
+                .props("dark").classes("text-sm mt-2")
+            ui.label(t("settings.lyrics_desc")).classes("text-xs text-white/50")
 
         # YouTube cookie (issue #9). Defined before the WebDAV card so the shared
         # save() closure below can persist it. The stored cookie is never echoed
@@ -231,6 +236,7 @@ def settings_page() -> None:
                     row.webdav_folder = folder_state["path"] or None
                     row.webdav_username = (wd_user.value or "").strip() or None
                     row.dedup_skip_existing = bool(dedup_sw.value)
+                    row.fetch_synced_lyrics = bool(lyrics_sw.value)
                     if (wd_pass.value or "").strip():
                         row.webdav_password_enc = encrypt_secret(wd_pass.value.strip())
                     # YouTube cookie (issue #9): remove wins; else store new; else keep.

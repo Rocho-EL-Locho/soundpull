@@ -178,7 +178,7 @@ def _make_artist_reporter(job_id: str, js: JobState) -> Reporter:
 
 def _run_artist(job_id: str, url: str, genre: str, destination: Destination,
                 audio_format: str, tag_options: TagOptions, cookies_txt: str | None,
-                dedup: bool = False) -> None:
+                dedup: bool = False, fetch_lyrics: bool = False) -> None:
     js = _registry[job_id]
     reporter = _make_artist_reporter(job_id, js)
 
@@ -196,7 +196,8 @@ def _run_artist(job_id: str, url: str, genre: str, destination: Destination,
                                      destination=destination, reporter=reporter,
                                      audio_format=audio_format, tag_options=tag_options,
                                      cookies_txt=cookies_txt, on_server=on_server,
-                                     max_items=settings.max_artist_items)
+                                     max_items=settings.max_artist_items,
+                                     fetch_lyrics=fetch_lyrics)
         indexed = True
         if destination.type == "webdav" and result.delivered:
             indexed = _record_delivered_safe(job_id, js.user_id, result.delivered)
@@ -220,7 +221,7 @@ def _run_artist(job_id: str, url: str, genre: str, destination: Destination,
 
 def _run(job_id: str, url: str, genre: str, mode: str, destination: Destination,
          audio_format: str, tag_options: TagOptions, cookies_txt: str | None,
-         dedup: bool = False) -> None:
+         dedup: bool = False, fetch_lyrics: bool = False) -> None:
     js = _registry[job_id]
     reporter = _make_reporter(job_id, js)
 
@@ -239,7 +240,7 @@ def _run(job_id: str, url: str, genre: str, mode: str, destination: Destination,
                               destination=destination, reporter=reporter,
                               audio_format=audio_format, tag_options=tag_options,
                               cookies_txt=cookies_txt, on_server=on_server,
-                              existing_ref=existing_ref)
+                              existing_ref=existing_ref, fetch_lyrics=fetch_lyrics)
         # A WebDAV upload actually puts tracks "on the server" → index them so a later
         # playlist sync recognises them (issue #21). Browser ZIPs are not on the server.
         # Best-effort: a failed index write (e.g. a unique-constraint race between two
@@ -267,13 +268,15 @@ def _run(job_id: str, url: str, genre: str, mode: str, destination: Destination,
 
 def start_job(*, user_id: int, url: str, genre: str, mode: str, destination_type: str,
               audio_format: str = DEFAULT_AUDIO_FORMAT,
-              tag_options: TagOptions | None = None, dedup: bool = False) -> str:
+              tag_options: TagOptions | None = None, dedup: bool = False,
+              fetch_lyrics: bool = False) -> str:
     """Queue a download for a user. Returns the job id. Raises on bad config.
 
     `tag_options` is the per-download field selection; when omitted it falls back
     to the user's saved defaults (issue #7). `dedup` skips tracks already in the
     user's library and references them in a playlist m3u (issue #31); it only takes
-    effect for the WebDAV destination.
+    effect for the WebDAV destination. `fetch_lyrics` writes a best-effort `.lrc`
+    synced-lyrics sidecar next to each track (issue #43); applies to both destinations.
     """
     job_id = uuid.uuid4().hex
     audio_format = normalize_audio_format(audio_format)
@@ -309,10 +312,10 @@ def start_job(*, user_id: int, url: str, genre: str, mode: str, destination_type
     if mode == "artist":
         # An artist run (issue #32) fans out into N album downloads under one job.
         _executor.submit(_run_artist, job_id, url, genre, destination, audio_format,
-                         tag_options, cookies_txt, dedup)
+                         tag_options, cookies_txt, dedup, fetch_lyrics)
     else:
         _executor.submit(_run, job_id, url, genre, mode, destination, audio_format,
-                         tag_options, cookies_txt, dedup)
+                         tag_options, cookies_txt, dedup, fetch_lyrics)
     return job_id
 
 
@@ -348,6 +351,7 @@ class _SyncConfig:
     initial_mode: str
     first_run: bool
     existing_tracks: list
+    fetch_lyrics: bool = False
 
 
 def start_sync(subscription_id: int) -> str | None:
@@ -384,6 +388,7 @@ def start_sync(subscription_id: int) -> str | None:
             initial_mode=sub.initial_mode,
             first_run=sub.last_synced_at is None,
             existing_tracks=json.loads(sub.playlist_files) if sub.playlist_files else [],
+            fetch_lyrics=bool(us.fetch_synced_lyrics),
         )
         session.add(sub)
 
@@ -474,7 +479,7 @@ def _run_sync(job_id: str, cfg: _SyncConfig) -> None:
                 destination=cfg.destination, reporter=reporter,
                 audio_format=cfg.audio_format, tag_options=cfg.tag_options,
                 cookies_txt=cfg.cookies_txt, on_server=on_server, existing_ref=existing_ref,
-                existing_tracks=cfg.existing_tracks,
+                existing_tracks=cfg.existing_tracks, fetch_lyrics=cfg.fetch_lyrics,
             )
             if result.delivered and not _record_delivered_safe(
                     job_id, cfg.user_id, result.delivered):

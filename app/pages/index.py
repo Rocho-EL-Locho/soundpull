@@ -104,6 +104,7 @@ def index_page(url: str = "") -> None:
                 d_dest = "browser"
             has_webdav = bool(us and us.webdav_url)
             d_dedup = bool(us and us.dedup_skip_existing)
+            d_lyrics = bool(us and us.fetch_synced_lyrics)
 
         delivered: set[str] = set()  # browser downloads already auto-started
 
@@ -149,6 +150,9 @@ def index_page(url: str = "") -> None:
                     .props("dense"):
                 with ui.column().classes("w-full gap-1 p-2"):
                     tag_switches = tag_option_switches(d_tags)
+                    # Synced lyrics (issue #43): fetch `.lrc` sidecars from LRCLIB; both dests.
+                    lyrics_sw = ui.switch(t("index.lyrics_label"), value=d_lyrics) \
+                        .props("dense color=primary").classes("text-sm")
 
             def start() -> None:
                 target = (url_in.value or "").strip()
@@ -164,7 +168,8 @@ def index_page(url: str = "") -> None:
                     dedup = bool(dedup_sw.value) and dest_sel.value == "webdav"
                     start_job(user_id=uid, url=target, genre=genre_sel.value,
                               mode=mode_tgl.value, destination_type=dest_sel.value,
-                              audio_format=audio_sel.value, tag_options=chosen_tags, dedup=dedup)
+                              audio_format=audio_sel.value, tag_options=chosen_tags, dedup=dedup,
+                              fetch_lyrics=bool(lyrics_sw.value))
                     ui.notify(t("index.notify_started"), type="positive")
                     url_in.value = ""
                     render_jobs.refresh()
