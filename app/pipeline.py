@@ -815,12 +815,14 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
     Result carries `delivered` so the caller can deliver the combined tree once. The download +
     tag steps in between are unchanged, so metadata parity is unaffected.
 
-    `own_artist` (artist mode, issue #56) installs a match_filter that skips any track NOT
-    credited to this artist — YouTube Music's `/releases` tab mixes an artist's own albums with
-    third-party compilation / label uploads whose artist tag is the label (or absent), which
-    would otherwise never dedup and land as mis-tagged duplicates. Only the artist orchestrator
-    passes it (album/single/playlist name their source directly); like dedup it is parity-safe —
-    it only selects WHICH entries download, never how they're tagged.
+    `own_artist` (artist mode, issue #56) is the known performer of the run and does two things:
+    (1) installs a match_filter that skips any track NOT credited to this artist — YouTube Music's
+    `/releases` tab mixes an artist's own albums with third-party compilation / label uploads whose
+    artist tag is the label (or absent), which would otherwise never dedup and land as mis-tagged
+    duplicates; and (2) forces it as the album's primary artist (folder / `album_artist` tag /
+    server-index key) so a release probed on a label channel isn't filed under the label. Only the
+    artist orchestrator passes it (album/single/playlist name their source directly); None keeps
+    the probed artist, so a plain download is unchanged (metadata parity).
 
     `album_name` (album mode, issue #32) forces the album folder + tag to a known release title
     instead of trusting each track's `%(album)s`. The artist orchestrator passes the release
@@ -877,7 +879,13 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
             base_flags = _SINGLE_FLAGS  # per-track tags, no album track-number remap
         else:
             artist_raw, album_raw = _probe_meta(url, is_album, cookiefile=cookiefile)
-            primary_artist = _primary_artist(artist_raw)
+            # In artist mode (`own_artist` set) force the known performer as the album's primary
+            # artist (issue #56): releases on a label channel probe as artist=<label> (e.g.
+            # "Drum&BassArena"), which would fold the whole album under the label in Navidrome and
+            # split the discography by upload-source casing ("Bcee" vs "BCee"). We already know the
+            # real artist for the run, so use it for the folder / album_artist / server-index key.
+            # None for a plain album/single download → falls back to the probed artist (parity).
+            primary_artist = own_artist or _primary_artist(artist_raw)
             album = (album_name or album_raw or "Unbekannt Album") if is_album else "Singles"
             reporter.on_meta(primary_artist, album)
             # `primary_artist` is interpolated literally (not a yt-dlp `%(...)s`
