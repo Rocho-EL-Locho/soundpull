@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import zipfile
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -1030,6 +1031,7 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
                         cookies_txt: str | None = None,
                         on_server: Callable[[str, str], bool] | None = None,
                         max_items: int = 0,
+                        album_concurrency: int = 1,
                         fetch_lyrics: bool = False) -> Result:
     """Download an artist's whole discography (issue #32).
 
@@ -1039,7 +1041,10 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
     tree ONCE: a WebDAV upload mirrors `<Artist>/<Album>/…` into the library; a browser run ZIPs
     it under the artist name. `on_server` (dedup, issue #31) is passed through to every release so
     a re-run skips already-present tracks; `max_items` caps the number of releases (0 = unlimited).
-    One failing release is logged and skipped — it does not abort the whole run.
+    `album_concurrency` (>=2) downloads that many releases in parallel — each release is an
+    independent yt-dlp run into its own `Artist/<album>/` folder, so parity is unaffected; results
+    are aggregated in the calling thread. One failing release is logged and skipped — it does not
+    abort the whole run.
     """
     work_base = _WORK_ROOT / job_id
     cookie_path = _write_cookie_file(job_id, cookies_txt)
@@ -1053,36 +1058,60 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
         reporter.on_meta(artist, "")
 
         # Per-release reporter: forward track/meta to the outer reporter, but swallow phase
-        # changes — the orchestrator owns the macro phase (so sub-albums don't flip it).
+        # changes — the orchestrator owns the macro phase (so sub-albums don't flip it). With a
+        # concurrent album pool the shared within-album track bar would flicker between releases,
+        # so forward per-track progress only when albums run one at a time.
+        forward_tracks = album_concurrency <= 1
         album_reporter = Reporter(on_phase=lambda phase: None,
-                                  on_meta=reporter.on_meta, on_track=reporter.on_track)
+                                  on_meta=reporter.on_meta,
+                                  on_track=reporter.on_track if forward_tracks
+                                  else (lambda cur, tot: None))
 
         total = len(releases)
-        delivered_all: list = []
-        new_count = 0
-        failed: list[str] = []
+        # Disambiguate release titles up front, single-threaded, so folder naming is deterministic
+        # and independent of completion order: two releases can share a title (a reissue, a
+        # re-released single) and would otherwise stage into the SAME `Artist/<title>/` folder,
+        # clobbering each other's cover / re-tagging each other's tracks.
         used_titles: dict[str, int] = {}
-        reporter.on_phase("download")
+        planned: list[tuple[int, dict, str]] = []
         for i, rel in enumerate(releases, 1):
-            # Two releases can share a title (a reissue, a re-released single). They would
-            # otherwise stage into the SAME `Artist/<title>/` folder and clobber each other's
-            # cover / re-tag each other's tracks — so disambiguate the album name per run.
             base = rel["title"]
             used_titles[base] = used_titles.get(base, 0) + 1
             album_name = base if used_titles[base] == 1 else f"{base} ({used_titles[base]})"
-            reporter.on_album(i, total, album_name)
-            try:
-                sub = run_download(job_id=f"{job_id}.{i}", url=rel["url"], genre=genre,
-                                   mode="album", destination=destination, reporter=album_reporter,
-                                   audio_format=audio_format, tag_options=tag_options,
-                                   cookies_txt=cookies_txt, on_server=on_server,
-                                   stage_dir=work_base, deliver=False, album_name=album_name,
-                                   fetch_lyrics=fetch_lyrics)
-                delivered_all += sub.delivered
-                new_count += sub.new_track_count
-            except Exception:  # noqa: BLE001 - one bad release must not abort the whole artist run
-                log.exception("artist release failed: %s", album_name)
-                failed.append(album_name)
+            planned.append((i, rel, album_name))
+
+        delivered_all: list = []
+        new_count = 0
+        failed: list[str] = []
+        done = 0
+        reporter.on_phase("download")
+        reporter.on_album(0, total, "")   # publish the album total before fan-out
+
+        def _stage_release(i: int, rel: dict, album_name: str) -> Result:
+            return run_download(job_id=f"{job_id}.{i}", url=rel["url"], genre=genre,
+                                mode="album", destination=destination, reporter=album_reporter,
+                                audio_format=audio_format, tag_options=tag_options,
+                                cookies_txt=cookies_txt, on_server=on_server,
+                                stage_dir=work_base, deliver=False, album_name=album_name,
+                                fetch_lyrics=fetch_lyrics)
+
+        # Fan out into up to `album_concurrency` parallel album downloads; results are aggregated
+        # here in the calling thread (as_completed yields in this thread), so no locking is needed.
+        workers = max(1, min(album_concurrency, total))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_stage_release, i, rel, name): name
+                       for (i, rel, name) in planned}
+            for fut in as_completed(futures):
+                album_name = futures[fut]
+                done += 1
+                try:
+                    sub = fut.result()
+                    delivered_all += sub.delivered
+                    new_count += sub.new_track_count
+                except Exception:  # noqa: BLE001 - one bad release must not abort the whole run
+                    log.exception("artist release failed: %s", album_name)
+                    failed.append(album_name)
+                reporter.on_album(done, total, album_name)
 
         # A failed release may have left incomplete-download artifacts behind (the shared
         # work dir is not cleaned per-release); never ship those partials.

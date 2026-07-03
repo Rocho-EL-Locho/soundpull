@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     max_playlist_items: int = 100
     # Cap on the number of releases pulled for an artist download (issue #32). 0 = unlimited.
     max_artist_items: int = 0
+    # Albums downloaded in parallel within one artist run (issue #32). Clamped to 1–4.
+    max_artist_album_concurrency: int = 3
 
     # Playlist interval-sync (issue #21). `sync_enabled` is the master switch for the
     # background scheduler; `sync_tick_seconds` is how often it checks for due

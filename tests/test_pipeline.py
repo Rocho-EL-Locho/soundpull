@@ -605,7 +605,8 @@ def test_run_artist_download_browser_stages_and_zips_once(monkeypatch, tmp_path)
     assert res.new_track_count == 2 and len(res.delivered) == 2   # A + C; B skipped
     assert res.zip_name == "Artist.zip"
     assert "übersprungen" in res.summary                    # failure surfaced, run continued
-    assert albums == [(1, 3, "A"), (2, 3, "B"), (3, 3, "C")]
+    # album progress: total published up front (0/3), then a monotonic completion count 1..3
+    assert albums == [(0, 3, ""), (1, 3, "A"), (2, 3, "B"), (3, 3, "C")]
     assert zipped["name"] == "Artist"
     assert zipped["src"] == tmp_path / ".work" / "job1" / "Artist"   # single artist level
 
@@ -670,3 +671,49 @@ def test_run_artist_download_raises_when_no_releases(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError):
         run_artist_download(job_id="j3", url="u", genre="Rap",
                             destination=Destination(type="browser"), reporter=Reporter())
+
+
+def test_run_artist_download_stages_albums_in_parallel(monkeypatch, tmp_path):
+    # With album_concurrency > 1 the releases stage concurrently (not strictly one-after-another),
+    # results are still fully aggregated, and album progress counts completions up to N — even
+    # though releases finish out of order.
+    import threading
+    import time
+
+    import app.pipeline as pipeline
+    monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
+    monkeypatch.setattr(pipeline, "enumerate_artist",
+                        lambda url, cookiefile=None, limit=0: ("Artist", [
+                            {"title": "A", "url": "uA"},
+                            {"title": "B", "url": "uB"},
+                            {"title": "C", "url": "uC"}]))
+    lock = threading.Lock()
+    live = {"now": 0, "max": 0}
+
+    def fake_run_download(**kw):
+        with lock:
+            live["now"] += 1
+            live["max"] = max(live["max"], live["now"])
+        time.sleep(0.05)                                   # hold the slot so overlap is observable
+        with lock:
+            live["now"] -= 1
+        d = kw["stage_dir"] / "Artist" / kw["album_name"]
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "t.mp3").write_bytes(b"x")
+        return Result(delivered=[("Artist", kw["album_name"], f"Artist/{kw['album_name']}/t.mp3")],
+                      new_track_count=1)
+
+    monkeypatch.setattr(pipeline, "run_download", fake_run_download)
+    monkeypatch.setattr(pipeline, "_upload_tree", lambda dest, root: None)
+    albums = []
+    reporter = Reporter(on_album=lambda c, t, n: albums.append((c, t, n)))
+
+    res = run_artist_download(job_id="jp", url="u", genre="Rap",
+                              destination=Destination(type="webdav"), reporter=reporter,
+                              album_concurrency=3)
+
+    assert live["max"] >= 2                                # at least two releases downloaded at once
+    assert res.new_track_count == 3 and len(res.delivered) == 3
+    assert albums[0] == (0, 3, "")                         # total published before fan-out
+    assert (albums[-1][0], albums[-1][1]) == (3, 3)        # progress reached all-done
+    assert {n for _, _, n in albums if n} == {"A", "B", "C"}
