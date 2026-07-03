@@ -43,6 +43,19 @@ _NAV_ITEMS = [
     ("nav.settings", "/settings", "settings", "settings"),
 ]
 
+# route path → active-key, for reactive sidebar highlighting under client-side routing.
+_ROUTE_ACTIVE = {route: active_key for _, route, active_key, _ in _NAV_ITEMS}
+
+# Sidebar width (px). An open drawer pushes the page content right by this much; the
+# content wrapper compensates for it so the column stays centred under the header logo.
+_DRAWER_WIDTH = 244
+
+
+def _active_key_for_path(path: str) -> str:
+    """Map a (possibly query/fragment-carrying) URL path to its sidebar active-key."""
+    clean = path.split("?", 1)[0].split("#", 1)[0].rstrip("/") or "/"
+    return _ROUTE_ACTIVE.get(clean, "download")
+
 # External links in the footer. (i18n key or literal, Material icon, url).
 _FOOTER_LINKS = [
     ("footer.github", "code", "https://github.com/Rocho-EL-Locho/soundpull"),
@@ -137,6 +150,27 @@ _HEAD_CSS = """
   }
   .sp-footer-link:hover { background: rgba(255,255,255,0.09); color: #fff; }
 
+  /* Destination selector cards (download page) */
+  .sp-dest-card {
+    display: flex; align-items: center; gap: 14px; flex: 1 1 0; min-width: 0;
+    padding: 15px 18px; border-radius: 14px; cursor: pointer;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.10);
+    transition: background .16s, border-color .16s, box-shadow .16s;
+  }
+  .sp-dest-card:hover {
+    background: rgba(255,255,255,0.06);
+    border-color: rgba(255,255,255,0.20);
+  }
+  .sp-dest-card-active, .sp-dest-card-active:hover {
+    border-color: rgba(124,58,237,0.85);
+    background: linear-gradient(135deg, rgba(124,58,237,0.22), rgba(6,182,212,0.12));
+    box-shadow: 0 0 0 1px rgba(124,58,237,0.45), 0 10px 26px rgba(124,58,237,0.18);
+  }
+  .sp-dest-card .sp-dest-title {
+    font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 15px; color: #fff;
+  }
+
   ::-webkit-scrollbar { width: 10px; height: 10px; }
   ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 8px; }
 </style>
@@ -163,11 +197,12 @@ def _language_selector() -> None:
             .tooltip(t("nav.language"))
 
 
-def _sidebar_item(key: str, target: str, active_key: str, icon: str, active: str) -> None:
+def _sidebar_item(key: str, target: str, active_key: str, icon: str, active: str):
     cls = "sp-nav-item" + (" sp-nav-active" if active_key == active else "")
-    with ui.link(target=target).classes(cls).style("text-decoration:none"):
+    with ui.link(target=target).classes(cls).style("text-decoration:none") as link:
         ui.icon(icon, size="22px")
         ui.label(t(key)).classes("sp-nav-label")
+    return link
 
 
 def _build_header(drawer) -> None:
@@ -215,21 +250,25 @@ def _build_header(drawer) -> None:
 
 
 def _build_sidebar(active: str):
-    """Collapsible left sidebar; returns the drawer element for the header toggle."""
+    """Collapsible left sidebar. Returns ``(drawer, nav_items)`` where ``nav_items`` is a
+    list of ``(link_element, active_key)`` so the shell can re-highlight the active entry
+    on client-side (``ui.sub_pages``) navigation without rebuilding the drawer."""
     sidebar_open = bool(app.storage.user.get("sidebar_open", True))
     drawer = ui.left_drawer(value=sidebar_open, fixed=True, bordered=False, elevated=False) \
-        .classes("sp-drawer").props("width=244").style("padding:0")
+        .classes("sp-drawer").props(f"width={_DRAWER_WIDTH}").style("padding:0")
+    nav_items: list = []
     with drawer:
         with ui.column().classes("w-full").style("height:100%; padding:20px 14px; gap:6px"):
             for key, target, active_key, icon in _NAV_ITEMS:
-                _sidebar_item(key, target, active_key, icon, active)
+                link = _sidebar_item(key, target, active_key, icon, active)
+                nav_items.append((link, active_key))
             with ui.row().style(
                 "margin-top:auto; padding-top:16px; border-top:1px solid rgba(255,255,255,0.08);"
                 "align-items:center; gap:8px; color:rgba(255,255,255,0.35); font-size:12px"
             ):
                 ui.icon("bolt", size="16px")
                 ui.label(f"v{_APP_VERSION} · {t('nav.selfhosted')}")
-    return drawer
+    return drawer, nav_items
 
 
 def _build_footer() -> None:
@@ -266,8 +305,14 @@ def tag_option_switches(values) -> dict:
 
 
 @contextmanager
-def frame(active: str = "download"):
-    """Render the sidebar app shell and yield the page content container."""
+def frame():
+    """Render the persistent sidebar app shell **once** and yield the content container
+    that hosts the client-side ``ui.sub_pages`` router.
+
+    The shell (drawer/header/footer) is built a single time per full page load; page
+    switches only swap the sub-page content, so there is no full reload. The active
+    sidebar entry is re-highlighted reactively via the sub-pages router's path-change
+    callback (see `_active_key_for_path`)."""
     apply_base_style()
     # Hydrate the session language from the user's stored preference once.
     if "lang" not in app.storage.user:
@@ -277,14 +322,38 @@ def frame(active: str = "download"):
     # The shell owns all spacing; drop NiceGUI's default page-content padding/gap.
     context.client.content.classes("!p-0 !gap-0")
 
+    router = context.client.sub_pages_router
+    active = _active_key_for_path(router.current_path)
+
     # Layout elements (header/drawer/footer) must be created as direct children of
     # the page content — auto-placed by NiceGUI into the Quasar layout regardless
     # of creation order. Build the drawer first so the header can toggle it.
-    drawer = _build_sidebar(active)
+    drawer, nav_items = _build_sidebar(active)
     _build_header(drawer)
     _build_footer()
 
-    with ui.element("div").classes("w-full").style("padding:30px 34px 48px"):
+    # Re-highlight the active entry when the client-side route changes (no reload).
+    def _sync_active(path: str) -> None:
+        key = _active_key_for_path(path)
+        for link, active_key in nav_items:
+            (link.classes(add="sp-nav-active") if active_key == key
+             else link.classes(remove="sp-nav-active"))
+    router.on_path_changed(_sync_active)
+
+    # Centre the content under the header logo (the viewport centre). An open left drawer
+    # pushes this container right by its width, while the full-width header keeps the logo
+    # at the viewport centre — so add matching right padding to re-centre the column, and
+    # drop it when the drawer is collapsed. Tracks the drawer's open/close live.
+    content_wrap = ui.element("div").classes("w-full")
+
+    def _center_under_logo(is_open: bool) -> None:
+        right = 34 + (_DRAWER_WIDTH if is_open else 0)
+        content_wrap.style(f"padding:30px {right}px 48px 34px")
+
+    _center_under_logo(bool(drawer.value))
+    drawer.on_value_change(lambda e: _center_under_logo(bool(e.value)))
+
+    with content_wrap:
         with ui.column().classes("w-full items-stretch") \
                 .style("max-width:760px; margin:0 auto; gap:16px") as content:
             yield content
