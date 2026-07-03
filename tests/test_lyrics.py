@@ -66,7 +66,7 @@ def test_404_get_falls_back_to_search(monkeypatch):
     def fake_get(url, **kw):
         if url.endswith("/api/get"):
             return _Resp(404, {"code": 404})
-        return _Resp(200, [{"syncedLyrics": _SYNCED}])
+        return _Resp(200, [{"trackName": "Song", "artistName": "A", "syncedLyrics": _SYNCED}])
 
     monkeypatch.setattr(lyrics.httpx, "get", fake_get)
     assert lyrics.fetch_synced_lyrics("A", "Song", None, 200) == _SYNCED
@@ -77,7 +77,7 @@ def test_no_duration_uses_get_without_duration(monkeypatch):
 
     def fake_get(url, **kw):
         seen.append((url, kw.get("params", {})))
-        return _Resp(200, {"syncedLyrics": _SYNCED})
+        return _Resp(200, {"trackName": "Song", "artistName": "A", "syncedLyrics": _SYNCED})
 
     monkeypatch.setattr(lyrics.httpx, "get", fake_get)
     assert lyrics.fetch_synced_lyrics("A", "Song") == _SYNCED
@@ -90,20 +90,22 @@ def test_no_duration_uses_get_without_duration(monkeypatch):
 
 def test_duration_mismatch_recovers_via_get_without_duration(monkeypatch):
     # The core fix: an exact /api/get with a mismatched duration 404s, but the second
-    # /api/get WITHOUT duration recovers the lyrics — no fall-through to the slow search.
+    # /api/get WITHOUT duration recovers the lyrics (candidate verified within tolerance) —
+    # no fall-through to the slow search.
     seen = []
 
     def fake_get(url, **kw):
         params = kw.get("params", {})
         seen.append((url, "duration" in params))
         if url.endswith("/api/get") and "duration" in params:
-            return _Resp(404, {"code": 404})          # exact match fails (wrong duration)
-        if url.endswith("/api/get"):
-            return _Resp(200, {"syncedLyrics": _SYNCED})  # canonical match succeeds
+            return _Resp(404, {"code": 404})          # exact match fails (duration off >2s)
+        if url.endswith("/api/get"):                  # canonical match, length within ±20s
+            return _Resp(200, {"trackName": "Song", "artistName": "A",
+                               "duration": 210, "syncedLyrics": _SYNCED})
         raise AssertionError("should not reach /api/search")
 
     monkeypatch.setattr(lyrics.httpx, "get", fake_get)
-    assert lyrics.fetch_synced_lyrics("A", "Song", "Album", 999) == _SYNCED
+    assert lyrics.fetch_synced_lyrics("A", "Song", "Album", 200) == _SYNCED
     assert seen == [("https://lrclib.net/api/get", True),
                     ("https://lrclib.net/api/get", False)]
 
@@ -173,6 +175,76 @@ def test_transient_failure_is_not_cached(monkeypatch, failure):
     state["down"] = False
     assert lyrics.fetch_synced_lyrics("A", "Song", "Album", 200) == _SYNCED  # recovered → retried
     assert len(calls) >= 2
+
+
+# --- Query normalisation & candidate matching (accuracy) ----------------------
+
+def test_clean_title_strips_youtube_noise_but_keeps_real_parens():
+    assert lyrics._clean_title("Numb (Official Music Video)") == "Numb"
+    assert lyrics._clean_title("Faint [Official Audio]") == "Faint"
+    assert lyrics._clean_title("Song - Official Video") == "Song"
+    assert lyrics._clean_title("In the End (Remastered 2020)") == "In the End"
+    assert lyrics._clean_title("Everything (I Do)") == "Everything (I Do)"  # real paren kept
+
+
+def test_clean_artist_takes_primary_and_strips_channel_suffixes():
+    assert lyrics._clean_artist("Linkin Park - Topic") == "Linkin Park"
+    assert lyrics._clean_artist("EminemVEVO") == "Eminem"
+    assert lyrics._clean_artist("A / B") == "A"
+
+
+def test_noisy_query_is_cleaned_before_lookup(monkeypatch):
+    seen = {}
+
+    def fake_get(url, **kw):
+        seen["params"] = kw.get("params", {})
+        return _Resp(200, {"trackName": "Numb", "artistName": "Linkin Park",
+                           "duration": 185, "syncedLyrics": _SYNCED})
+
+    monkeypatch.setattr(lyrics.httpx, "get", fake_get)
+    out = lyrics.fetch_synced_lyrics("Linkin Park - Topic", "Numb (Official Music Video)", None, 185)
+    assert out == _SYNCED
+    assert seen["params"]["track_name"] == "Numb"          # title noise stripped
+    assert seen["params"]["artist_name"] == "Linkin Park"  # channel suffix stripped
+
+
+def test_wrong_track_is_rejected_not_attached(monkeypatch):
+    # LRCLIB returns a result for a DIFFERENT song → must be rejected (better no .lrc than
+    # the wrong lyrics). Covers the get-without-duration and search paths.
+    def fake_get(url, **kw):
+        if url.endswith("/api/get") and "duration" in kw.get("params", {}):
+            return _Resp(404, {"code": 404})
+        payload = {"trackName": "Totally Different Song", "artistName": "Someone Else",
+                   "duration": 999, "syncedLyrics": _SYNCED}
+        return _Resp(200, payload if url.endswith("/api/get") else [payload])
+
+    monkeypatch.setattr(lyrics.httpx, "get", fake_get)
+    assert lyrics.fetch_synced_lyrics("Linkin Park", "Numb", None, 185) is None
+
+
+def test_search_picks_best_matching_candidate_not_first(monkeypatch):
+    def fake_get(url, **kw):
+        if url.endswith("/api/get"):
+            return _Resp(404, {"code": 404})
+        return _Resp(200, [
+            {"trackName": "Numb / Encore", "artistName": "Jay-Z", "syncedLyrics": "WRONG"},
+            {"trackName": "Numb", "artistName": "Linkin Park", "syncedLyrics": _SYNCED},
+        ])
+
+    monkeypatch.setattr(lyrics.httpx, "get", fake_get)
+    assert lyrics.fetch_synced_lyrics("Linkin Park", "Numb", None, None) == _SYNCED
+
+
+def test_far_off_duration_candidate_is_rejected(monkeypatch):
+    def fake_get(url, **kw):
+        if url.endswith("/api/get") and "duration" in kw.get("params", {}):
+            return _Resp(404, {"code": 404})
+        cand = {"trackName": "Numb", "artistName": "Linkin Park",
+                "duration": 500, "syncedLyrics": _SYNCED}
+        return _Resp(200, cand if url.endswith("/api/get") else [cand])
+
+    monkeypatch.setattr(lyrics.httpx, "get", fake_get)
+    assert lyrics.fetch_synced_lyrics("Linkin Park", "Numb", None, 185) is None  # 500 vs 185 → reject
 
 
 # --- write_lrc_for round-trip -------------------------------------------------

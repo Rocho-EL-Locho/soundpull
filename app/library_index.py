@@ -217,6 +217,43 @@ def _walk_remote_files(client, path: str, depth: int, max_depth: int,
             yield name
 
 
+def _walk_audio_with_lrc(client, path: str, depth: int, max_depth: int,
+                         errors: list | None = None):
+    """Like `_walk_remote_files`, but yields ``(audio_path, has_lrc)`` per audio file.
+
+    `has_lrc` is whether a sibling ``<stem>.lrc`` already exists — determined from the SAME
+    directory listing, so a backfill can skip already-covered tracks without an extra
+    per-file existence check. Same error/skip/depth semantics as `_walk_remote_files`.
+    """
+    try:
+        entries = client.ls(path or "", detail=True)
+    except Exception as exc:  # noqa: BLE001 - a single unreadable dir must not abort the walk
+        if depth == 0:
+            raise
+        log.warning("backfill: listing %r failed: %s", path, exc)
+        if errors is not None:
+            errors.append((path, str(exc)))
+        return
+    files: set[str] = set()
+    subdirs: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name", "")).rstrip("/")
+        if not name or name == path.rstrip("/"):
+            continue
+        if entry.get("type") == "directory":
+            if depth < max_depth and not _is_skippable_dir(name):
+                subdirs.append(name)
+        else:
+            files.add(name)
+    for name in files:
+        if name.lower().endswith(fix_music_tags._SUPPORTED_EXTS):
+            yield name, (name.rsplit(".", 1)[0] + ".lrc") in files
+    for sub in subdirs:
+        yield from _walk_audio_with_lrc(client, sub, depth + 1, max_depth, errors)
+
+
 def _prune_missing(session: Session, user_id: int, found_paths: set[str]) -> int:
     """Delete index rows whose stored `rel_path` was not seen in a COMPLETE scan (issue #31).
 
@@ -300,3 +337,84 @@ def scan_webdav(user_id: int, max_depth: int = 8) -> tuple[int, int, list]:
         else:
             pruned = _prune_missing(session, user_id, found_paths)
     return added, pruned, errors
+
+
+def backfill_lyrics(user_id: int, progress=None, max_depth: int = 8) -> tuple[int, int, int, list]:
+    """Write a `.lrc` sidecar for every library track that lacks one (LRCGET-style backfill).
+
+    Walks the user's WebDAV target folder (path-based, like `scan_webdav`) and, for each audio
+    file WITHOUT a sibling `.lrc`, fetches synced lyrics from LRCLIB and uploads the sidecar
+    next to the track. Best-effort and WebDAV-only; never touches existing `.lrc` files.
+
+    Returns ``(written, skipped, missing, errors)``:
+      - ``written`` — sidecars newly uploaded
+      - ``skipped`` — tracks that already had a `.lrc`, or whose artist isn't in the path
+        (e.g. a playlist folder) so we can't build a reliable query
+      - ``missing`` — queried but LRCLIB had no lyrics
+      - ``errors``  — ``(path, message)`` for dir-listing / upload failures (non-empty ⇒ the
+        walk was INCOMPLETE)
+    Raises on connection/config errors (unreachable root), like `scan_webdav`.
+    """
+    import io
+    from concurrent.futures import ThreadPoolExecutor
+
+    from app import lyrics
+    from app.db import session_scope
+    from app.models import UserSettings
+    from app.security import decrypt_secret
+    from app.webdav_util import make_client
+
+    with session_scope() as session:
+        us = session.exec(select(UserSettings).where(UserSettings.user_id == user_id)).first()
+        if not us or not us.webdav_url:
+            raise ValueError("Kein WebDAV-Ziel im Profil hinterlegt.")
+        url, username = us.webdav_url, us.webdav_username
+        password = decrypt_secret(us.webdav_password_enc) if us.webdav_password_enc else None
+        base = (us.webdav_folder or "").strip("/")
+
+    client = make_client(url, username, password)
+    prefix = f"{base}/" if base else ""
+    errors: list = []
+
+    # 1) Enumerate audio files still missing a sidecar (one listing per dir; `.lrc` inline).
+    targets: list[tuple[str, str, str]] = []   # (audio_path, artist, title)
+    skipped = 0
+    for full, has_lrc in _walk_audio_with_lrc(client, base, 0, max_depth, errors):
+        if has_lrc:
+            skipped += 1
+            continue
+        rel = full[len(prefix):] if prefix and full.startswith(prefix) else full
+        parts = [p for p in rel.split("/") if p]
+        artist, title = _artist_title_from_path(parts)
+        if artist and title:
+            targets.append((full, artist, title))
+        else:
+            skipped += 1   # no path-derived artist (e.g. a playlist folder) → can't query
+
+    total = len(targets)
+    if progress:
+        progress(0, total)
+
+    # 2) Fetch + upload concurrently (bounded — LRCLIB is slow; don't stampede it).
+    def handle(item: tuple[str, str, str]) -> str:
+        audio_path, artist, title = item
+        text = lyrics.fetch_synced_lyrics(artist, title)
+        if not text:
+            return "missing"
+        lrc_path = audio_path.rsplit(".", 1)[0] + ".lrc"
+        try:
+            client.upload_fileobj(io.BytesIO(text.encode("utf-8")), lrc_path, overwrite=True)
+            return "written"
+        except Exception as exc:  # noqa: BLE001 - one bad upload must not abort the backfill
+            errors.append((lrc_path, str(exc)))
+            return "error"
+
+    written = missing = done = 0
+    with ThreadPoolExecutor(max_workers=lyrics._MAX_WORKERS) as pool:
+        for result in pool.map(handle, targets):
+            written += result == "written"
+            missing += result == "missing"
+            done += 1
+            if progress:
+                progress(done, total)
+    return written, skipped, missing, errors
