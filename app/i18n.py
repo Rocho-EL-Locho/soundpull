@@ -42,7 +42,11 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "common.artist": "Künstler",
         "genre.none": "Kein Genre",
         "dest.browser": "Im Browser (ZIP)",
+        "dest.browser_title": "Browser-ZIP",
+        "dest.browser_sub": "Direkt herunterladen",
         "dest.webdav": "WebDAV",
+        "dest.webdav_sub": "Auf deinen Server",
+        "dest.webdav_sub_unconfigured": "Erst in Einstellungen einrichten",
         "dest.webdav_unconfigured": "WebDAV (nicht konfiguriert)",
         # audio quality/format select labels (keys = app.pipeline.AUDIO_FORMATS)
         "audio.mp3_320": "MP3 320 kbps · max. Kompatibilität (Standard)",
@@ -70,7 +74,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "phase.error": "Fehler",
         # download page
         "index.heading_new": "Neuer Download",
-        "index.url_label": "YouTube Music URL",
+        "index.subtitle": "Füge einen YouTube-Music-Link ein und lade ihn getaggt herunter.",
+        "index.url_label": "YouTube-Music-Link",
         "index.genre_label": "Genre",
         "index.mode_label": "Modus",
         "index.audio_label": "Qualität / Format",
@@ -241,7 +246,11 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "common.artist": "Artist",
         "genre.none": "No genre",
         "dest.browser": "In browser (ZIP)",
+        "dest.browser_title": "Browser ZIP",
+        "dest.browser_sub": "Download directly",
         "dest.webdav": "WebDAV",
+        "dest.webdav_sub": "To your server",
+        "dest.webdav_sub_unconfigured": "Set up in Settings first",
         "dest.webdav_unconfigured": "WebDAV (not configured)",
         # audio quality/format select labels (keys = app.pipeline.AUDIO_FORMATS)
         "audio.mp3_320": "MP3 320 kbps · max. compatibility (default)",
@@ -269,7 +278,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "phase.error": "Error",
         # download page
         "index.heading_new": "New download",
-        "index.url_label": "YouTube Music URL",
+        "index.subtitle": "Paste a YouTube Music link and download it fully tagged.",
+        "index.url_label": "YouTube Music link",
         "index.genre_label": "Genre",
         "index.mode_label": "Mode",
         "index.audio_label": "Quality / format",

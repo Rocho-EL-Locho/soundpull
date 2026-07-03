@@ -12,13 +12,12 @@ from app.db import init_db
 from app.pipeline import purge_work_root
 from app.scheduler import start_scheduler, stop_scheduler
 
-# Import page modules so their @ui.page routes are registered.
-from app.pages import (  # noqa: F401,E402
-    history,
-    index,
-    settings as settings_page,
-    subscriptions,
-)
+# Page content builders, mounted client-side by the app-shell sub_pages router.
+from app.pages.history import history_content  # noqa: E402
+from app.pages.index import index_content  # noqa: E402
+from app.pages.settings import settings_content  # noqa: E402
+from app.pages.subscriptions import subscriptions_content  # noqa: E402
+from app.theme import frame  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("main")
@@ -60,6 +59,27 @@ auth.init_auth()
 @app.get("/healthz")
 def healthz() -> dict:
     return {"status": "ok"}
+
+
+# One app-shell page, mounted on every nav route. It renders the persistent sidebar shell
+# once and hosts a client-side ``ui.sub_pages`` router, so switching pages swaps only the
+# content area — no full reload. Deep-linking works because each path is a real registered
+# route that renders the same shell; the router then shows the matching sub-page.
+_SUB_PAGES = {
+    "/": index_content,
+    "/history": history_content,
+    "/subscriptions": subscriptions_content,
+    "/settings": settings_content,
+}
+
+
+@ui.page("/")
+@ui.page("/history")
+@ui.page("/subscriptions")
+@ui.page("/settings")
+def app_shell() -> None:
+    with frame():
+        ui.sub_pages(_SUB_PAGES)
 
 
 # Serve branding assets (logo, banner) for the UI and README.
