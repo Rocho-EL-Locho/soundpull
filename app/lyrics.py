@@ -10,7 +10,9 @@ and the job still succeeds (mirrors the cover fetch in `app/pipeline.py`).
 from __future__ import annotations
 
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from difflib import SequenceMatcher
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable
@@ -27,6 +29,9 @@ _TIMEOUT = 20
 # Bounded concurrency for bulk sidecar writes: enough to parallelise a large discography
 # without stampeding the slow LRCLIB service (which then times out / rate-limits us).
 _MAX_WORKERS = 4
+# A candidate whose length differs from ours by more than this is a different version/track
+# (live/remix/extended) whose synced timestamps wouldn't line up → reject it.
+_DURATION_TOLERANCE = 20
 
 try:  # version is cosmetic — only used to identify ourselves to LRCLIB
     from importlib.metadata import version
@@ -62,6 +67,84 @@ def _pick_lyrics(entry: object) -> str | None:
     return plain or None
 
 
+# --- Query normalisation & candidate matching (issue #43 accuracy) ------------
+# YouTube (Music) titles/artists carry noise LRCLIB doesn't ("(Official Video)",
+# a "- Topic" artist, …). We clean the query so it matches, and we score LRCLIB's
+# candidates against our track so a wrong song's lyrics are never attached.
+
+# Only strip a bracketed group that CONTAINS a noise word, so a real title like
+# "Everything (I Do)" survives.
+_TITLE_NOISE = re.compile(
+    r"""\s*[\(\[][^\)\]]*\b(
+        official|lyrics?|audio|video|visuali[sz]er|remaster(?:ed)?|
+        explicit|clean|hd|hq|4k|8k|mv|m/v|radio\s*edit|sped\s*up|
+        color\s*coded|full\s*album|with\s*lyrics
+    )\b[^\)\]]*[\)\]]""",
+    re.IGNORECASE | re.VERBOSE,
+)
+_TRAILING_NOISE = re.compile(
+    r"\s*[-|]\s*(official\b.*|lyrics?\b.*|audio|video|visuali[sz]er)\s*$", re.IGNORECASE)
+
+
+def _clean_title(title: str) -> str:
+    t = _TITLE_NOISE.sub("", title or "")
+    t = _TRAILING_NOISE.sub("", t)
+    t = re.sub(r"\s{2,}", " ", t).strip(" -–—|")
+    return t or (title or "")
+
+
+def _clean_artist(artist: str) -> str:
+    a = (artist or "").split(" / ")[0]                          # primary artist only
+    a = re.sub(r"\s*-\s*topic\s*$", "", a, flags=re.IGNORECASE)  # YouTube auto channels
+    a = re.sub(r"\s*vevo\s*$", "", a, flags=re.IGNORECASE)
+    return a.strip() or (artist or "")
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+
+def _similar(a: str, b: str) -> float:
+    a, b = _norm(a), _norm(b)
+    return SequenceMatcher(None, a, b).ratio() if a and b else 0.0
+
+
+def _score(cand: object, title: str, artist: str, duration: int | None) -> float:
+    """Confidence (0..1) that `cand` is our track. 0 = reject.
+
+    Both title and artist must be plausibly the same, and a candidate whose length is far
+    off (a different version/track) is rejected outright — better no `.lrc` than the wrong
+    song's lyrics.
+    """
+    if not isinstance(cand, dict):
+        return 0.0
+    ts = _similar(cand.get("trackName", ""), title)
+    ars = _similar(cand.get("artistName", ""), artist)
+    if ts < 0.5 or ars < 0.4:
+        return 0.0
+    cd = cand.get("duration")
+    has_dur = bool(duration and duration > 0 and isinstance(cd, (int, float)) and cd > 0)
+    if has_dur and abs(cd - duration) > _DURATION_TOLERANCE:
+        return 0.0                              # different version/track
+    score = 0.6 * ts + 0.4 * ars
+    if has_dur and abs(cd - duration) <= 2:
+        score = min(1.0, score + 0.1)           # exact duration → small confidence boost
+    return score
+
+
+def _best_match(results: object, title: str, artist: str, duration: int | None) -> dict | None:
+    """The highest-scoring search candidate that carries lyrics, or None if none qualify."""
+    best: dict | None = None
+    best_score = 0.0
+    for cand in results if isinstance(results, list) else []:
+        if not isinstance(cand, dict) or not (cand.get("syncedLyrics") or cand.get("plainLyrics")):
+            continue
+        s = _score(cand, title, artist, duration)
+        if s > best_score:
+            best, best_score = cand, s
+    return best
+
+
 def _get(path: str, params: dict) -> object | None:
     """GET an LRCLIB endpoint.
 
@@ -94,29 +177,28 @@ def _cached_lookup(artist: str, title: str, album: str | None,
     cached. Raises `_TransientLookupError` on a retryable failure, which lru_cache does
     NOT memoize, so the blip can be retried later.
     """
+    ctitle, cartist = _clean_title(title), _clean_artist(artist)
     # 1) Exact version match via /api/get with the duration (LRCLIB matches within ±2s), so
     #    the synced timestamps line up with THIS audio. Album is tolerant; duration is strict.
+    #    A 200 here is a confirmed title+artist+duration match, so trust it directly.
     if duration and duration > 0:
-        params = {"artist_name": artist, "track_name": title, "duration": duration}
+        params = {"artist_name": cartist, "track_name": ctitle, "duration": duration}
         if album:
             params["album_name"] = album
         text = _pick_lyrics(_get("/api/get", params))
         if text:
             return text
         # A duration mismatch (>2s — very common, YT masters differ) 404s here; don't give up.
-    # 2) Canonical match via /api/get WITHOUT the duration — returns LRCLIB's best match by
-    #    artist+title. This catches the common duration-mismatch case with one fast, precise
-    #    call instead of falling straight through to the much slower/looser fuzzy search.
-    text = _pick_lyrics(_get("/api/get", {"artist_name": artist, "track_name": title}))
-    if text:
-        return text
-    # 3) Last resort: fuzzy search, take the first result that carries lyrics.
-    results = _get("/api/search", {"track_name": title, "artist_name": artist})
-    for entry in results if isinstance(results, list) else []:
-        text = _pick_lyrics(entry)
+    # 2) Canonical match via /api/get WITHOUT the duration — fast, but VERIFY the returned
+    #    best-match really is our track (title/artist/duration score) before trusting it.
+    cand = _get("/api/get", {"artist_name": cartist, "track_name": ctitle})
+    if _score(cand, ctitle, cartist, duration) > 0:
+        text = _pick_lyrics(cand)
         if text:
             return text
-    return None  # definitive miss — safe to cache
+    # 3) Fuzzy search: score every candidate and take the best that clears the bar (or None).
+    results = _get("/api/search", {"track_name": ctitle, "artist_name": cartist})
+    return _pick_lyrics(_best_match(results, ctitle, cartist, duration))
 
 
 def fetch_synced_lyrics(artist: str, title: str, album: str | None = None,
