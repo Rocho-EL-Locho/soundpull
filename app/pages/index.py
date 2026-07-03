@@ -165,6 +165,7 @@ def index_content(url: str = "") -> None:
                 (card.classes(add="sp-dest-card-active") if v == value
                  else card.classes(remove="sp-dest-card-active"))
             dedup_row.set_visibility(value == "webdav")
+            _sync_dedup_for_mode()
 
         def _dest_card(value: str, icon: str, title: str, sub: str) -> None:
             card = ui.element("div").classes("sp-dest-card") \
@@ -188,7 +189,17 @@ def index_content(url: str = "") -> None:
             dedup_sw = ui.switch(t("index.dedup_label"), value=d_dedup) \
                 .props("dense color=primary").classes("text-sm")
 
-        _select_dest(d_dest)  # sets initial card highlight + dedup visibility
+        def _sync_dedup_for_mode() -> None:
+            # Artist runs always auto-dedup on WebDAV → lock the toggle on so the UI doesn't
+            # imply you can turn skipping off for a whole-discography re-download.
+            if mode_tgl.value == "artist" and dest_state["value"] == "webdav":
+                dedup_sw.set_value(True)
+                dedup_sw.disable()
+            else:
+                dedup_sw.enable()
+
+        mode_tgl.on_value_change(lambda: _sync_dedup_for_mode())
+        _select_dest(d_dest)  # sets initial card highlight + dedup visibility + toggle lock
 
         with ui.expansion(t("meta.heading"), icon="tune").classes("w-full glass rounded-lg") \
                 .props("dense"):

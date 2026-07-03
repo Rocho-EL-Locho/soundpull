@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import zipfile
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -130,6 +131,11 @@ _SINGLE_FLAGS = [
 #                for a ~160 kbps source.
 # Deliberately omitted: mp3_256 (redundant between 320/192) and mp3_128 (below
 # the source bitrate → audibly worse for little gain — "original" covers small).
+# Fallback artist name when `enumerate_artist` can't resolve one from the channel.
+# Kept as a named sentinel so callers can tell "unknown" apart from a real name (issue #56:
+# the compilation filter must NOT run against an unresolved name — it would drop everything).
+_UNKNOWN_ARTIST = "Artist"
+
 DEFAULT_AUDIO_FORMAT = "mp3_320"
 AUDIO_FORMATS: dict[str, tuple[str | None, str | None]] = {
     "mp3_320": ("mp3", "320K"),
@@ -425,7 +431,7 @@ def enumerate_artist(url: str, cookiefile: str | None = None,
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(releases_url, download=False) or {}
     artist = (info.get("channel") or info.get("uploader")
-              or (info.get("title") or "").removesuffix(" - Releases") or "Artist")
+              or (info.get("title") or "").removesuffix(" - Releases") or _UNKNOWN_ARTIST)
     releases: list[dict] = []
     for entry in (info.get("entries") or []):
         if entry and entry.get("url"):
@@ -635,19 +641,71 @@ def _build_playlist_manifest(existing: list[dict] | None, new_entries: list[dict
     return _merge_manifest(existing, combined) if is_sync else combined
 
 
-def _make_match_filter(on_server: Callable[[str, str], bool],
-                       on_skip: Callable[[int | None, str, str], None] | None = None):
-    """yt-dlp match_filter: reject a track already on the server (issue #21/#31).
+def _artist_credit_text(info_dict: dict) -> str:
+    """Lower-cased blob of a track's real *credit* tags (issue #56).
+
+    Uses ONLY the tag fields that name a performer — `artists`/`artist`/`creators`/`creator`/
+    `album_artist`. Deliberately EXCLUDES:
+    - `title`/`track`/`album` — a label upload whose *title* merely mentions the artist
+      ("<Artist> - <Song> - <Label>") must NOT count as crediting them; and
+    - `channel`/`uploader` — the *upload source*, not a credit. YouTube Music surfaces old,
+      broken self-uploads on the artist's OWN channel (channel="BCee") whose actual metadata is
+      empty (`artist=None`, performer only in the free-text title); those defeat dedup and land
+      mis-tagged exactly like a foreign label upload, so the crediting channel must not save them.
+
+    A cleanly-tagged own release always carries a real `artist`/`artists` tag, so this blob is
+    populated for the tracks we want and empty for the broken ones we don't.
+    """
+    parts: list[str] = []
+    for key in ("artists", "creators"):
+        val = info_dict.get(key)
+        if isinstance(val, list):
+            parts += [str(x) for x in val if x]
+    for key in ("artist", "creator", "album_artist"):
+        val = info_dict.get(key)
+        if val:
+            parts.append(str(val))
+    return re.sub(r"\s+", " ", " , ".join(parts)).casefold()
+
+
+def _credits_artist(info_dict: dict, artist: str) -> bool:
+    """True if `artist` is a credited performer of the track (issue #56).
+
+    Word-boundary match against `_artist_credit_text`, so "BCee" matches "BCee, Charlotte
+    Haining" but NOT "Spearhead Records" (label-as-artist) and NOT a longer word that merely
+    contains it. A track with NO real credit tag (`artist=None` etc. — the broken video-name
+    uploads the `/releases` tab mixes in) yields an empty blob and is therefore NOT credited →
+    skipped. A blank target never filters (returns True) so a run with no known artist is a no-op.
+    """
+    target = re.sub(r"\s+", " ", (artist or "").strip()).casefold()
+    if not target:
+        return True
+    return re.search(rf"(?<!\w){re.escape(target)}(?!\w)", _artist_credit_text(info_dict)) is not None
+
+
+def _make_match_filter(on_server: Callable[[str, str], bool] | None = None,
+                       on_skip: Callable[[int | None, str, str], None] | None = None,
+                       own_artist: str | None = None):
+    """yt-dlp match_filter: skip tracks we don't want to download (issue #21/#31/#56).
 
     yt-dlp extracts each entry's full metadata (artist/track) BEFORE downloading the
     media, then calls this; returning a string skips the entry. `incomplete` is True
     during playlist enumeration when tags aren't final — we defer (return None) so the
     real check runs on the complete info_dict.
 
-    `on_skip(playlist_index, artist, title)` (issue #31) is invoked once, on the
-    effective (non-incomplete) call, for every track we skip — so the pipeline can
-    reference the already-present copy in a playlist's .m3u8. yt-dlp has merged a stable
-    1-based `playlist_index` into the info_dict by this point, even for skipped entries.
+    Two independent skip reasons compose:
+
+    - `own_artist` (issue #56, artist mode): reject a track whose credited artist does not
+      include this name. A YouTube-Music artist's `/releases` tab mixes in compilations and
+      third-party "appears-on" / label uploads whose artist tag is the LABEL (or is absent —
+      the performer lives only in the video title). Those can never dedup against a cleanly
+      tagged library and would land as mis-tagged duplicates, so a track that isn't credited
+      to the artist we're downloading is dropped up front (checked before `on_server`).
+    - `on_server` (issue #21/#31): reject a track already in the user's library. `on_skip`
+      (issue #31) is then invoked once, on the effective (non-incomplete) call, for every
+      such skip — so the pipeline can reference the already-present copy in a playlist's
+      .m3u8. yt-dlp has merged a stable 1-based `playlist_index` into the info_dict by this
+      point, even for skipped entries.
     """
     def _filter(info_dict: dict, incomplete: bool = False) -> str | None:
         if incomplete or info_dict.get("_type") in ("playlist", "multi_video"):
@@ -656,7 +714,9 @@ def _make_match_filter(on_server: Callable[[str, str], bool],
         artists = info_dict.get("artists")
         first = artists[0] if isinstance(artists, list) and artists else ""
         artist = info_dict.get("artist") or first or info_dict.get("uploader") or ""
-        if title and on_server(artist, title):
+        if own_artist and not _credits_artist(info_dict, own_artist):
+            return f"nicht vom Künstler {own_artist}: {artist or '?'} - {title}".strip()
+        if on_server is not None and title and on_server(artist, title):
             if on_skip is not None:
                 on_skip(info_dict.get("playlist_index"), artist, title)
             return f"schon auf dem Server: {artist} - {title}".strip()
@@ -714,6 +774,7 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
                  existing_tracks: list[dict] | None = None,
                  stage_dir: Path | None = None, deliver: bool = True,
                  album_name: str | None = None,
+                 own_artist: str | None = None,
                  fetch_lyrics: bool = False) -> Result:
     """Execute one download end-to-end and return a Result.
 
@@ -753,6 +814,13 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
     tree is left in place and the delivery step (ZIP / WebDAV upload) is skipped; the returned
     Result carries `delivered` so the caller can deliver the combined tree once. The download +
     tag steps in between are unchanged, so metadata parity is unaffected.
+
+    `own_artist` (artist mode, issue #56) installs a match_filter that skips any track NOT
+    credited to this artist — YouTube Music's `/releases` tab mixes an artist's own albums with
+    third-party compilation / label uploads whose artist tag is the label (or absent), which
+    would otherwise never dedup and land as mis-tagged duplicates. Only the artist orchestrator
+    passes it (album/single/playlist name their source directly); like dedup it is parity-safe —
+    it only selects WHICH entries download, never how they're tagged.
 
     `album_name` (album mode, issue #32) forces the album folder + tag to a known release title
     instead of trusting each track's `%(album)s`. The artist orchestrator passes the release
@@ -849,9 +917,10 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
         # Dedup: skip tracks already on the server, capturing each skip so a playlist can
         # reference the existing copy afterwards (issue #21/#31).
         skipped: list[tuple[int | None, str, str]] = []  # (playlist_index, artist, title)
-        if on_server is not None:
+        if on_server is not None or own_artist:
             opts["match_filter"] = _make_match_filter(
-                on_server, on_skip=lambda idx, a, t: skipped.append((idx, a, t)))
+                on_server, on_skip=lambda idx, a, t: skipped.append((idx, a, t)),
+                own_artist=own_artist)
 
         finished_dirs: Counter[str] = Counter()
 
@@ -891,9 +960,10 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
                                     "title": title, "artist": artist, "dur": -1})
 
         if not finished_dirs:
-            if not dedup:
+            if not dedup and not own_artist:
                 raise RuntimeError("Download lieferte keine Dateien (siehe Logs).")
-            # Dedup active and nothing NEW downloaded — a normal outcome (issue #21/#31).
+            # Dedup active (issue #21/#31) or a whole release filtered out as compilations /
+            # label uploads (issue #56) — nothing NEW downloaded is a normal outcome.
             if is_playlist:
                 manifest = _build_playlist_manifest(existing_tracks, [], ref_entries, is_sync)
                 if ref_entries:
@@ -1030,6 +1100,7 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
                         cookies_txt: str | None = None,
                         on_server: Callable[[str, str], bool] | None = None,
                         max_items: int = 0,
+                        album_concurrency: int = 1,
                         fetch_lyrics: bool = False) -> Result:
     """Download an artist's whole discography (issue #32).
 
@@ -1039,7 +1110,15 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
     tree ONCE: a WebDAV upload mirrors `<Artist>/<Album>/…` into the library; a browser run ZIPs
     it under the artist name. `on_server` (dedup, issue #31) is passed through to every release so
     a re-run skips already-present tracks; `max_items` caps the number of releases (0 = unlimited).
-    One failing release is logged and skipped — it does not abort the whole run.
+    `album_concurrency` (>=2) downloads that many releases in parallel — each release is an
+    independent yt-dlp run into its own `Artist/<album>/` folder, so parity is unaffected; results
+    are aggregated in the calling thread. One failing release is logged and skipped — it does not
+    abort the whole run.
+
+    Every release is downloaded with `own_artist=<artist>` (issue #56), so tracks not credited to
+    the artist — the compilation / "appears-on" / label uploads the `/releases` tab mixes in, whose
+    broken metadata (label-as-artist) both defeats dedup and pollutes the library — are skipped up
+    front. A release that is entirely such uploads simply contributes nothing (not an error).
     """
     work_base = _WORK_ROOT / job_id
     cookie_path = _write_cookie_file(job_id, cookies_txt)
@@ -1052,37 +1131,71 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
             raise RuntimeError("Keine Releases gefunden — ist das eine YouTube-Music-Künstlerseite?")
         reporter.on_meta(artist, "")
 
+        # Skip third-party compilation / "appears-on" / label uploads (issue #56): the
+        # `/releases` tab mixes them in with the artist's OWN albums, but their artist tag is
+        # the label (or absent — the performer only in the video title), so they never dedup
+        # and would pollute the library with mis-tagged duplicates. Filter per-track by
+        # crediting, always on for an artist run — but only with a CONFIDENT name (an
+        # unresolved `_UNKNOWN_ARTIST` would drop everything). A "- Topic" channel suffix is
+        # stripped so the match targets the bare performer name.
+        own_artist = artist.removesuffix(" - Topic").strip() if artist else ""
+        own_artist = own_artist if own_artist and own_artist != _UNKNOWN_ARTIST else None
+
         # Per-release reporter: forward track/meta to the outer reporter, but swallow phase
-        # changes — the orchestrator owns the macro phase (so sub-albums don't flip it).
+        # changes — the orchestrator owns the macro phase (so sub-albums don't flip it). With a
+        # concurrent album pool the shared within-album track bar would flicker between releases,
+        # so forward per-track progress only when albums run one at a time.
+        forward_tracks = album_concurrency <= 1
         album_reporter = Reporter(on_phase=lambda phase: None,
-                                  on_meta=reporter.on_meta, on_track=reporter.on_track)
+                                  on_meta=reporter.on_meta,
+                                  on_track=reporter.on_track if forward_tracks
+                                  else (lambda cur, tot: None))
 
         total = len(releases)
-        delivered_all: list = []
-        new_count = 0
-        failed: list[str] = []
+        # Disambiguate release titles up front, single-threaded, so folder naming is deterministic
+        # and independent of completion order: two releases can share a title (a reissue, a
+        # re-released single) and would otherwise stage into the SAME `Artist/<title>/` folder,
+        # clobbering each other's cover / re-tagging each other's tracks.
         used_titles: dict[str, int] = {}
-        reporter.on_phase("download")
+        planned: list[tuple[int, dict, str]] = []
         for i, rel in enumerate(releases, 1):
-            # Two releases can share a title (a reissue, a re-released single). They would
-            # otherwise stage into the SAME `Artist/<title>/` folder and clobber each other's
-            # cover / re-tag each other's tracks — so disambiguate the album name per run.
             base = rel["title"]
             used_titles[base] = used_titles.get(base, 0) + 1
             album_name = base if used_titles[base] == 1 else f"{base} ({used_titles[base]})"
-            reporter.on_album(i, total, album_name)
-            try:
-                sub = run_download(job_id=f"{job_id}.{i}", url=rel["url"], genre=genre,
-                                   mode="album", destination=destination, reporter=album_reporter,
-                                   audio_format=audio_format, tag_options=tag_options,
-                                   cookies_txt=cookies_txt, on_server=on_server,
-                                   stage_dir=work_base, deliver=False, album_name=album_name,
-                                   fetch_lyrics=fetch_lyrics)
-                delivered_all += sub.delivered
-                new_count += sub.new_track_count
-            except Exception:  # noqa: BLE001 - one bad release must not abort the whole artist run
-                log.exception("artist release failed: %s", album_name)
-                failed.append(album_name)
+            planned.append((i, rel, album_name))
+
+        delivered_all: list = []
+        new_count = 0
+        failed: list[str] = []
+        done = 0
+        reporter.on_phase("download")
+        reporter.on_album(0, total, "")   # publish the album total before fan-out
+
+        def _stage_release(i: int, rel: dict, album_name: str) -> Result:
+            return run_download(job_id=f"{job_id}.{i}", url=rel["url"], genre=genre,
+                                mode="album", destination=destination, reporter=album_reporter,
+                                audio_format=audio_format, tag_options=tag_options,
+                                cookies_txt=cookies_txt, on_server=on_server,
+                                stage_dir=work_base, deliver=False, album_name=album_name,
+                                own_artist=own_artist, fetch_lyrics=fetch_lyrics)
+
+        # Fan out into up to `album_concurrency` parallel album downloads; results are aggregated
+        # here in the calling thread (as_completed yields in this thread), so no locking is needed.
+        workers = max(1, min(album_concurrency, total))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_stage_release, i, rel, name): name
+                       for (i, rel, name) in planned}
+            for fut in as_completed(futures):
+                album_name = futures[fut]
+                done += 1
+                try:
+                    sub = fut.result()
+                    delivered_all += sub.delivered
+                    new_count += sub.new_track_count
+                except Exception:  # noqa: BLE001 - one bad release must not abort the whole run
+                    log.exception("artist release failed: %s", album_name)
+                    failed.append(album_name)
+                reporter.on_album(done, total, album_name)
 
         # A failed release may have left incomplete-download artifacts behind (the shared
         # work dir is not cleaned per-release); never ship those partials.

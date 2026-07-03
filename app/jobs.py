@@ -168,9 +168,15 @@ def _make_artist_reporter(job_id: str, js: JobState) -> Reporter:
     base = _make_reporter(job_id, js)
 
     def on_album(current: int, total: int, name: str) -> None:
+        # `name` is "" only for the initial total-publish before fan-out; don't blank the album
+        # label (or hit the DB) for it. With a concurrent album pool `current` is a completion
+        # count, so the bar stays monotonic even though releases finish out of order.
         with _lock:
-            js.current_album, js.total_albums, js.album = current, total, name
-        _persist(job_id, album=name)
+            js.current_album, js.total_albums = current, total
+            if name:
+                js.album = name
+        if name:
+            _persist(job_id, album=name)
 
     return Reporter(on_phase=base.on_phase, on_meta=base.on_meta,
                     on_track=base.on_track, on_album=on_album)
@@ -178,25 +184,30 @@ def _make_artist_reporter(job_id: str, js: JobState) -> Reporter:
 
 def _run_artist(job_id: str, url: str, genre: str, destination: Destination,
                 audio_format: str, tag_options: TagOptions, cookies_txt: str | None,
-                dedup: bool = False, fetch_lyrics: bool = False) -> None:
+                fetch_lyrics: bool = False) -> None:
     js = _registry[job_id]
     reporter = _make_artist_reporter(job_id, js)
 
     try:
-        # Dedup (issue #31): skip tracks already in the user's library so an artist re-run is
-        # cheap. WebDAV-only — a browser ZIP has no library to dedup against. `existing_ref` is
+        # Artist runs ALWAYS reconcile against the server on WebDAV (auto-dedup, issue #31): a
+        # re-download of a big discography then only pulls tracks not already in the library,
+        # instead of re-processing all N releases. No per-download toggle — a browser ZIP still
+        # has no library to dedup against, so it stays a plain full download. `existing_ref` is
         # playlist-only (m3u cross-refs), so it is unused here (albums write no m3u).
         on_server = None
-        if dedup and destination.type == "webdav":
+        if destination.type == "webdav":
             with session_scope() as session:
                 paths = library_index.load_index_paths(session, js.user_id)
             on_server = lambda a, t: library_index.track_key(t, a) in paths  # noqa: E731
 
+        # Cap the parallel album pool to a sane 1–4 regardless of how the env var is set.
+        album_concurrency = max(1, min(4, settings.max_artist_album_concurrency))
         result = run_artist_download(job_id=job_id, url=url, genre=genre,
                                      destination=destination, reporter=reporter,
                                      audio_format=audio_format, tag_options=tag_options,
                                      cookies_txt=cookies_txt, on_server=on_server,
                                      max_items=settings.max_artist_items,
+                                     album_concurrency=album_concurrency,
                                      fetch_lyrics=fetch_lyrics)
         indexed = True
         if destination.type == "webdav" and result.delivered:
@@ -310,9 +321,10 @@ def start_job(*, user_id: int, url: str, genre: str, mode: str, destination_type
     with _lock:
         _registry[job_id] = js
     if mode == "artist":
-        # An artist run (issue #32) fans out into N album downloads under one job.
+        # An artist run (issue #32) fans out into N album downloads under one job; it always
+        # auto-dedups on WebDAV, so the per-download `dedup` toggle isn't forwarded.
         _executor.submit(_run_artist, job_id, url, genre, destination, audio_format,
-                         tag_options, cookies_txt, dedup, fetch_lyrics)
+                         tag_options, cookies_txt, fetch_lyrics)
     else:
         _executor.submit(_run, job_id, url, genre, mode, destination, audio_format,
                          tag_options, cookies_txt, dedup, fetch_lyrics)
