@@ -153,6 +153,18 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
                                     "{count} Titel erfasst – veraltete Einträge wurden nicht "
                                     "entfernt. Bitte erneut versuchen.",
         "settings.scan_error": "Einlesen fehlgeschlagen: {error}",
+        # Lyrics-Backfill (issue #43)
+        "settings.lyrics_backfill_desc": "Die gesamte Bibliothek durchgehen und für jeden Titel "
+                                         "ohne Liedtext eine .lrc-Datei von LRCLIB nachladen. "
+                                         "Vorhandene .lrc bleiben unangetastet. Nur bei WebDAV.",
+        "settings.lyrics_backfill_button": "Liedtexte nachladen",
+        "settings.lyrics_backfill_running": "Liedtexte werden nachgeladen …",
+        "settings.lyrics_backfill_done": "{written} Liedtexte geschrieben, {skipped} übersprungen, "
+                                         "{missing} ohne Treffer",
+        "settings.lyrics_backfill_incomplete": "Nachladen unvollständig: {failed} Ordner/Uploads "
+                                               "fehlgeschlagen, {written} Liedtexte geschrieben. "
+                                               "Bitte erneut versuchen.",
+        "settings.lyrics_backfill_error": "Nachladen fehlgeschlagen: {error}",
         # Dedup (issue #31)
         "settings.dedup_label": "Bereits vorhandene Titel überspringen",
         "settings.dedup_desc": "Titel, die schon in deinem Bestand liegen, nicht erneut "
@@ -331,6 +343,17 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
                                     "{count} tracks indexed — stale entries were not pruned. "
                                     "Please try again.",
         "settings.scan_error": "Scan failed: {error}",
+        # Lyrics backfill (issue #43)
+        "settings.lyrics_backfill_desc": "Walk the whole library and fetch a .lrc from LRCLIB "
+                                         "for every track that has no lyrics yet. Existing .lrc "
+                                         "files are left untouched. WebDAV only.",
+        "settings.lyrics_backfill_button": "Backfill lyrics",
+        "settings.lyrics_backfill_running": "Backfilling lyrics …",
+        "settings.lyrics_backfill_done": "Wrote {written} lyrics, skipped {skipped}, "
+                                         "{missing} with no match",
+        "settings.lyrics_backfill_incomplete": "Backfill incomplete: {failed} folder(s)/uploads "
+                                               "failed, wrote {written} lyrics. Please try again.",
+        "settings.lyrics_backfill_error": "Backfill failed: {error}",
         # Dedup (issue #31)
         "settings.dedup_label": "Skip tracks already in my library",
         "settings.dedup_desc": "Don't re-download tracks already in your library. In "

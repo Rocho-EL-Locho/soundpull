@@ -215,6 +215,31 @@ def settings_page() -> None:
             ui.button(t("settings.scan_button"), icon="cloud_sync", on_click=scan_server) \
                 .props("outline").classes("text-white/90 self-start")
 
+            # Lyrics backfill (LRCGET-style, issue #43): walk the library and drop a `.lrc`
+            # next to every track that lacks one. Best-effort, WebDAV-only; runs off-thread.
+            ui.label(t("settings.lyrics_backfill_desc")).classes("text-xs text-white/50 mt-2")
+
+            async def backfill_lyrics_server() -> None:
+                from app import library_index
+
+                ui.notify(t("settings.lyrics_backfill_running"), type="ongoing")
+                try:
+                    written, skipped, missing, errors = await run.io_bound(
+                        library_index.backfill_lyrics, uid)
+                except Exception as exc:  # noqa: BLE001 - surface config/connection errors
+                    ui.notify(t("settings.lyrics_backfill_error", error=exc), type="negative")
+                    return
+                if errors:
+                    ui.notify(t("settings.lyrics_backfill_incomplete", written=written,
+                                failed=len(errors)), type="warning")
+                    return
+                ui.notify(t("settings.lyrics_backfill_done", written=written, skipped=skipped,
+                            missing=missing), type="positive")
+
+            ui.button(t("settings.lyrics_backfill_button"), icon="lyrics",
+                      on_click=backfill_lyrics_server) \
+                .props("outline").classes("text-white/90 self-start")
+
             # Dedup (issue #31): skip already-present tracks; reference them in playlist m3u.
             ui.label(t("settings.dedup_desc")).classes("text-xs text-white/50 mt-2")
             dedup_sw = ui.switch(t("settings.dedup_label"), value=snap["dedup"]) \

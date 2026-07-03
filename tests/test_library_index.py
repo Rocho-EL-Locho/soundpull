@@ -325,3 +325,80 @@ def test_scan_webdav_clean_walk_reports_no_errors(monkeypatch):
     assert errors == []
     with Session(library_index_engine) as s:
         assert ("artist", "song") in library_index.load_index_paths(s, 1)
+
+
+# --- Lyrics backfill (LRCGET-style, issue #43) --------------------------------
+
+def test_walk_audio_with_lrc_flags_existing_sidecars():
+    # Per audio file, report whether a sibling `.lrc` already exists (from the same
+    # listing); non-audio files are ignored and cache dirs are skipped.
+    tree = {
+        "": [{"name": "Artist", "type": "directory"},
+             {"name": "cache", "type": "directory"}],
+        "Artist": [{"name": "Artist/Album", "type": "directory"}],
+        "Artist/Album": [
+            {"name": "Artist/Album/01 - A.mp3", "type": "file"},
+            {"name": "Artist/Album/02 - B.mp3", "type": "file"},
+            {"name": "Artist/Album/02 - B.lrc", "type": "file"},
+            {"name": "Artist/Album/cover.jpg", "type": "file"},
+        ],
+        "cache": [{"name": "cache/x.mp3", "type": "file"}],
+    }
+
+    class Fake:
+        def ls(self, path, detail=True):
+            return tree.get(path, [])
+
+    out = dict(library_index._walk_audio_with_lrc(Fake(), "", 0, 8))
+    assert out == {"Artist/Album/01 - A.mp3": False,   # needs a sidecar
+                   "Artist/Album/02 - B.mp3": True}    # already has one; cover.jpg + cache/ ignored
+
+
+def test_backfill_lyrics_writes_missing_and_skips_existing(monkeypatch):
+    tree = {
+        "": [{"name": "Artist", "type": "directory"}],
+        "Artist": [{"name": "Artist/Album", "type": "directory"}],
+        "Artist/Album": [
+            {"name": "Artist/Album/01 - Have.mp3", "type": "file"},
+            {"name": "Artist/Album/01 - Have.lrc", "type": "file"},   # already covered
+            {"name": "Artist/Album/02 - Get.mp3", "type": "file"},    # LRCLIB has it
+            {"name": "Artist/Album/03 - None.mp3", "type": "file"},   # LRCLIB has nothing
+        ],
+    }
+    uploaded: dict[str, bytes] = {}
+
+    class FakeDav:
+        def ls(self, path, detail=True):
+            return tree.get(path, [])
+
+        def upload_fileobj(self, fileobj, to_path, overwrite=False, **kw):
+            uploaded[to_path] = fileobj.read()
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False},
+                           poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as s:
+        s.add(UserSettings(user_id=1, webdav_url="http://dav.example", webdav_folder=""))
+        s.commit()
+
+    @contextmanager
+    def fake_scope():
+        session = Session(engine)
+        try:
+            yield session
+            session.commit()
+        finally:
+            session.close()
+
+    monkeypatch.setattr("app.db.session_scope", fake_scope)
+    monkeypatch.setattr("app.webdav_util.make_client", lambda *a, **k: FakeDav())
+    monkeypatch.setattr("app.lyrics.fetch_synced_lyrics",
+                        lambda artist, title, album=None, duration=None:
+                        "[00:00.00]la" if title == "Get" else None)
+
+    written, skipped, missing, errors = library_index.backfill_lyrics(1)
+
+    assert (written, skipped, missing) == (1, 1, 1)   # Get written, Have skipped, None missing
+    assert errors == []
+    assert list(uploaded) == ["Artist/Album/02 - Get.lrc"]
+    assert uploaded["Artist/Album/02 - Get.lrc"].decode() == "[00:00.00]la"
