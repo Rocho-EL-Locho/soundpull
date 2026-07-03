@@ -72,16 +72,40 @@ def test_404_get_falls_back_to_search(monkeypatch):
     assert lyrics.fetch_synced_lyrics("A", "Song", None, 200) == _SYNCED
 
 
-def test_no_duration_skips_get_uses_search(monkeypatch):
+def test_no_duration_uses_get_without_duration(monkeypatch):
     seen = []
 
     def fake_get(url, **kw):
-        seen.append(url)
-        return _Resp(200, [{"syncedLyrics": _SYNCED}])
+        seen.append((url, kw.get("params", {})))
+        return _Resp(200, {"syncedLyrics": _SYNCED})
 
     monkeypatch.setattr(lyrics.httpx, "get", fake_get)
     assert lyrics.fetch_synced_lyrics("A", "Song") == _SYNCED
-    assert seen and all(u.endswith("/api/search") for u in seen)  # no /api/get without duration
+    # No duration → the exact-match get is skipped, but the canonical /api/get (no duration)
+    # is tried and already hits, so the slow fuzzy search is never reached.
+    assert len(seen) == 1
+    url, params = seen[0]
+    assert url.endswith("/api/get") and "duration" not in params
+
+
+def test_duration_mismatch_recovers_via_get_without_duration(monkeypatch):
+    # The core fix: an exact /api/get with a mismatched duration 404s, but the second
+    # /api/get WITHOUT duration recovers the lyrics — no fall-through to the slow search.
+    seen = []
+
+    def fake_get(url, **kw):
+        params = kw.get("params", {})
+        seen.append((url, "duration" in params))
+        if url.endswith("/api/get") and "duration" in params:
+            return _Resp(404, {"code": 404})          # exact match fails (wrong duration)
+        if url.endswith("/api/get"):
+            return _Resp(200, {"syncedLyrics": _SYNCED})  # canonical match succeeds
+        raise AssertionError("should not reach /api/search")
+
+    monkeypatch.setattr(lyrics.httpx, "get", fake_get)
+    assert lyrics.fetch_synced_lyrics("A", "Song", "Album", 999) == _SYNCED
+    assert seen == [("https://lrclib.net/api/get", True),
+                    ("https://lrclib.net/api/get", False)]
 
 
 def test_network_error_returns_none(monkeypatch):
@@ -125,7 +149,8 @@ def test_definitive_miss_is_cached(monkeypatch):
     monkeypatch.setattr(lyrics.httpx, "get", fake_get)
     assert lyrics.fetch_synced_lyrics("A", "Song", "Album", 200) is None
     assert lyrics.fetch_synced_lyrics("A", "Song", "Album", 200) is None
-    assert len(calls) == 2  # first call hits get+search; second is fully cached
+    # First lookup: exact get + canonical get + search (all 404); second fully cached.
+    assert len(calls) == 3
 
 
 @pytest.mark.parametrize("failure", ["raise", 429, 503])

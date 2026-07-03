@@ -20,10 +20,13 @@ import httpx
 log = logging.getLogger("lyrics")
 
 _LRCLIB_BASE = "https://lrclib.net"
-_TIMEOUT = 10
-# Bounded concurrency for bulk sidecar writes: fast for a large playlist without
-# hammering the community LRCLIB service into rate-limiting us.
-_MAX_WORKERS = 8
+# LRCLIB is a community service and genuinely slow (single requests take several seconds,
+# worse under concurrency), so give each request generous headroom — a tight timeout was
+# silently dropping most tracks of a large download.
+_TIMEOUT = 20
+# Bounded concurrency for bulk sidecar writes: enough to parallelise a large discography
+# without stampeding the slow LRCLIB service (which then times out / rate-limits us).
+_MAX_WORKERS = 4
 
 try:  # version is cosmetic — only used to identify ourselves to LRCLIB
     from importlib.metadata import version
@@ -91,18 +94,23 @@ def _cached_lookup(artist: str, title: str, album: str | None,
     cached. Raises `_TransientLookupError` on a retryable failure, which lru_cache does
     NOT memoize, so the blip can be retried later.
     """
-    # 1) Exact match via /api/get when we know the duration (LRCLIB matches within ±2s).
+    # 1) Exact version match via /api/get with the duration (LRCLIB matches within ±2s), so
+    #    the synced timestamps line up with THIS audio. Album is tolerant; duration is strict.
     if duration and duration > 0:
         params = {"artist_name": artist, "track_name": title, "duration": duration}
         if album:
             params["album_name"] = album
-        data = _get("/api/get", params)
-        if data is not None:
-            text = _pick_lyrics(data)
-            if text:
-                return text
-        # 404 or a 200 without usable lyrics → fall through to a fuzzy search.
-    # 2) Fallback: fuzzy search, take the first result that carries lyrics.
+        text = _pick_lyrics(_get("/api/get", params))
+        if text:
+            return text
+        # A duration mismatch (>2s — very common, YT masters differ) 404s here; don't give up.
+    # 2) Canonical match via /api/get WITHOUT the duration — returns LRCLIB's best match by
+    #    artist+title. This catches the common duration-mismatch case with one fast, precise
+    #    call instead of falling straight through to the much slower/looser fuzzy search.
+    text = _pick_lyrics(_get("/api/get", {"artist_name": artist, "track_name": title}))
+    if text:
+        return text
+    # 3) Last resort: fuzzy search, take the first result that carries lyrics.
     results = _get("/api/search", {"track_name": title, "artist_name": artist})
     for entry in results if isinstance(results, list) else []:
         text = _pick_lyrics(entry)
