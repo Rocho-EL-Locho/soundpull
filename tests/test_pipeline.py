@@ -630,6 +630,57 @@ def test_enumerate_artist_direct_releases_url_and_limit(monkeypatch):
     assert rec.seen == ["https://www.youtube.com/channel/UCabc/releases"]  # no extra probe
 
 
+def test_run_download_artist_mode_forces_own_artist_over_probed_label(monkeypatch, tmp_path):
+    # issue #56: a release hosted on a label channel probes as artist=<label>. With own_artist
+    # set (artist mode) the known performer wins everywhere — folder, the album_artist tag
+    # (process_directory's primary_artist arg) and the server-index key — so it isn't filed
+    # under the label. A plain download (own_artist=None) keeps the probed artist (parity).
+    from pathlib import Path
+    import app.pipeline as pipeline
+    monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
+    monkeypatch.setattr(pipeline, "_probe_meta",
+                        lambda *a, **k: ("Drum&BassArena", "This Time Next Year"))
+    monkeypatch.setattr(pipeline, "_fetch_cover", lambda *a, **k: None)
+    tagged = {}
+    monkeypatch.setattr(pipeline.fix_music_tags, "process_directory",
+                        lambda d, cover, album, artist, opts: tagged.update(
+                            dir=d, album=album, artist=artist))
+
+    class _FakeYDL:
+        # `_build_ydl_opts` runs parse_options, which calls YoutubeDL.validate_outtmpl — keep
+        # the real staticmethod so opts still build; only the actual download is faked.
+        validate_outtmpl = staticmethod(pipeline.yt_dlp.YoutubeDL.validate_outtmpl)
+
+        def __init__(self, opts): self.opts = opts
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def download(self, urls):
+            outtmpl = self.opts["outtmpl"]
+            tmpl = outtmpl["default"] if isinstance(outtmpl, dict) else outtmpl
+            out_dir = Path(tmpl).parent
+            out_dir.mkdir(parents=True, exist_ok=True)
+            f = out_dir / "track.mp3"
+            f.write_bytes(b"x")
+            for hook in self.opts.get("progress_hooks", []):
+                hook({"status": "finished", "filename": str(f), "info_dict": {}})
+
+    monkeypatch.setattr(pipeline.yt_dlp, "YoutubeDL", _FakeYDL)
+    zipped = {}
+    monkeypatch.setattr(pipeline, "_zip_dir", lambda src, zp, name: zipped.update(name=name))
+
+    res = pipeline.run_download(
+        job_id="ja1", url="uAlbum", genre="DnB", mode="album",
+        destination=Destination(type="browser"), reporter=Reporter(),
+        album_name="This Time Next Year", own_artist="BCee")
+
+    assert tagged["artist"] == "BCee"                             # album_artist forced to performer
+    assert tagged["album"] == "This Time Next Year"
+    assert tagged["dir"].replace("\\", "/").endswith("/BCee/This Time Next Year")
+    assert res.delivered[0][0] == "BCee"                         # server-index key = performer
+    assert res.delivered[0][2].startswith("BCee/This Time Next Year/")
+    assert zipped["name"] == "BCee - This Time Next Year"        # zip root name = performer
+
+
 def test_run_artist_download_browser_stages_and_zips_once(monkeypatch, tmp_path):
     # An artist run stages every release through the album path (deliver=False into ONE
     # shared dir, dedup passed through), tolerates a failed release, reports album i/N,
