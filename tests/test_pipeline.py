@@ -24,6 +24,7 @@ from app.pipeline import (
     _apply_tag_options,
     _build_playlist_manifest,
     _build_ydl_opts,
+    _credits_artist,
     _genre_flags,
     _index_from_name,
     _make_match_filter,
@@ -379,6 +380,74 @@ def test_match_filter_captures_skipped_for_reference():
     assert captured == []                                     # incomplete call never captures
 
 
+def test_credits_artist_distinguishes_own_release_from_label_upload():
+    # issue #56: a track counts as the artist's own only when they're a CREDITED performer,
+    # not when a compilation/label upload merely names them in the video title.
+    own = {"artist": "BCee, Charlotte Haining", "artists": ["BCee", "Charlotte Haining"],
+           "channel": "BCee"}
+    assert _credits_artist(own, "BCee")
+    # label-as-artist (issue's example): artist tag is the label → not credited
+    assert not _credits_artist(
+        {"artist": "Spearhead Records",
+         "title": "BCee & Charlotte Haining - Almost There - Spearhead Records"}, "BCee")
+    # third-party reupload: no artist tag, performer only in the title, channel = label
+    assert not _credits_artist(
+        {"artist": None, "artists": None, "channel": "4U Chill",
+         "title": "BCee Featuring Charlotte Haining - Almost There (HD)"}, "BCee")
+    # broken SELF-upload on the artist's OWN channel: no artist tag, performer only in the
+    # title, channel = the artist → still skipped (channel/uploader are the source, not a credit)
+    assert not _credits_artist(
+        {"artist": None, "artists": None, "channel": "BCee", "uploader": "BCee",
+         "title": "BCee & Lomax - Brazilian Wax - Spearhead Records"}, "BCee")
+    # word-boundary, not substring: "Nas" must not match "Nasty"
+    assert not _credits_artist({"artist": "Nasty"}, "Nas")
+    # multi-word target inside a collab credit still matches
+    assert _credits_artist({"artist": "Sub Focus & Wilkinson"}, "Sub Focus")
+    # a track with NO real credit tag (only a title) is NOT credited → skipped
+    assert not _credits_artist({"title": "mystery"}, "BCee")
+    # a blank target never filters
+    assert _credits_artist({"artist": "Anyone"}, "")
+
+
+def test_match_filter_own_artist_skips_foreign_uploads():
+    # issue #56: own_artist filter rejects tracks not credited to the artist, keeps their
+    # own, defers while incomplete, ignores the playlist envelope, and — unlike a dedup skip —
+    # is NOT captured as a reference (it's dropped, not "already on the server").
+    captured: list = []
+    mf = _make_match_filter(own_artist="BCee",
+                            on_skip=lambda idx, a, t: captured.append((idx, a, t)))
+
+    assert mf({"_type": "video", "artist": "BCee, Logistics", "title": "Northpoint"}) is None
+    assert mf({"_type": "video", "artist": "Spearhead Records",
+               "title": "Almost There - Spearhead Records"}) is not None
+    assert mf({"artist": "Spearhead Records", "title": "x"}, incomplete=True) is None
+    assert mf({"_type": "playlist", "title": "BCee - Releases"}) is None
+    assert captured == []                                   # own_artist drops are never captured
+
+
+def test_match_filter_own_artist_and_dedup_compose():
+    # issue #56 + #31: both filters active. A foreign upload is dropped by own_artist (before
+    # the dedup check, so it's not captured); a track credited to the artist that is already on
+    # the server is skipped by dedup and captured for a possible m3u reference.
+    known = {("bcee", "hurt each other")}
+    captured: list = []
+    mf = _make_match_filter(
+        on_server=lambda a, t: (a.split(",")[0].strip().casefold(), t.casefold()) in known,
+        on_skip=lambda idx, a, t: captured.append((idx, a, t)),
+        own_artist="BCee")
+
+    # foreign label upload → own_artist reject, not a dedup capture
+    assert mf({"_type": "video", "artist": "UKF Drum & Bass",
+               "title": "BCee - Hurt Each Other", "playlist_index": 1}) is not None
+    assert captured == []
+    # credited to BCee AND already on server → dedup skip, captured
+    assert mf({"_type": "video", "artist": "BCee", "title": "Hurt Each Other",
+               "playlist_index": 2}) is not None
+    assert captured == [(2, "BCee", "Hurt Each Other")]
+    # credited to BCee and NOT on server → downloads
+    assert mf({"_type": "video", "artist": "BCee", "title": "Northpoint"}) is None
+
+
 def test_build_playlist_manifest_keeps_fresh_reference():
     # A downloaded track plus a cross-folder reference to a DIFFERENT already-present
     # track → both appear, the reference keeping its relative path (issue #31).
@@ -661,6 +730,43 @@ def test_run_artist_download_disambiguates_duplicate_release_titles(monkeypatch,
                         destination=Destination(type="browser"), reporter=Reporter())
 
     assert seen == ["Live", "Live (2)"]                     # second release disambiguated
+
+
+def test_run_artist_download_passes_own_artist_filter(monkeypatch, tmp_path):
+    # issue #56: an artist run forwards own_artist=<resolved name> to every release so
+    # compilation/label uploads are filtered per-track — but only with a CONFIDENT name; an
+    # unresolved "Artist" fallback (and a "- Topic" suffix) is handled so nothing is over-dropped.
+    import app.pipeline as pipeline
+    monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
+
+    def fake_run_download(**kw):
+        d = kw["stage_dir"] / "X" / kw["album_name"]
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "t.mp3").write_bytes(b"x")
+        return Result(delivered=[], new_track_count=1)
+
+    monkeypatch.setattr(pipeline, "run_download", fake_run_download)
+    monkeypatch.setattr(pipeline, "_zip_dir", lambda src, zp, name: None)
+
+    # A resolved artist (with a "- Topic" channel suffix) → filter on with the bare name.
+    calls = []
+    monkeypatch.setattr(pipeline, "run_download",
+                        lambda **kw: (calls.append(kw), fake_run_download(**kw))[1])
+    monkeypatch.setattr(pipeline, "enumerate_artist",
+                        lambda url, cookiefile=None, limit=0: ("BCee - Topic",
+                                                               [{"title": "A", "url": "uA"}]))
+    run_artist_download(job_id="ja", url="u", genre="Rap",
+                        destination=Destination(type="browser"), reporter=Reporter())
+    assert [c["own_artist"] for c in calls] == ["BCee"]
+
+    # An unresolved fallback name must NOT be used as a filter (would drop everything).
+    calls.clear()
+    monkeypatch.setattr(pipeline, "enumerate_artist",
+                        lambda url, cookiefile=None, limit=0: (pipeline._UNKNOWN_ARTIST,
+                                                               [{"title": "A", "url": "uA"}]))
+    run_artist_download(job_id="jb", url="u", genre="Rap",
+                        destination=Destination(type="browser"), reporter=Reporter())
+    assert [c["own_artist"] for c in calls] == [None]
 
 
 def test_run_artist_download_raises_when_no_releases(monkeypatch, tmp_path):
