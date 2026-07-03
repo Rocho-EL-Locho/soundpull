@@ -28,6 +28,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "nav.settings": "Einstellungen",
         "nav.logout": "Abmelden",
         "nav.language": "Sprache",
+        "nav.menu": "Menü ein-/ausklappen",
+        "nav.selfhosted": "self-hosted",
+        # footer
+        "footer.tagline": "Soundpull · self-hosted · MIT-Lizenz",
+        "footer.github": "GitHub",
+        "footer.issues": "Issues",
+        "footer.license": "Lizenz",
         # shared values
         "common.album": "Album",
         "common.single": "Single",
@@ -220,6 +227,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "nav.settings": "Settings",
         "nav.logout": "Log out",
         "nav.language": "Language",
+        "nav.menu": "Toggle menu",
+        "nav.selfhosted": "self-hosted",
+        # footer
+        "footer.tagline": "Soundpull · self-hosted · MIT license",
+        "footer.github": "GitHub",
+        "footer.issues": "Issues",
+        "footer.license": "License",
         # shared values
         "common.album": "Album",
         "common.single": "Single",
