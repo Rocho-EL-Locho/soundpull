@@ -80,9 +80,20 @@ def is_supported_url(raw: str) -> bool:
     return host in _YOUTUBE_HOSTS or host.endswith(".youtube.com")
 
 
+# Chars a Windows-backed / oCIS (OpenCloud) WebDAV server rejects in a path segment even when
+# percent-encoded — a raw "?" in an album folder made oCIS return 400 and skip the upload
+# (issue #56). Map them to yt-dlp's fullwidth look-alikes (yt-dlp already uses these for the
+# track *filenames*, so our folders and its files match); path separators stay "_" as before so
+# existing folder names are unchanged.
+_SEGMENT_MAP = str.maketrans({
+    "/": "_", "\\": "_", "\x00": "",
+    "?": "？", "*": "＊", ":": "：", '"': "＂", "<": "＜", ">": "＞", "|": "｜",
+})
+
+
 def _safe_segment(name: str) -> str:
-    """Make a metadata string safe as a single path segment (no traversal)."""
-    seg = name.replace("/", "_").replace("\\", "_").replace("\x00", "").strip()
+    """Make a metadata string safe as a single path segment (no traversal, server-safe chars)."""
+    seg = name.translate(_SEGMENT_MAP).strip()
     return "Unbekannt" if seg in ("", ".", "..") else seg
 
 # Verbatim from download_album.sh / download_single.sh.
