@@ -668,6 +668,11 @@ def _artist_credit_text(info_dict: dict) -> str:
     return re.sub(r"\s+", " ", " , ".join(parts)).casefold()
 
 
+def _norm_name(text: str) -> str:
+    """Casefold + collapse whitespace — the shared normal form for artist/title matching."""
+    return re.sub(r"\s+", " ", (text or "").strip()).casefold()
+
+
 def _credits_artist(info_dict: dict, artist: str) -> bool:
     """True if `artist` is a credited performer of the track (issue #56).
 
@@ -677,10 +682,130 @@ def _credits_artist(info_dict: dict, artist: str) -> bool:
     uploads the `/releases` tab mixes in) yields an empty blob and is therefore NOT credited →
     skipped. A blank target never filters (returns True) so a run with no known artist is a no-op.
     """
-    target = re.sub(r"\s+", " ", (artist or "").strip()).casefold()
+    target = _norm_name(artist)
     if not target:
         return True
     return re.search(rf"(?<!\w){re.escape(target)}(?!\w)", _artist_credit_text(info_dict)) is not None
+
+
+# Trailing non-title suffixes a label upload's video name carries (dropped when repairing).
+_VIDEO_NAME_SUFFIX = re.compile(
+    r"\s*[\(\[]\s*(?:official(?:\s+(?:music\s+)?(?:video|audio|visuali[sz]er))?|"
+    r"music\s+video|lyric(?:s)?(?:\s+video)?|visuali[sz]er|audio|hd|hq|4k|"
+    r"free\s+download|out\s+now|premiere)\s*[\)\]]\s*$", re.IGNORECASE)
+
+def _repair_broken_title(raw_title: str, own_artist: str) -> tuple[str, str] | None:
+    """Parse a label-upload video name back into ``(artist, title)`` — issue #56.
+
+    Many artist-mode `/releases` entries are third-party/label uploads tagged with NO artist
+    and the whole video name as the title: ``<Artist> - <Song>[ - <Label>]`` (e.g.
+    ``BCee & Lomax - Brazilian Wax - Spearhead Records``). Rather than drop these (they'd
+    otherwise be filtered as "not credited"), we recover clean tags — but ONLY when the artist
+    prefix (before the first `` - ``) credits the artist we're downloading (`own_artist`) as one
+    of its individual names. That both confirms the track is theirs and anchors the split, so a
+    foreign upload whose name merely CONTAINS the artist (``Wax Tailor - …`` for own_artist
+    "Wax") is left alone — `own_artist` must equal a whole prefix artist, not a substring.
+
+    Returns ``(artist, title)`` — the ``<Artist> - `` prefix and a trailing `` - <Label>``
+    segment removed, plus a trailing video-name suffix like ``(Official Video)``; a ``feat.``
+    clause is LEFT in the title for `fix_music_tags`. Returns None when it doesn't match (a
+    clean ``title="Colours"`` has no `` - ``; a name not crediting own_artist).
+
+    Label stripping: a trailing segment is dropped as the label UNLESS it starts with a bracket
+    (a version like ``(LSB remix)``; labels rarely start with one), which re-attaches to the
+    title — so ``So Right - (LSB remix) - Spearhead Records`` → ``So Right (LSB remix)`` and
+    ``So Right - (LSB remix)`` keeps the remix. Heuristic (a non-bracketed real trailing
+    segment — a co-artist, a subtitle — can be lost), but far better than a raw video name.
+    """
+    if not raw_title or " - " not in raw_title:
+        return None
+    target = _norm_name(own_artist)
+    if not target:
+        return None
+    prefix, _, rest = raw_title.partition(" - ")
+    # Split the prefix into individual credited artists (feat./ft. → separator) and require
+    # own_artist to be EXACTLY one of them — so "Wax" doesn't match the artist "Wax Tailor".
+    prefix_norm = re.sub(r"\b(?:featuring|feat|ft)\b\.?", "&", prefix, flags=re.IGNORECASE)
+    prefix_artists = fix_music_tags.split_artists(prefix_norm)
+    if not any(_norm_name(a) == target for a in prefix_artists):
+        return None
+    segs = [s.strip() for s in rest.split(" - ") if s.strip()]
+    if not segs:
+        return None
+    # Drop a trailing label segment unless it's a bracketed version like "(LSB remix)"; then
+    # rejoin, attaching a bracketed segment with a space so it reads as part of the title.
+    if len(segs) >= 2 and segs[-1][:1] not in "([":
+        segs = segs[:-1]
+    title = segs[0]
+    for seg in segs[1:]:
+        title += (" " if seg[:1] in "([" else " - ") + seg
+    title = _VIDEO_NAME_SUFFIX.sub("", title).strip()
+    if not title:
+        return None
+    artist = " / ".join(prefix_artists) or prefix.strip()
+    return artist, title
+
+
+def _repair_album_titles(album_dir: Path, own_artist: str) -> None:
+    """Rewrite label-upload video-name tags in an artist-mode album folder (issue #56).
+
+    For a staged audio file that is NOT already credited to `own_artist` (a broken label upload)
+    and whose title `_repair_broken_title` can recover, rewrite its title/artist tags and rename
+    the file to the clean title, so `fix_music_tags` then normalises it like any clean track
+    (feat cleanup, forced album_artist) and the delivered/indexed name is clean too. A track
+    already crediting `own_artist` is CLEAN — its tags are authoritative and left untouched (even
+    if its real title happens to look like `<Artist> - … - …`). Every original name is reserved
+    up front so a rename can never overwrite another file. Tag-write and rename are coupled and
+    best-effort: if the tag write fails the file is NOT renamed (name and tags stay consistent —
+    never a clean filename over a still-raw title tag). Runs BEFORE `process_directory`.
+    """
+    from mutagen import File as MutagenFile
+
+    audio = [p for p in sorted(album_dir.iterdir())
+             if p.is_file() and p.suffix.lower() in fix_music_tags._SUPPORTED_EXTS]
+    # Seed with EVERY original name so a rename can never clobber another file (a clean track,
+    # or a broken one not yet processed) — Path.rename overwrites silently on POSIX.
+    taken: set[str] = {p.name.casefold() for p in audio}
+    for path in audio:
+        try:
+            mf = MutagenFile(str(path), easy=True)
+        except Exception:  # noqa: BLE001 - unreadable file: leave it as-is
+            mf = None
+        if mf is None:
+            continue
+        cur_title = (mf.get("title") or [None])[0]
+        cur_artist = (mf.get("artist") or [None])[0]
+        # A track already credited to own_artist is CLEAN — its tags are authoritative, never
+        # rewrite it (even if its real title happens to look like "<Artist> - … - …").
+        if _credits_artist({"artist": cur_artist or ""}, own_artist):
+            continue
+        repaired = _repair_broken_title(cur_title or path.stem, own_artist)
+        if repaired is None:
+            continue
+        new_artist, new_title = repaired
+        try:
+            if mf.tags is None:
+                mf.add_tags()
+            mf["title"] = [new_title]
+            mf["artist"] = [new_artist]
+            mf.save()
+        except Exception:  # noqa: BLE001 - tag write failed → skip rename too, so name and
+            continue        # tags stay consistent (never a clean name over a raw title tag)
+        # Rename to the clean title (collision-safe); the file's own name frees up first.
+        taken.discard(path.name.casefold())
+        base = _safe_segment(new_title) or path.stem
+        candidate = f"{base}{path.suffix}"
+        n = 2
+        while candidate.casefold() in taken:
+            candidate = f"{base} ({n}){path.suffix}"
+            n += 1
+        taken.add(candidate.casefold())
+        if candidate != path.name:
+            try:
+                path.rename(path.with_name(candidate))
+            except Exception:  # noqa: BLE001 - rename best-effort (tags already clean)
+                taken.discard(candidate.casefold())
+                taken.add(path.name.casefold())
 
 
 def _make_match_filter(on_server: Callable[[str, str], bool] | None = None,
@@ -701,6 +826,9 @@ def _make_match_filter(on_server: Callable[[str, str], bool] | None = None,
       the performer lives only in the video title). Those can never dedup against a cleanly
       tagged library and would land as mis-tagged duplicates, so a track that isn't credited
       to the artist we're downloading is dropped up front (checked before `on_server`).
+      Exception: a broken upload whose video NAME still starts with the artist
+      (`_repair_broken_title`) is KEPT — the pipeline repairs its tags after download instead
+      of losing a genuine (if mis-tagged) release track.
     - `on_server` (issue #21/#31): reject a track already in the user's library. `on_skip`
       (issue #31) is then invoked once, on the effective (non-incomplete) call, for every
       such skip — so the pipeline can reference the already-present copy in a playlist's
@@ -714,12 +842,22 @@ def _make_match_filter(on_server: Callable[[str, str], bool] | None = None,
         artists = info_dict.get("artists")
         first = artists[0] if isinstance(artists, list) and artists else ""
         artist = info_dict.get("artist") or first or info_dict.get("uploader") or ""
+        # A broken upload (not credited) is repaired iff its video name still starts with the
+        # artist; if not even repairable, it's foreign → drop. `repaired` stays None for a
+        # credited (clean) track, so its authoritative tags aren't second-guessed here.
+        repaired = None
         if own_artist and not _credits_artist(info_dict, own_artist):
-            return f"nicht vom Künstler {own_artist}: {artist or '?'} - {title}".strip()
-        if on_server is not None and title and on_server(artist, title):
+            repaired = _repair_broken_title(title, own_artist)
+            if repaired is None:
+                return f"nicht vom Künstler {own_artist}: {artist or '?'} - {title}".strip()
+        # Dedup on the key the track will actually be INDEXED under: a repaired upload is filed
+        # under own_artist + its recovered title (so a clean copy already on the server skips,
+        # and the pre/post-download keys agree — issue #56); a normal track uses its raw meta.
+        d_artist, d_title = (own_artist, repaired[1]) if repaired else (artist, title)
+        if on_server is not None and d_title and on_server(d_artist, d_title):
             if on_skip is not None:
-                on_skip(info_dict.get("playlist_index"), artist, title)
-            return f"schon auf dem Server: {artist} - {title}".strip()
+                on_skip(info_dict.get("playlist_index"), d_artist, d_title)
+            return f"schon auf dem Server: {d_artist} - {d_title}".strip()
         return None
     return _filter
 
@@ -1035,6 +1173,11 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
             if not album_dir.is_dir():
                 # Defensive: keeps fix_music_tags' sys.exit path (BaseException) unreachable.
                 raise RuntimeError(f"Album-Verzeichnis fehlt: {album_dir}")
+            # Artist mode (issue #56): recover clean title/artist tags for label-upload video
+            # names ("<Artist> - <Song> - <Label>") BEFORE tagging, so fix_music_tags normalises
+            # them like any clean track instead of them shipping as mis-tagged duplicates.
+            if own_artist:
+                _repair_album_titles(album_dir, own_artist)
             cover_path = (_fetch_cover(url, is_album, album_dir / "cover.jpg", cookiefile=cookiefile)
                           if tag_options.cover else None)
             fix_music_tags.process_directory(

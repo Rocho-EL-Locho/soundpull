@@ -31,6 +31,8 @@ from app.pipeline import (
     _merge_manifest,
     _playlist_folder_name,
     _primary_artist,
+    _repair_album_titles,
+    _repair_broken_title,
     _safe_segment,
     _square_crop_jpeg,
     _write_cookie_file,
@@ -436,9 +438,10 @@ def test_match_filter_own_artist_and_dedup_compose():
         on_skip=lambda idx, a, t: captured.append((idx, a, t)),
         own_artist="BCee")
 
-    # foreign label upload → own_artist reject, not a dedup capture
+    # foreign label upload — not credited AND name doesn't start with the artist → own_artist
+    # reject (before the dedup check, so it's not captured)
     assert mf({"_type": "video", "artist": "UKF Drum & Bass",
-               "title": "BCee - Hurt Each Other", "playlist_index": 1}) is not None
+               "title": "Drum & Bass Arena Mix 2019", "playlist_index": 1}) is not None
     assert captured == []
     # credited to BCee AND already on server → dedup skip, captured
     assert mf({"_type": "video", "artist": "BCee", "title": "Hurt Each Other",
@@ -446,6 +449,143 @@ def test_match_filter_own_artist_and_dedup_compose():
     assert captured == [(2, "BCee", "Hurt Each Other")]
     # credited to BCee and NOT on server → downloads
     assert mf({"_type": "video", "artist": "BCee", "title": "Northpoint"}) is None
+
+
+def test_repair_broken_title_parses_label_uploads():
+    # issue #56: recover (artist, title) from a label-upload video name, anchored on own_artist.
+    R = _repair_broken_title
+    assert R("BCee - Little Bird - Spearhead Records", "BCee") == ("BCee", "Little Bird")
+    assert R("BCee & Lomax - Brazilian Wax - Spearhead Records", "BCee") == (
+        "BCee / Lomax", "Brazilian Wax")
+    # feat in the PREFIX moves into the artist; a trailing " - <label>" is dropped
+    assert R("BCee feat. Shaz Sparks - Looking Glass (Metrik Remix) - Spearhead Records",
+             "BCee") == ("BCee / Shaz Sparks", "Looking Glass (Metrik Remix)")
+    # feat in the TITLE is left for fix_music_tags to normalise
+    assert R("BCee - Surfacing feat. Lucy Kitchen - Spearhead Records", "BCee") == (
+        "BCee", "Surfacing feat. Lucy Kitchen")
+    # a common video-name suffix is stripped
+    assert R("BCee - Come And Join Us (Official Video)", "BCee") == ("BCee", "Come And Join Us")
+    # no label segment → title kept whole (a bracketed feat stays for the tagger)
+    assert R("BCee - Northpoint (ft. Riya)", "BCee") == ("BCee", "Northpoint (ft. Riya)")
+    # version-aware label strip: a " - (remix)" segment is kept and re-attached, not dropped
+    assert R("BCee & Darrison - So Right - (LSB remix) - Spearhead Records", "BCee") == (
+        "BCee / Darrison", "So Right (LSB remix)")
+    assert R("BCee - So Right - (LSB remix)", "BCee") == ("BCee", "So Right (LSB remix)")
+    assert R("Colours", "BCee") is None                       # clean track (no " - ")
+    assert R("Some Other Artist - Song - Label", "BCee") is None   # not ours
+    assert R("BCee - X - Label", "") is None                  # blank artist never repairs
+    # exact-artist anchor: own_artist "Wax" must NOT hijack the foreign artist "Wax Tailor"
+    assert R("Wax Tailor - Que Sera - Label", "Wax") is None
+    # own_artist need not be FIRST in the prefix, but must be a whole credited artist
+    assert R("Lomax & BCee - Brazilian Wax - Spearhead Records", "BCee") == (
+        "Lomax / BCee", "Brazilian Wax")
+    # a label is stripped even when it contains a version keyword ("Dub") …
+    assert R("BCee - Forsaken - Dub Recordings", "BCee") == ("BCee", "Forsaken")
+    # … or a parenthetical (only a segment STARTING with a bracket counts as a version)
+    assert R("BCee - Just One Second - Hospital Records (UK)", "BCee") == (
+        "BCee", "Just One Second")
+
+
+def test_match_filter_keeps_repairable_broken_upload():
+    # issue #56: a broken upload with no artist tag but a name STARTING with the artist is KEPT
+    # (repaired after download), while one that neither credits nor starts with it is dropped.
+    mf = _make_match_filter(own_artist="BCee")
+    assert mf({"_type": "video", "artist": None,
+               "title": "BCee - Little Bird - Spearhead Records"}) is None
+    assert mf({"_type": "video", "artist": None,
+               "title": "Some DJ - Other Song - Label"}) is not None
+
+
+def test_match_filter_dedups_repairable_upload_on_recovered_key():
+    # issue #56: a broken upload whose CLEAN version is already on the server must be skipped by
+    # dedup — matched on the recovered (artist, title), not its raw video-name key.
+    known = {("bcee", "little bird")}
+    mf = _make_match_filter(
+        on_server=lambda a, t: (a.split("/")[0].strip().casefold(), t.casefold()) in known,
+        own_artist="BCee")
+    # raw key ("", "BCee - Little Bird - Spearhead Records") wouldn't match; recovered one does
+    assert mf({"_type": "video", "artist": None,
+               "title": "BCee - Little Bird - Spearhead Records"}) is not None
+    # a repairable upload NOT on the server still downloads (to be repaired after)
+    assert mf({"_type": "video", "artist": None,
+               "title": "BCee - Brand New Tune - Spearhead Records"}) is None
+
+
+def test_match_filter_repaired_dedups_under_own_artist():
+    # issue #56: a repaired upload dedups under own_artist (the key it will be INDEXED under),
+    # even when the recovered prefix lists another artist first — else the pre-download key
+    # ("lomax", …) and the post-download index key ("bcee", …) diverge and it re-downloads.
+    known = {("bcee", "brazilian wax")}
+    mf = _make_match_filter(
+        on_server=lambda a, t: (a.split("/")[0].strip().casefold(), t.casefold()) in known,
+        own_artist="BCee")
+    assert mf({"_type": "video", "artist": None,
+               "title": "Lomax & BCee - Brazilian Wax - Spearhead Records"}) is not None
+    # a credited (clean) track is deduped on its RAW title, not a speculative repair of it
+    assert mf({"_type": "video", "artist": "BCee", "title": "Brazilian Wax"}) is not None
+
+
+def test_repair_album_titles_rewrites_tags_and_renames(tmp_path):
+    # issue #56: broken video-name files get clean title/artist tags and are renamed to the
+    # clean title; a clean track (real artist tag) is left untouched and keeps its name.
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("ffmpeg not on PATH")
+    from mutagen import File as MutagenFile
+
+    def mk(title):
+        p = tmp_path / f"{title}.m4a"
+        subprocess.run([ffmpeg, "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                        "-t", "0.1", "-metadata", f"title={title}", "-c:a", "aac", str(p)],
+                       capture_output=True, check=True)
+        return p
+
+    mk("BCee - Little Bird - Spearhead Records")
+    mk("BCee & Lomax - Brazilian Wax - Spearhead Records")
+    clean = mk("Colours")
+    c = MutagenFile(str(clean), easy=True); c["artist"] = ["BCee"]; c.save()
+    # a CLEAN track whose title happens to look broken but has a real artist tag → left alone
+    weird = mk("BCee - Live at XOYO - Part 1")
+    w = MutagenFile(str(weird), easy=True); w["artist"] = ["BCee"]; w.save()
+
+    _repair_album_titles(tmp_path, "BCee")
+
+    assert {p.name for p in tmp_path.iterdir()} == {
+        "Little Bird.m4a", "Brazilian Wax.m4a", "Colours.m4a",
+        "BCee - Live at XOYO - Part 1.m4a"}
+    tags = {p.name: MutagenFile(str(p), easy=True) for p in tmp_path.iterdir()}
+    assert tags["Little Bird.m4a"]["title"] == ["Little Bird"]
+    assert tags["Little Bird.m4a"]["artist"] == ["BCee"]
+    assert tags["Brazilian Wax.m4a"]["artist"] == ["BCee / Lomax"]
+    assert tags["Colours.m4a"]["title"] == ["Colours"]        # clean track untouched
+    # credited track with a broken-looking title is NOT rewritten (its tags win)
+    assert tags["BCee - Live at XOYO - Part 1.m4a"]["title"] == ["BCee - Live at XOYO - Part 1"]
+
+
+def test_repair_album_titles_never_clobbers_another_file(tmp_path):
+    # issue #56: two broken uploads that would repair to the SAME clean name must both survive
+    # (the second gets a " (2)" suffix) — a rename must never overwrite another staged file.
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("ffmpeg not on PATH")
+    from mutagen import File as MutagenFile
+
+    def mk(name):
+        p = tmp_path / f"{name}.m4a"
+        subprocess.run([ffmpeg, "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                        "-t", "0.1", "-metadata", f"title={name}", "-c:a", "aac", str(p)],
+                       capture_output=True, check=True)
+        return p
+
+    # both video names recover to title "Skyline" (e.g. an album cut + a single upload)
+    mk("BCee - Skyline - Spearhead Records")
+    mk("BCee - Skyline - UKF Drum & Bass")
+
+    _repair_album_titles(tmp_path, "BCee")
+
+    names = {p.name for p in tmp_path.iterdir()}
+    assert len(names) == 2                                    # nothing overwritten
+    assert names == {"Skyline.m4a", "Skyline (2).m4a"}
 
 
 def test_build_playlist_manifest_keeps_fresh_reference():
