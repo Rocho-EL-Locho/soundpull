@@ -1246,10 +1246,12 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
         _apply_pot_provider(opts)
         if is_playlist and settings.max_playlist_items > 0:
             opts["playlistend"] = settings.max_playlist_items  # cap runaway playlists
-        if is_playlist:
-            # A playlist spans many videos; a dead/region-locked one must not abort the
-            # whole run — skip it and download the rest (issue #21). Set on the opts dict
-            # (not the frozen flag lists) so album/single stay strict and tag parity holds.
+        if is_playlist or own_artist:
+            # A playlist — or any album in an artist run (own_artist set) — spans many
+            # tracks; a dead / region-locked / 403 one must not abort the rest of the
+            # release (issue #21/#56). Skip it and keep the others. Set on the opts dict
+            # (not the frozen flag lists) so a STANDALONE album/single stays strict (a
+            # user pasting one album URL still fails loudly), and tag parity holds either way.
             opts["ignoreerrors"] = True
         # Dedup: skip tracks already on the server, capturing each skip so a playlist can
         # reference the existing copy afterwards (issue #21/#31).
