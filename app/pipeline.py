@@ -13,6 +13,7 @@ import posixpath
 import re
 import shutil
 import subprocess
+import time
 import zipfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -886,6 +887,28 @@ def _zip_dir(src_dir: Path, zip_path: Path, root_name: str) -> None:
                 zf.write(path, f"{root_name}/{path.relative_to(src_dir).as_posix()}")
 
 
+_UPLOAD_ATTEMPTS = 3
+
+
+def _upload_with_retry(client, local: str, remote: str) -> None:
+    """Upload one file, retrying TRANSIENT network failures (timeout / transport error).
+
+    A single slow or dropped PUT during a big artist upload must not abort the whole job (which
+    would discard every already-downloaded album); retry a few times with linear backoff. A
+    non-transient error (bad path, auth, 4xx) is not retried — it re-raises immediately.
+    """
+    for attempt in range(1, _UPLOAD_ATTEMPTS + 1):
+        try:
+            client.upload_file(local, remote, overwrite=True)
+            return
+        except httpx.TransportError as exc:  # timeout / connect / read / write / network
+            if attempt == _UPLOAD_ATTEMPTS:
+                raise
+            log.warning("WebDAV upload %r failed (attempt %d/%d): %s — retrying",
+                        remote, attempt, _UPLOAD_ATTEMPTS, exc)
+            time.sleep(2.0 * attempt)
+
+
 def _upload_tree(dest: Destination, local_root: Path) -> None:
     from app.webdav_util import make_client
 
@@ -899,7 +922,7 @@ def _upload_tree(dest: Destination, local_root: Path) -> None:
         parent = "/".join(remote.split("/")[:-1])
         if parent:
             _ensure_remote_dir(client, parent)
-        client.upload_file(str(path), remote, overwrite=True)
+        _upload_with_retry(client, str(path), remote)
 
 
 def run_download(*, job_id: str, url: str, genre: str, mode: str,
