@@ -634,6 +634,48 @@ def test_upload_with_retry_does_not_retry_non_transient(monkeypatch):
     assert calls["n"] == 1
 
 
+def test_upload_tree_skips_rejected_path_but_uploads_rest(monkeypatch, tmp_path):
+    # issue #56 follow-up: a single path the server rejects (400) must be skipped + reported,
+    # not abort the whole discography upload — the other files still go up.
+    import app.pipeline as pipeline
+    d = tmp_path / "BCee" / "Album"
+    d.mkdir(parents=True)
+    for n in ["Good One.m4a", "BAD Track.m4a", "Good Two.m4a"]:
+        (d / n).write_bytes(b"x")
+
+    class _FakeClient:
+        def __init__(self): self.uploaded = []
+        def exists(self, p): return True
+        def mkdir(self, p): pass
+        def upload_file(self, local, remote, overwrite=True):
+            if "BAD" in remote:
+                raise RuntimeError("received 400 (Bad Request)")
+            self.uploaded.append(remote)
+
+    fake = _FakeClient()
+    monkeypatch.setattr("app.webdav_util.make_client", lambda *a, **k: fake)
+
+    failed = pipeline._upload_tree(Destination(type="webdav", webdav_folder="Music"), tmp_path)
+
+    assert len(fake.uploaded) == 2                              # both good files uploaded
+    assert failed == ["BCee/Album/BAD Track.m4a"]              # bad one reported, non-fatal
+
+
+def test_upload_tree_raises_when_all_uploads_fail(monkeypatch, tmp_path):
+    # systemic failure (nothing uploads) must surface as an error, not a silent empty upload.
+    import app.pipeline as pipeline
+    (tmp_path / "a.m4a").write_bytes(b"x")
+
+    class _FakeClient:
+        def exists(self, p): return True
+        def mkdir(self, p): pass
+        def upload_file(self, *a, **k): raise RuntimeError("received 400 (Bad Request)")
+
+    monkeypatch.setattr("app.webdav_util.make_client", lambda *a, **k: _FakeClient())
+    with pytest.raises(RuntimeError):
+        pipeline._upload_tree(Destination(type="webdav"), tmp_path)
+
+
 def test_build_playlist_manifest_keeps_fresh_reference():
     # A downloaded track plus a cross-folder reference to a DIFFERENT already-present
     # track → both appear, the reference keeping its relative path (issue #31).

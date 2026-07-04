@@ -909,20 +909,41 @@ def _upload_with_retry(client, local: str, remote: str) -> None:
             time.sleep(2.0 * attempt)
 
 
-def _upload_tree(dest: Destination, local_root: Path) -> None:
+def _upload_tree(dest: Destination, local_root: Path) -> list[str]:
+    """Upload the staged tree to WebDAV; return the list of files that could NOT be uploaded.
+
+    A single file the server rejects (e.g. HTTP 400 on a name it dislikes, after transient
+    retries are exhausted) must not discard a whole discography upload — it's logged WITH its
+    full remote path (so the offending name is diagnosable) and skipped, and the rest proceed.
+    If NOT ONE file uploads, the failure is systemic (auth, bad base URL, unreachable) → raise so
+    the job surfaces as an error rather than a silent empty upload.
+    """
     from app.webdav_util import make_client
 
     client = make_client(dest.webdav_url, dest.webdav_username, dest.webdav_password)
     prefix = (dest.webdav_folder or "").strip("/")
-    for path in sorted(local_root.rglob("*")):
-        if not path.is_file():
-            continue
+    files = [p for p in sorted(local_root.rglob("*")) if p.is_file()]
+    uploaded = 0
+    failed: list[str] = []
+    for path in files:
         rel = path.relative_to(local_root).as_posix()
         remote = f"{prefix}/{rel}" if prefix else rel
         parent = "/".join(remote.split("/")[:-1])
-        if parent:
-            _ensure_remote_dir(client, parent)
-        _upload_with_retry(client, str(path), remote)
+        try:
+            if parent:
+                _ensure_remote_dir(client, parent)
+            _upload_with_retry(client, str(path), remote)
+            uploaded += 1
+        except Exception as exc:  # noqa: BLE001 - one rejected path must not lose the whole upload
+            log.warning("WebDAV upload skipped %r: %s", remote, exc)
+            failed.append(rel)
+    if failed and uploaded == 0:
+        raise RuntimeError(f"WebDAV-Upload fehlgeschlagen (0/{len(files)}): "
+                           f"{failed[0]} — {'; '.join(failed[1:3])}".rstrip(" —"))
+    if failed:
+        log.warning("WebDAV: %d von %d Dateien übersprungen (Server lehnte den Pfad ab): %s",
+                    len(failed), len(files), ", ".join(repr(f) for f in failed[:5]))
+    return failed
 
 
 def run_download(*, job_id: str, url: str, genre: str, mode: str,
