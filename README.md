@@ -156,6 +156,18 @@ bot" check. To download those, store your own YouTube cookie in **Settings → Y
 The cookie is [Fernet-encrypted](SECURITY.md) at rest (requires `FERNET_KEY`), is never shown
 back to you, and is used only for your own downloads. Toggle **Remove stored cookie** to delete it.
 
+> [!WARNING]
+> **Known limitation — cookies & age-verified tracks.** YouTube now enforces a *GVS PO token*
+> for most audio formats. Soundpull handles this for **public** tracks automatically (via the
+> token-free `android_vr` client — no cookie needed). **Age-restricted / age-verified** tracks,
+> however, *require* a login cookie, and a cookie forces the request onto a web-family client
+> (`mweb`) that needs a PO token from the bundled provider sidecar
+> (`bgutil-provider`, set `POT_PROVIDER_BASE_URL`). Even with the cookie and provider in place,
+> this authenticated path can still fail with **HTTP 403** depending on YouTube's token binding —
+> so **some age-verified titles may fail to download** and an album can come out incomplete. This
+> is an upstream YouTube/yt-dlp limitation, not a tagging bug; it is still being worked on. Public
+> content is unaffected.
+
 ## Tech stack
 
 NiceGUI (FastAPI) · Authlib (OIDC) · SQLModel + SQLite · yt-dlp · mutagen · webdav4 ·
