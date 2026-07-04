@@ -63,3 +63,12 @@ def test_request_and_response_paths_decode_to_same_key():
 def test_make_client_returns_safe_path_client():
     c = make_client("https://cloud.example.com/dav", "u", "p")
     assert isinstance(c, _SafePathClient)
+
+
+def test_make_client_sets_generous_upload_timeout():
+    """httpx's 5s default is far too tight for multi-MB uploads → a read timeout aborted the
+    whole artist job. make_client must pass generous read/write budgets."""
+    c = make_client("https://cloud.example.com/dav", "u", "p")
+    http = getattr(c, "_client", None) or getattr(c, "http", None)
+    assert http.timeout.read >= 60 and http.timeout.write >= 60
+    assert http.timeout.connect <= 60      # still fail fast on an unreachable host

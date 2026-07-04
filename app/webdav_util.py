@@ -3,10 +3,17 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
+import httpx
 from httpx import URL
 from webdav4.client import Client
 
 from app.config import settings
+
+# webdav4 passes no timeout, so httpx falls back to its 5s default — far too tight for uploading
+# multi-MB audio files over a remote WebDAV, where a single slow PUT/response raises
+# `httpx.ReadTimeout: The read operation timed out` and (in an artist run) aborts the whole job.
+# Generous read/write budgets for large transfers; a short connect so an unreachable host fails fast.
+_WEBDAV_TIMEOUT = httpx.Timeout(connect=30.0, read=180.0, write=180.0, pool=30.0)
 
 
 def _encode_webdav_path(path: str) -> str:
@@ -51,7 +58,8 @@ def _check_host_allowed(url: str) -> None:
 
 def make_client(url: str, username: str | None, password: str | None) -> Client:
     _check_host_allowed(url)
-    return _SafePathClient(base_url=url, auth=(username or "", password or ""))
+    return _SafePathClient(base_url=url, auth=(username or "", password or ""),
+                           timeout=_WEBDAV_TIMEOUT)
 
 
 def list_dirs(client: Client, path: str) -> list[tuple[str, str]]:

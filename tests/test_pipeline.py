@@ -5,6 +5,7 @@ import shutil
 import stat
 import subprocess
 
+import httpx
 import pytest
 import yt_dlp
 
@@ -35,6 +36,7 @@ from app.pipeline import (
     _repair_broken_title,
     _safe_segment,
     _square_crop_jpeg,
+    _upload_with_retry,
     _write_cookie_file,
     _write_m3u,
     _write_m3u_entries,
@@ -586,6 +588,50 @@ def test_repair_album_titles_never_clobbers_another_file(tmp_path):
     names = {p.name for p in tmp_path.iterdir()}
     assert len(names) == 2                                    # nothing overwritten
     assert names == {"Skyline.m4a", "Skyline (2).m4a"}
+
+
+def test_upload_with_retry_succeeds_after_transient_timeout(monkeypatch):
+    # A slow/dropped PUT is transient — retry rather than abort the whole artist upload.
+    import app.pipeline as pipeline
+    monkeypatch.setattr(pipeline.time, "sleep", lambda s: None)
+    calls = {"n": 0}
+
+    class _C:
+        def upload_file(self, local, remote, overwrite=True):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise httpx.ReadTimeout("The read operation timed out")
+
+    _upload_with_retry(_C(), "/tmp/a.mp3", "Artist/Album/a.mp3")
+    assert calls["n"] == 3                        # two timeouts, third attempt succeeds
+
+
+def test_upload_with_retry_reraises_after_exhausting(monkeypatch):
+    import app.pipeline as pipeline
+    monkeypatch.setattr(pipeline.time, "sleep", lambda s: None)
+
+    class _C:
+        def upload_file(self, *a, **k):
+            raise httpx.ConnectError("boom")
+
+    with pytest.raises(httpx.ConnectError):
+        _upload_with_retry(_C(), "/tmp/a.mp3", "r/a.mp3")
+
+
+def test_upload_with_retry_does_not_retry_non_transient(monkeypatch):
+    # A non-network error (bad path, auth, 4xx) is not transient → fail fast, no retry.
+    import app.pipeline as pipeline
+    monkeypatch.setattr(pipeline.time, "sleep", lambda s: None)
+    calls = {"n": 0}
+
+    class _C:
+        def upload_file(self, *a, **k):
+            calls["n"] += 1
+            raise ValueError("bad path")
+
+    with pytest.raises(ValueError):
+        _upload_with_retry(_C(), "/tmp/a.mp3", "r/a.mp3")
+    assert calls["n"] == 1
 
 
 def test_build_playlist_manifest_keeps_fresh_reference():
