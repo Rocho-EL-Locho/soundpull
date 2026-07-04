@@ -689,6 +689,12 @@ _VIDEO_NAME_SUFFIX = re.compile(
     r"music\s+video|lyric(?:s)?(?:\s+video)?|visuali[sz]er|audio|hd|hq|4k|"
     r"free\s+download|out\s+now|premiere)\s*[\)\]]\s*$", re.IGNORECASE)
 
+# A `" - "` segment that is a version/remix marker, NOT a label — a bracket, or a version
+# keyword. Such a segment must never be dropped as the "label", and re-attaches to the title.
+_VERSION_SEGMENT = re.compile(
+    r"[\(\[]|\b(?:remix|mix|edit|vip|bootleg|dub|version|instrumental|refix|rework|flip|"
+    r"remaster(?:ed)?|acoustic|live|extended|radio|remake|reprise)\b", re.IGNORECASE)
+
 
 def _repair_broken_title(raw_title: str, own_artist: str) -> tuple[str, str] | None:
     """Parse a label-upload video name back into ``(artist, title)`` — issue #56.
@@ -706,9 +712,12 @@ def _repair_broken_title(raw_title: str, own_artist: str) -> tuple[str, str] | N
     a ``feat.`` clause is LEFT in the title for `fix_music_tags` to normalise. Returns None when
     the name doesn't match (a clean track: ``title="Colours"`` has no `` - ``; or not ours).
 
-    Heuristic, not exact: the label is taken to be the LAST `` - `` segment, so a title that
-    itself contains `` - `` loses that tail — acceptable for the common case, and far better
-    than importing the raw video name as a mis-tagged duplicate.
+    Label stripping is version-aware: only a trailing segment that is NOT a version/remix marker
+    (`_VERSION_SEGMENT`) is dropped as the label, and a remaining bracketed version segment
+    re-attaches to the title — so ``So Right - (LSB remix) - Spearhead Records`` →
+    ``So Right (LSB remix)`` and ``So Right - (LSB remix)`` (no label) keeps the remix. Still a
+    heuristic (an unrecognised dashed title can lose its tail), but far better than importing the
+    raw video name as a mis-tagged duplicate.
     """
     if not raw_title or " - " not in raw_title:
         return None
@@ -720,7 +729,16 @@ def _repair_broken_title(raw_title: str, own_artist: str) -> tuple[str, str] | N
     # name begins with the artist we're downloading. Word-boundary so "BCee" ≠ "BCeeX".
     if not re.search(rf"(?<!\w){re.escape(target)}(?!\w)", prefix.casefold()):
         return None
-    title = rest.rsplit(" - ", 1)[0].strip() if " - " in rest else rest.strip()
+    segs = [s.strip() for s in rest.split(" - ") if s.strip()]
+    if not segs:
+        return None
+    # Drop ONE trailing label-looking segment (not a version/remix marker); then rejoin,
+    # attaching a bracketed version segment with a space so it reads as part of the title.
+    if len(segs) >= 2 and not _VERSION_SEGMENT.search(segs[-1]):
+        segs = segs[:-1]
+    title = segs[0]
+    for seg in segs[1:]:
+        title += (" " if seg[:1] in "([" else " - ") + seg
     title = _VIDEO_NAME_SUFFIX.sub("", title).strip()
     if not title:
         return None

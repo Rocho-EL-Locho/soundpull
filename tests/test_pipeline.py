@@ -467,6 +467,10 @@ def test_repair_broken_title_parses_label_uploads():
     assert R("BCee - Come And Join Us (Official Video)", "BCee") == ("BCee", "Come And Join Us")
     # no label segment → title kept whole (a bracketed feat stays for the tagger)
     assert R("BCee - Northpoint (ft. Riya)", "BCee") == ("BCee", "Northpoint (ft. Riya)")
+    # version-aware label strip: a " - (remix)" segment is kept and re-attached, not dropped
+    assert R("BCee & Darrison - So Right - (LSB remix) - Spearhead Records", "BCee") == (
+        "BCee / Darrison", "So Right (LSB remix)")
+    assert R("BCee - So Right - (LSB remix)", "BCee") == ("BCee", "So Right (LSB remix)")
     assert R("Colours", "BCee") is None                       # clean track (no " - ")
     assert R("Some Other Artist - Song - Label", "BCee") is None   # not ours
     assert R("BCee - X - Label", "") is None                  # blank artist never repairs
