@@ -657,6 +657,49 @@ def test_dedup_staged_tracks_keeps_biggest_album(tmp_path):
     assert not (tmp_path / "BCee" / "Colours").exists()      # emptied folder + cover removed
 
 
+def test_dedup_staged_tracks_keeps_distinct_same_title_album_tracks(tmp_path):
+    # issue #56 regression: two DIFFERENT recordings sharing a title across albums (an "Intro"
+    # on each) are NOT duplicates — track_key ignores the album, so dedup must keep both. Only a
+    # lone single is dropped, never a copy that sits in its own multi-track album.
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("ffmpeg not on PATH")
+
+    def mk(folder, title):
+        d = tmp_path / folder
+        d.mkdir(parents=True, exist_ok=True)
+        subprocess.run([ffmpeg, "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t",
+                        "0.1", "-metadata", f"title={title}", "-metadata", "artist=BCee",
+                        "-c:a", "aac", str(d / f"{title}.m4a")], capture_output=True, check=True)
+
+    mk("BCee/Album A", "Intro"); mk("BCee/Album A", "S1"); mk("BCee/Album A", "S2")
+    mk("BCee/Album B", "Intro"); mk("BCee/Album B", "S3")     # a DIFFERENT "Intro"
+
+    removed = _dedup_staged_tracks(tmp_path)
+
+    assert removed == 0                                       # nothing deleted
+    assert len(list(tmp_path.rglob("Intro.m4a"))) == 2        # both "Intro"s survive
+
+
+def test_dedup_staged_tracks_keeps_all_when_only_singles(tmp_path):
+    # When every copy of a track is a lone single (no album), none is deleted — we can't tell
+    # which is canonical, and deleting would be arbitrary data loss.
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("ffmpeg not on PATH")
+
+    def mk(folder):
+        d = tmp_path / folder
+        d.mkdir(parents=True, exist_ok=True)
+        subprocess.run([ffmpeg, "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t",
+                        "0.1", "-metadata", "title=Solo", "-metadata", "artist=BCee",
+                        "-c:a", "aac", str(d / "Solo.m4a")], capture_output=True, check=True)
+
+    mk("BCee/Solo"); mk("BCee/Solo (2)")
+    assert _dedup_staged_tracks(tmp_path) == 0
+    assert len(list(tmp_path.rglob("Solo.m4a"))) == 2
+
+
 def test_upload_with_retry_succeeds_after_transient_timeout(monkeypatch):
     # A slow/dropped PUT is transient — retry rather than abort the whole artist upload.
     import app.pipeline as pipeline

@@ -747,6 +747,21 @@ def _repair_broken_title(raw_title: str, own_artist: str) -> tuple[str, str] | N
     return artist, title
 
 
+def _save_easy_tags(mf) -> None:
+    """Save an ``easy=True`` mutagen file, keeping MP3 on ID3v2.3.
+
+    mutagen's ``EasyMP3.save()`` defaults to writing ID3v2.4, but `fix_music_tags` writes v2.3;
+    an artist-mode tag rewrite (`_repair_album_titles` / `_unify_album_year`) must stay on v2.3
+    so one album folder doesn't end up with mixed ID3 versions. Other formats save normally.
+    """
+    from mutagen.mp3 import EasyMP3
+
+    if isinstance(mf, EasyMP3):
+        mf.save(v2_version=3)
+    else:
+        mf.save()
+
+
 def _repair_album_titles(album_dir: Path, own_artist: str) -> None:
     """Rewrite label-upload video-name tags in an artist-mode album folder (issue #56).
 
@@ -789,7 +804,7 @@ def _repair_album_titles(album_dir: Path, own_artist: str) -> None:
                 mf.add_tags()
             mf["title"] = [new_title]
             mf["artist"] = [new_artist]
-            mf.save()
+            _save_easy_tags(mf)
         except Exception:  # noqa: BLE001 - tag write failed → skip rename too, so name and
             continue        # tags stay consistent (never a clean name over a raw title tag)
         # Rename to the clean title (collision-safe); the file's own name frees up first.
@@ -842,19 +857,25 @@ def _unify_album_year(album_dir: Path) -> None:
         if (mf.get("date") or [None])[0] != earliest:
             try:
                 mf["date"] = [earliest]
-                mf.save()
+                _save_easy_tags(mf)
             except Exception:  # noqa: BLE001 - best-effort
                 pass
 
 
 def _dedup_staged_tracks(work_base: Path) -> int:
-    """Drop tracks staged more than once across an artist run's album folders (issue #56).
+    """Drop a redundant SINGLE staged for a track already in a real album (issue #56).
 
-    The same recording is often pulled into a real album AND as a single / another compilation.
-    Keep the copy in the folder with the MOST audio files (a real release beats a 1-track single),
-    delete the rest plus each removed track's sibling `.lrc`, then remove any folder left with no
-    audio. Returns the number of audio files removed. Runs once, single-threaded, after the
-    parallel fan-out — so no locking, and "biggest album wins" is deterministic.
+    The same recording often arrives both inside a multi-track album AND as a standalone single.
+    For each ``(artist, title)`` that appears in more than one folder, if the biggest folder is a
+    real album (>1 track) we delete only the copies that sit ALONE in a 1-track folder (a single),
+    plus each removed track's sibling `.lrc`, and remove the emptied folder.
+
+    Deliberately conservative: a copy that is itself in a multi-track album is NEVER deleted, so
+    two different tracks that merely share a title across albums (an "Intro"/"Interlude"/"Outro"
+    on each, live-vs-studio) are kept — `track_key` normalises away artist detail and ignores the
+    album, so treating those as duplicates would silently delete distinct recordings. When every
+    copy is a single (biggest folder is 1 track) none is deleted — we can't tell which is
+    canonical. Runs once, single-threaded, after the parallel fan-out. Returns files removed.
     """
     from collections import defaultdict
 
@@ -871,21 +892,23 @@ def _dedup_staged_tracks(work_base: Path) -> int:
         by_key[track_key(title, art)].append(p)
 
     removed = 0
+    emptied: set[Path] = set()
     for key, paths in by_key.items():
-        if not key[1] or len(paths) <= 1:   # no title, or already unique → keep
+        if not key[0] or not key[1] or len(paths) <= 1:  # need a real artist+title, and a dup
             continue
-        paths.sort(key=lambda p: (-folder_size[p.parent], str(p)))  # biggest album wins
-        for dup in paths[1:]:
-            dup.unlink(missing_ok=True)
-            dup.with_suffix(".lrc").unlink(missing_ok=True)
-            removed += 1
-    if removed:
-        # Remove folders emptied of audio (deepest first), incl. their leftover cover/.lrc.
-        for d in sorted((p for p in work_base.rglob("*") if p.is_dir()),
-                        key=lambda p: -len(p.parts)):
-            if not any(f.suffix.lower() in fix_music_tags._SUPPORTED_EXTS
-                       for f in d.rglob("*") if f.is_file()):
-                shutil.rmtree(d, ignore_errors=True)
+        if max(folder_size[p.parent] for p in paths) <= 1:
+            continue  # every copy is a 1-track single → can't tell which is canonical; keep all
+        for dup in paths:
+            if folder_size[dup.parent] == 1:   # a lone single, and a bigger album has this track
+                dup.unlink(missing_ok=True)
+                dup.with_suffix(".lrc").unlink(missing_ok=True)
+                emptied.add(dup.parent)
+                removed += 1
+    # A dropped single leaves its 1-track folder without audio → remove it (+ leftover cover).
+    for d in emptied:
+        if d.is_dir() and not any(f.suffix.lower() in fix_music_tags._SUPPORTED_EXTS
+                                  for f in d.iterdir() if f.is_file()):
+            shutil.rmtree(d, ignore_errors=True)
     return removed
 
 
@@ -1481,10 +1504,10 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
         for tmp in (*work_base.rglob("*.part"), *work_base.rglob("*.ytdl")):
             tmp.unlink(missing_ok=True)
 
-        # Cross-album track dedup (issue #56): the same recording staged both into a real album
-        # and as a single / another compilation. Keep the copy in the biggest album, drop the
-        # rest, then drop the delivered entries whose file was removed so the server index and
-        # the summary count match what actually ships.
+        # Cross-album track dedup (issue #56): drop a standalone single whose recording is also
+        # inside a real (multi-track) album; two multi-track albums that share a title are left
+        # alone (distinct recordings). Then drop the delivered entries whose file was removed so
+        # the server index and the summary count match what actually ships.
         if own_artist:
             n_removed = _dedup_staged_tracks(work_base)
             if n_removed:
