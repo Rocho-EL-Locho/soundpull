@@ -19,6 +19,11 @@ RUN mkdir -p /runtime/data /runtime/downloads && chown -R 65532:65532 /runtime
 # or glibc-overlay concerns in the distroless runtime.
 FROM mwader/static-ffmpeg:7.1 AS ffmpeg
 
+# ─── Stage 2b: Deno JS runtime (yt-dlp EJS: solves YouTube signature/n challenges)
+# The :bin flavor is just the deno binary at /deno. Without a JS runtime yt-dlp
+# can no longer decipher YouTube formats ("Only images are available").
+FROM denoland/deno:bin-2.9.1 AS deno
+
 # ─── Stage 3: distroless runtime ──────────────────────────────────────────────
 FROM gcr.io/distroless/python3-debian12:nonroot
 ENV PYTHONUNBUFFERED=1 \
@@ -30,6 +35,10 @@ COPY --from=builder /install /install
 # Static ffmpeg + ffprobe on PATH
 COPY --from=ffmpeg /ffmpeg /usr/bin/ffmpeg
 COPY --from=ffmpeg /ffprobe /usr/bin/ffprobe
+# Deno JS runtime for yt-dlp's EJS challenge solver (YouTube signature/n challenges).
+# DENO_DIR must be writable by the distroless nonroot uid — point it at /downloads.
+COPY --from=deno /deno /usr/bin/deno
+ENV DENO_DIR=/downloads/.deno
 # Writable data + staging dirs, owned by nonroot
 COPY --from=builder --chown=65532:65532 /runtime/data /data
 COPY --from=builder --chown=65532:65532 /runtime/downloads /downloads
