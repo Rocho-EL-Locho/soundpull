@@ -280,6 +280,16 @@ def test_safe_segment_blocks_traversal():
     assert _safe_segment("Drake") == "Drake"          # legitimate names untouched
 
 
+def test_safe_segment_replaces_server_unsafe_chars():
+    # issue #56: oCIS/OpenCloud rejects "?" (and other Windows-reserved chars) in a path
+    # segment even percent-encoded → 400 on upload. Map them to fullwidth look-alikes yt-dlp
+    # also uses for filenames, so folders match. Path separators stay "_".
+    assert _safe_segment("Is Anybody out There? / Nothing to Declare") == (
+        "Is Anybody out There？ _ Nothing to Declare")
+    assert _safe_segment('A:B*C"D<E>F|G') == "A：B＊C＂D＜E＞F｜G"
+    assert _safe_segment("Normal Album (2024)") == "Normal Album (2024)"   # ordinary names intact
+
+
 def test_playlist_folder_name_disambiguates_by_id():
     # Two different playlists that share a title must NOT map to the same folder,
     # or the second delivery overwrites the first's .m3u8 / clobbers tracks (issue #39).
