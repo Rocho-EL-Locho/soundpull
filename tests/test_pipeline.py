@@ -26,6 +26,7 @@ from app.pipeline import (
     _build_playlist_manifest,
     _build_ydl_opts,
     _credits_artist,
+    _dedup_staged_tracks,
     _genre_flags,
     _index_from_name,
     _make_match_filter,
@@ -36,6 +37,7 @@ from app.pipeline import (
     _repair_broken_title,
     _safe_segment,
     _square_crop_jpeg,
+    _unify_album_year,
     _upload_with_retry,
     _write_cookie_file,
     _write_m3u,
@@ -588,6 +590,71 @@ def test_repair_album_titles_never_clobbers_another_file(tmp_path):
     names = {p.name for p in tmp_path.iterdir()}
     assert len(names) == 2                                    # nothing overwritten
     assert names == {"Skyline.m4a", "Skyline (2).m4a"}
+
+
+def test_unify_album_year_collapses_compilation_dates(tmp_path):
+    # issue #56 (B): a sampler's tracks each carry their own year → Navidrome splits the folder
+    # into one album per year. Force the earliest date onto all so it's one album.
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("ffmpeg not on PATH")
+    from mutagen import File as MutagenFile
+
+    def mk(name, date):
+        p = tmp_path / f"{name}.m4a"
+        subprocess.run([ffmpeg, "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t",
+                        "0.1", "-metadata", f"title={name}", "-metadata", f"date={date}",
+                        "-c:a", "aac", str(p)], capture_output=True, check=True)
+
+    mk("A", "20120308"); mk("B", "20110902"); mk("C", "20111008")
+    _unify_album_year(tmp_path)
+    dates = {(MutagenFile(str(p), easy=True).get("date") or [None])[0]
+             for p in tmp_path.glob("*.m4a")}
+    assert dates == {"20110902"}                              # all → earliest → one album
+
+    # a real album (uniform dates) is left untouched
+    d2 = tmp_path / "real"
+    d2.mkdir()
+    for n in ("X", "Y"):
+        subprocess.run([ffmpeg, "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t",
+                        "0.1", "-metadata", f"title={n}", "-metadata", "date=2020",
+                        "-c:a", "aac", str(d2 / f"{n}.m4a")], capture_output=True, check=True)
+    _unify_album_year(d2)
+    assert {(MutagenFile(str(p), easy=True).get("date") or [None])[0]
+            for p in d2.glob("*.m4a")} == {"2020"}
+
+
+def test_dedup_staged_tracks_keeps_biggest_album(tmp_path):
+    # issue #56 (C): the same track staged in a real album AND as a single → keep the album copy,
+    # drop the single (and its emptied folder + cover).
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("ffmpeg not on PATH")
+
+    def mk(folder, title):
+        d = tmp_path / folder
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / f"{title}.m4a"
+        subprocess.run([ffmpeg, "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t",
+                        "0.1", "-metadata", f"title={title}", "-metadata", "artist=BCee",
+                        "-c:a", "aac", str(p)], capture_output=True, check=True)
+        return p
+
+    mk("BCee/These Are The Days", "Colours")
+    mk("BCee/These Are The Days", "Imposter")
+    mk("BCee/These Are The Days", "Lies")
+    single = mk("BCee/Colours", "Colours")                   # same track also as a single
+    (tmp_path / "BCee" / "Colours" / "cover.jpg").write_bytes(b"x")
+
+    removed = _dedup_staged_tracks(tmp_path)
+
+    assert removed == 1
+    assert {str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*.m4a")} == {
+        "BCee/These Are The Days/Colours.m4a",
+        "BCee/These Are The Days/Imposter.m4a",
+        "BCee/These Are The Days/Lies.m4a"}
+    assert not single.exists()                               # single copy removed
+    assert not (tmp_path / "BCee" / "Colours").exists()      # emptied folder + cover removed
 
 
 def test_upload_with_retry_succeeds_after_transient_timeout(monkeypatch):

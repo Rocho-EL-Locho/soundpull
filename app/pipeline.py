@@ -809,6 +809,86 @@ def _repair_album_titles(album_dir: Path, own_artist: str) -> None:
                 taken.add(path.name.casefold())
 
 
+def _unify_album_year(album_dir: Path) -> None:
+    """Give every track in an artist-mode album folder the same (earliest) date (issue #56).
+
+    Navidrome groups albums by (albumartist, album, date), so a label sampler whose tracks each
+    carry their OWN original release year splits one folder into a separate album per year
+    ("Volume Two" ×5). Forcing one date collapses it back to a single album. No-op for a real
+    album (dates already uniform) or when fewer than two tracks carry a date. Best-effort per
+    file; only runs in artist mode, so a plain album/single download is untouched (parity).
+    """
+    from mutagen import File as MutagenFile
+
+    loaded = []
+    dates: list[str] = []
+    for p in sorted(album_dir.iterdir()):
+        if not p.is_file() or p.suffix.lower() not in fix_music_tags._SUPPORTED_EXTS:
+            continue
+        try:
+            mf = MutagenFile(str(p), easy=True)
+        except Exception:  # noqa: BLE001 - unreadable file: leave it as-is
+            mf = None
+        if mf is None:
+            continue
+        loaded.append(mf)
+        d = (mf.get("date") or [None])[0]
+        if d:
+            dates.append(str(d))
+    if len(dates) < 2 or len(set(dates)) < 2:
+        return  # already uniform (a real album) or nothing to unify
+    earliest = min(dates)  # YYYYMMDD / YYYY-MM-DD / YYYY all sort chronologically as strings
+    for mf in loaded:
+        if (mf.get("date") or [None])[0] != earliest:
+            try:
+                mf["date"] = [earliest]
+                mf.save()
+            except Exception:  # noqa: BLE001 - best-effort
+                pass
+
+
+def _dedup_staged_tracks(work_base: Path) -> int:
+    """Drop tracks staged more than once across an artist run's album folders (issue #56).
+
+    The same recording is often pulled into a real album AND as a single / another compilation.
+    Keep the copy in the folder with the MOST audio files (a real release beats a 1-track single),
+    delete the rest plus each removed track's sibling `.lrc`, then remove any folder left with no
+    audio. Returns the number of audio files removed. Runs once, single-threaded, after the
+    parallel fan-out — so no locking, and "biggest album wins" is deterministic.
+    """
+    from collections import defaultdict
+
+    from app.library_index import track_key
+
+    audio = [p for p in work_base.rglob("*")
+             if p.is_file() and p.suffix.lower() in fix_music_tags._SUPPORTED_EXTS]
+    folder_size: dict[Path, int] = defaultdict(int)
+    for p in audio:
+        folder_size[p.parent] += 1
+    by_key: dict[tuple[str, str], list[Path]] = defaultdict(list)
+    for p in audio:
+        title, art, _ = _track_meta(p)
+        by_key[track_key(title, art)].append(p)
+
+    removed = 0
+    for key, paths in by_key.items():
+        if not key[1] or len(paths) <= 1:   # no title, or already unique → keep
+            continue
+        paths.sort(key=lambda p: (-folder_size[p.parent], str(p)))  # biggest album wins
+        for dup in paths[1:]:
+            dup.unlink(missing_ok=True)
+            dup.with_suffix(".lrc").unlink(missing_ok=True)
+            removed += 1
+    if removed:
+        # Remove folders emptied of audio (deepest first), incl. their leftover cover/.lrc.
+        for d in sorted((p for p in work_base.rglob("*") if p.is_dir()),
+                        key=lambda p: -len(p.parts)):
+            if not any(f.suffix.lower() in fix_music_tags._SUPPORTED_EXTS
+                       for f in d.rglob("*") if f.is_file()):
+                shutil.rmtree(d, ignore_errors=True)
+    return removed
+
+
 def _make_match_filter(on_server: Callable[[str, str], bool] | None = None,
                        on_skip: Callable[[int | None, str, str], None] | None = None,
                        own_artist: str | None = None):
@@ -1231,6 +1311,10 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
                 primary_artist,
                 tag_options,
             )
+            # Artist mode (issue #56): a label sampler's tracks each carry their own release
+            # year, which Navidrome would split into one album per year — force a single date.
+            if own_artist:
+                _unify_album_year(album_dir)
             # Record delivered tracks for the server index (issue #21/#31). Album/single
             # force one primary artist, so pair each track's title with it; rel_path
             # (relative to the WebDAV base) lets a future playlist reference it.
@@ -1396,6 +1480,18 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
         # work dir is not cleaned per-release); never ship those partials.
         for tmp in (*work_base.rglob("*.part"), *work_base.rglob("*.ytdl")):
             tmp.unlink(missing_ok=True)
+
+        # Cross-album track dedup (issue #56): the same recording staged both into a real album
+        # and as a single / another compilation. Keep the copy in the biggest album, drop the
+        # rest, then drop the delivered entries whose file was removed so the server index and
+        # the summary count match what actually ships.
+        if own_artist:
+            n_removed = _dedup_staged_tracks(work_base)
+            if n_removed:
+                delivered_all = [(a, t, rel) for (a, t, rel) in delivered_all
+                                 if (work_base / rel).exists()]
+                new_count = len(delivered_all)
+                log.info("artist dedup: removed %d duplicate track(s) across albums", n_removed)
 
         # Nothing staged: dedup found everything already present, or every release failed.
         if not any(p.is_file() for p in work_base.rglob("*")):
