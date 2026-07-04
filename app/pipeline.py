@@ -102,11 +102,16 @@ def _safe_segment(name: str) -> str:
 # are skipped and it falls back to the 360p progressive stream (~96 kbps). Now:
 #   • android_vr — token-free, serves the real bestaudio (opus/m4a), no cookie.
 #     Listed first so it wins format selection for public content (reliable, no 403).
-#   • web — cookie-capable; with a cookie + a PO token from the provider sidecar
-#     (see _apply_pot_provider) it reaches age-restricted / gated content.
+#   • mweb — cookie-capable AND serves the real bestaudio when given a GVS PO token
+#     from the provider sidecar (see _apply_pot_provider). This is the client that
+#     downloads AGE-RESTRICTED tracks (which need a login cookie): with a cookie set,
+#     android_vr is skipped and mweb + cookie + token carries the whole run at full
+#     quality. (Plain `web`/`web_safari` were tried and rejected: web falls back to the
+#     360p progressive stream (~96 kbps), web_safari yields no format — only mweb gives
+#     251/140 with the token.)
 # Parity-safe: this only selects the extraction client, not the tag pipeline (the
 # frozen postprocessor chain is unchanged); metadata values are client-independent.
-EXTRACTOR_ARGS = "youtube:player_client=android_vr,web"
+EXTRACTOR_ARGS = "youtube:player_client=android_vr,mweb"
 
 # yt-dlp flags for the download step, identical to the bash scripts (genre and
 # -o output template are appended per-run). --ignore-config keeps it deterministic.

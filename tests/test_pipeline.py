@@ -83,8 +83,9 @@ def test_album_opts_parity():
     assert extract["preferredquality"] == "320"
     clients = opts["extractor_args"]["youtube"]["player_client"]
     # android_vr (token-free bestaudio) first so it wins selection for public content;
-    # web (cookie + PO token) covers age-restricted content. See EXTRACTOR_ARGS.
-    assert clients == ["android_vr", "web"]
+    # mweb (cookie-capable + PO token) covers age-restricted content at full quality.
+    # See EXTRACTOR_ARGS.
+    assert clients == ["android_vr", "mweb"]
 
 
 def test_single_has_no_playlist_track_remap():

@@ -1,6 +1,6 @@
 [project]
 name = "soundpull"
-version = "0.8.3"
+version = "0.8.4"
 description = "Soundpull — multi-user web app to download YouTube Music as Navidrome-tagged MP3s"
 requires-python = ">=3.11"
 dependencies = [
