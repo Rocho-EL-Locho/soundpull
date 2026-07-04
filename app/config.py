@@ -42,6 +42,14 @@ class Settings(BaseSettings):
     # Albums downloaded in parallel within one artist run (issue #32). Clamped to 1–4.
     max_artist_album_concurrency: int = 3
 
+    # PO-token provider (issue: YouTube 403). YouTube now requires a GVS PO token
+    # for most audio formats; without one the affected clients' format URLs return
+    # HTTP 403. Point this at a running bgutil-ytdlp-pot-provider server (e.g. the
+    # docker-compose sidecar: http://bgutil-provider:4416) and the bundled yt-dlp
+    # plugin fetches tokens from it. Empty = disabled (the plugin stays idle and
+    # yt-dlp falls back to token-free clients like android_vr, at reduced quality).
+    pot_provider_base_url: str = ""
+
     # Playlist interval-sync (issue #21). `sync_enabled` is the master switch for the
     # background scheduler; `sync_tick_seconds` is how often it checks for due
     # subscriptions (the per-subscription cadence is `interval_hours`).

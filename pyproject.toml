@@ -1,6 +1,6 @@
 [project]
 name = "soundpull"
-version = "0.8.1"
+version = "0.8.2"
 description = "Soundpull — multi-user web app to download YouTube Music as Navidrome-tagged MP3s"
 requires-python = ">=3.11"
 dependencies = [
@@ -21,6 +21,11 @@ dependencies = [
     # a JS runtime too — the Docker image ships a Deno binary (see Dockerfile).
     # Parity is unaffected: yt-dlp itself stays pinned, only companion deps change.
     "yt-dlp[default]==2026.6.9",
+    # PO-token plugin: yt-dlp auto-discovers it via the yt_dlp_plugins namespace.
+    # It fetches GVS PO tokens (YouTube 403 fix) from a bgutil-ytdlp-pot-provider
+    # server (docker-compose sidecar). Pin to match the provider image tag; the
+    # plugin only makes HTTP calls, so no JS runtime is needed in THIS image.
+    "bgutil-ytdlp-pot-provider==1.3.1",
     "mutagen>=1.47",
     "webdav4>=0.10",
 ]

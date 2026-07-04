@@ -22,6 +22,7 @@ from app.pipeline import (
     run_artist_download,
     _apply_audio_format,
     _apply_cookie_policy,
+    _apply_pot_provider,
     _apply_tag_options,
     _build_playlist_manifest,
     _build_ydl_opts,
@@ -81,7 +82,9 @@ def test_album_opts_parity():
     assert extract["preferredcodec"] == "mp3"
     assert extract["preferredquality"] == "320"
     clients = opts["extractor_args"]["youtube"]["player_client"]
-    assert {"ios", "web", "android"}.issubset(set(clients))
+    # android_vr (token-free bestaudio) first so it wins selection for public content;
+    # web (cookie + PO token) covers age-restricted content. See EXTRACTOR_ARGS.
+    assert clients == ["android_vr", "web"]
 
 
 def test_single_has_no_playlist_track_remap():
@@ -335,6 +338,28 @@ def test_apply_cookie_policy_pins_user_cookie_and_forbids_browser():
     _apply_cookie_policy(opts, "/work/job.cookies.txt")
     assert opts["cookiefile"] == "/work/job.cookies.txt"
     assert opts["cookiesfrombrowser"] is None
+
+
+def test_apply_pot_provider_injects_base_url_only_when_configured(monkeypatch):
+    from app import pipeline
+
+    # Not configured (empty) → no-op: no bgutil provider args added.
+    monkeypatch.setattr(pipeline.settings, "pot_provider_base_url", "")
+    opts = {"extractor_args": {"youtube": {"player_client": ["ios"]}}}
+    _apply_pot_provider(opts)
+    assert "youtubepot-bgutilhttp" not in opts["extractor_args"]
+
+    # Configured → base_url is injected as a list value, existing args preserved.
+    monkeypatch.setattr(pipeline.settings, "pot_provider_base_url", "http://bgutil-provider:4416")
+    _apply_pot_provider(opts)
+    assert opts["extractor_args"]["youtubepot-bgutilhttp"] == {"base_url": ["http://bgutil-provider:4416"]}
+    assert opts["extractor_args"]["youtube"] == {"player_client": ["ios"]}
+
+    # Surrounding whitespace is trimmed; missing extractor_args is created.
+    monkeypatch.setattr(pipeline.settings, "pot_provider_base_url", "  http://host:9\n")
+    opts = {}
+    _apply_pot_provider(opts)
+    assert opts["extractor_args"]["youtubepot-bgutilhttp"] == {"base_url": ["http://host:9"]}
 
 
 def test_genre_flags_forces_real_genre_but_skips_empty():

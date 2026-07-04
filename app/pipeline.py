@@ -96,8 +96,17 @@ def _safe_segment(name: str) -> str:
     seg = name.translate(_SEGMENT_MAP).strip()
     return "Unbekannt" if seg in ("", ".", "..") else seg
 
-# Verbatim from download_album.sh / download_single.sh.
-EXTRACTOR_ARGS = "youtube:player_client=ios,web,android;-android_sdkless"
+# YouTube player clients. Was `ios,web,android` (verbatim from download_album.sh),
+# but YouTube's GVS PO-token enforcement broke those: with a cookie only `web`
+# survives (needs a token → HTTP 403); without one `ios`/`android` audio formats
+# are skipped and it falls back to the 360p progressive stream (~96 kbps). Now:
+#   • android_vr — token-free, serves the real bestaudio (opus/m4a), no cookie.
+#     Listed first so it wins format selection for public content (reliable, no 403).
+#   • web — cookie-capable; with a cookie + a PO token from the provider sidecar
+#     (see _apply_pot_provider) it reaches age-restricted / gated content.
+# Parity-safe: this only selects the extraction client, not the tag pipeline (the
+# frozen postprocessor chain is unchanged); metadata values are client-independent.
+EXTRACTOR_ARGS = "youtube:player_client=android_vr,web"
 
 # yt-dlp flags for the download step, identical to the bash scripts (genre and
 # -o output template are appended per-run). --ignore-config keeps it deterministic.
@@ -312,6 +321,24 @@ def _apply_cookie_policy(opts: dict, cookiefile: str | None) -> None:
     opts["cookiesfrombrowser"] = None    # never read a browser cookie store on the server
 
 
+def _apply_pot_provider(opts: dict) -> None:
+    """Point the bundled bgutil PO-token plugin at the provider server, if configured.
+
+    YouTube now requires a GVS PO token for most audio formats (else HTTP 403 on the
+    format URLs). The yt-dlp plugin fetches one from a bgutil-ytdlp-pot-provider
+    server; when it runs as a separate container we must tell the plugin its
+    base_url (it otherwise probes http://127.0.0.1:4416, which isn't in our image).
+    No provider configured → no-op: the plugin stays idle and yt-dlp falls back to
+    token-free clients. Only affects the GVS/download step; a no-op for flat
+    enumeration and cover fetches (no formats are requested, so no token is asked
+    for), but applied uniformly next to the cookie policy for consistency."""
+    base_url = settings.pot_provider_base_url.strip()
+    if not base_url:
+        return
+    # extractor_args values are lists of strings (matches parse_options' output).
+    opts.setdefault("extractor_args", {})["youtubepot-bgutilhttp"] = {"base_url": [base_url]}
+
+
 def _primary_artist(raw: str | None) -> str:
     """Main artist = part before the first ', ' (mirrors `sed 's/, .*//'`)."""
     if not raw or raw == "NA":
@@ -329,6 +356,7 @@ def _probe_meta(url: str, is_album: bool, cookiefile: str | None = None) -> tupl
         "logger": _QuietLogger(),
     }
     _apply_cookie_policy(opts, cookiefile)
+    _apply_pot_provider(opts)
     if is_album:
         opts["playlist_items"] = "1"
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -362,6 +390,7 @@ def _probe_playlist(url: str, cookiefile: str | None = None) -> tuple[str, str, 
         "logger": _QuietLogger(),
     }
     _apply_cookie_policy(opts, cookiefile)
+    _apply_pot_provider(opts)
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False) or {}
     title = info.get("title") or "Playlist"
@@ -392,6 +421,7 @@ def enumerate_playlist_tracks(url: str, cookiefile: str | None = None,
         "logger": _QuietLogger(),
     }
     _apply_cookie_policy(opts, cookiefile)
+    _apply_pot_provider(opts)
     if limit and limit > 0:
         opts["playlistend"] = limit
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -431,6 +461,7 @@ def enumerate_artist(url: str, cookiefile: str | None = None,
         "logger": _QuietLogger(),
     }
     _apply_cookie_policy(opts, cookiefile)
+    _apply_pot_provider(opts)
 
     releases_url = url if url.rstrip("/").endswith("/releases") else None
     if releases_url is None:
@@ -514,6 +545,7 @@ def _fetch_cover(url: str, is_album: bool, dest: Path, cookiefile: str | None = 
     """Download the square album cover into `dest` (cover.jpg). Returns path or None."""
     opts = {"quiet": True, "no_warnings": True, "skip_download": True, "logger": _QuietLogger()}
     _apply_cookie_policy(opts, cookiefile)
+    _apply_pot_provider(opts)
     if is_album:
         opts["extract_flat"] = True  # playlist-level thumbnails (the album art)
     try:
@@ -1211,6 +1243,7 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
         opts = _build_ydl_opts(flags)
         opts.update({"quiet": True, "no_warnings": True, "noprogress": True, "logger": _QuietLogger()})
         _apply_cookie_policy(opts, cookiefile)
+        _apply_pot_provider(opts)
         if is_playlist and settings.max_playlist_items > 0:
             opts["playlistend"] = settings.max_playlist_items  # cap runaway playlists
         if is_playlist:
