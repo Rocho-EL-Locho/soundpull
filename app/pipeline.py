@@ -758,6 +758,21 @@ def _repair_broken_title(raw_title: str, own_artist: str) -> tuple[str, str] | N
     return artist, title
 
 
+def _save_easy_tags(mf) -> None:
+    """Save an ``easy=True`` mutagen file, keeping MP3 on ID3v2.3.
+
+    mutagen's ``EasyMP3.save()`` defaults to writing ID3v2.4, but `fix_music_tags` writes v2.3;
+    an artist-mode tag rewrite (`_repair_album_titles` / `_unify_album_year`) must stay on v2.3
+    so one album folder doesn't end up with mixed ID3 versions. Other formats save normally.
+    """
+    from mutagen.mp3 import EasyMP3
+
+    if isinstance(mf, EasyMP3):
+        mf.save(v2_version=3)
+    else:
+        mf.save()
+
+
 def _repair_album_titles(album_dir: Path, own_artist: str) -> None:
     """Rewrite label-upload video-name tags in an artist-mode album folder (issue #56).
 
@@ -800,7 +815,7 @@ def _repair_album_titles(album_dir: Path, own_artist: str) -> None:
                 mf.add_tags()
             mf["title"] = [new_title]
             mf["artist"] = [new_artist]
-            mf.save()
+            _save_easy_tags(mf)
         except Exception:  # noqa: BLE001 - tag write failed → skip rename too, so name and
             continue        # tags stay consistent (never a clean name over a raw title tag)
         # Rename to the clean title (collision-safe); the file's own name frees up first.
@@ -818,6 +833,94 @@ def _repair_album_titles(album_dir: Path, own_artist: str) -> None:
             except Exception:  # noqa: BLE001 - rename best-effort (tags already clean)
                 taken.discard(candidate.casefold())
                 taken.add(path.name.casefold())
+
+
+def _unify_album_year(album_dir: Path) -> None:
+    """Give every track in an artist-mode album folder the same (earliest) date (issue #56).
+
+    Navidrome groups albums by (albumartist, album, date), so a label sampler whose tracks each
+    carry their OWN original release year splits one folder into a separate album per year
+    ("Volume Two" ×5). Forcing one date collapses it back to a single album. No-op for a real
+    album (dates already uniform) or when fewer than two tracks carry a date. Best-effort per
+    file; only runs in artist mode, so a plain album/single download is untouched (parity).
+    """
+    from mutagen import File as MutagenFile
+
+    loaded = []
+    dates: list[str] = []
+    for p in sorted(album_dir.iterdir()):
+        if not p.is_file() or p.suffix.lower() not in fix_music_tags._SUPPORTED_EXTS:
+            continue
+        try:
+            mf = MutagenFile(str(p), easy=True)
+        except Exception:  # noqa: BLE001 - unreadable file: leave it as-is
+            mf = None
+        if mf is None:
+            continue
+        loaded.append(mf)
+        d = (mf.get("date") or [None])[0]
+        if d:
+            dates.append(str(d))
+    if len(dates) < 2 or len(set(dates)) < 2:
+        return  # already uniform (a real album) or nothing to unify
+    earliest = min(dates)  # YYYYMMDD / YYYY-MM-DD / YYYY all sort chronologically as strings
+    for mf in loaded:
+        if (mf.get("date") or [None])[0] != earliest:
+            try:
+                mf["date"] = [earliest]
+                _save_easy_tags(mf)
+            except Exception:  # noqa: BLE001 - best-effort
+                pass
+
+
+def _dedup_staged_tracks(work_base: Path) -> int:
+    """Drop a redundant SINGLE staged for a track already in a real album (issue #56).
+
+    The same recording often arrives both inside a multi-track album AND as a standalone single.
+    For each ``(artist, title)`` that appears in more than one folder, if the biggest folder is a
+    real album (>1 track) we delete only the copies that sit ALONE in a 1-track folder (a single),
+    plus each removed track's sibling `.lrc`, and remove the emptied folder.
+
+    Deliberately conservative: a copy that is itself in a multi-track album is NEVER deleted, so
+    two different tracks that merely share a title across albums (an "Intro"/"Interlude"/"Outro"
+    on each, live-vs-studio) are kept — `track_key` normalises away artist detail and ignores the
+    album, so treating those as duplicates would silently delete distinct recordings. When every
+    copy is a single (biggest folder is 1 track) none is deleted — we can't tell which is
+    canonical. Runs once, single-threaded, after the parallel fan-out. Returns files removed.
+    """
+    from collections import defaultdict
+
+    from app.library_index import track_key
+
+    audio = [p for p in work_base.rglob("*")
+             if p.is_file() and p.suffix.lower() in fix_music_tags._SUPPORTED_EXTS]
+    folder_size: dict[Path, int] = defaultdict(int)
+    for p in audio:
+        folder_size[p.parent] += 1
+    by_key: dict[tuple[str, str], list[Path]] = defaultdict(list)
+    for p in audio:
+        title, art, _ = _track_meta(p)
+        by_key[track_key(title, art)].append(p)
+
+    removed = 0
+    emptied: set[Path] = set()
+    for key, paths in by_key.items():
+        if not key[0] or not key[1] or len(paths) <= 1:  # need a real artist+title, and a dup
+            continue
+        if max(folder_size[p.parent] for p in paths) <= 1:
+            continue  # every copy is a 1-track single → can't tell which is canonical; keep all
+        for dup in paths:
+            if folder_size[dup.parent] == 1:   # a lone single, and a bigger album has this track
+                dup.unlink(missing_ok=True)
+                dup.with_suffix(".lrc").unlink(missing_ok=True)
+                emptied.add(dup.parent)
+                removed += 1
+    # A dropped single leaves its 1-track folder without audio → remove it (+ leftover cover).
+    for d in emptied:
+        if d.is_dir() and not any(f.suffix.lower() in fix_music_tags._SUPPORTED_EXTS
+                                  for f in d.iterdir() if f.is_file()):
+            shutil.rmtree(d, ignore_errors=True)
+    return removed
 
 
 def _make_match_filter(on_server: Callable[[str, str], bool] | None = None,
@@ -1242,6 +1345,10 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
                 primary_artist,
                 tag_options,
             )
+            # Artist mode (issue #56): a label sampler's tracks each carry their own release
+            # year, which Navidrome would split into one album per year — force a single date.
+            if own_artist:
+                _unify_album_year(album_dir)
             # Record delivered tracks for the server index (issue #21/#31). Album/single
             # force one primary artist, so pair each track's title with it; rel_path
             # (relative to the WebDAV base) lets a future playlist reference it.
@@ -1407,6 +1514,18 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
         # work dir is not cleaned per-release); never ship those partials.
         for tmp in (*work_base.rglob("*.part"), *work_base.rglob("*.ytdl")):
             tmp.unlink(missing_ok=True)
+
+        # Cross-album track dedup (issue #56): drop a standalone single whose recording is also
+        # inside a real (multi-track) album; two multi-track albums that share a title are left
+        # alone (distinct recordings). Then drop the delivered entries whose file was removed so
+        # the server index and the summary count match what actually ships.
+        if own_artist:
+            n_removed = _dedup_staged_tracks(work_base)
+            if n_removed:
+                delivered_all = [(a, t, rel) for (a, t, rel) in delivered_all
+                                 if (work_base / rel).exists()]
+                new_count = len(delivered_all)
+                log.info("artist dedup: removed %d duplicate track(s) across albums", n_removed)
 
         # Nothing staged: dedup found everything already present, or every release failed.
         if not any(p.is_file() for p in work_base.rglob("*")):
