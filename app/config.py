@@ -42,6 +42,23 @@ class Settings(BaseSettings):
     # Albums downloaded in parallel within one artist run (issue #32). Clamped to 1–4.
     max_artist_album_concurrency: int = 3
 
+    # Resilience against transient YouTube throttling on multi-track runs (album /
+    # playlist / artist). A back-to-back marathon of big downloads can get the IP
+    # temporarily rate-limited; yt-dlp then silently skips the throttled tracks
+    # (`ignoreerrors='only_download'`), so an album can come out partial while the job
+    # still reports "done". These knobs make that recoverable and visible:
+    #   - retry_passes: after the first pass, re-run up to this many more times, using a
+    #     per-job download-archive so only the still-missing tracks are re-attempted.
+    #   - retry_backoff_seconds: wait this long before each retry pass so a throttle can
+    #     clear. 0 disables the wait.
+    #   - sleep_requests_seconds: paced delay between yt-dlp HTTP requests on a multi-track
+    #     run to AVOID tripping the throttle in the first place. 0 = off (fastest). A small
+    #     value (e.g. 0.5) helps when pulling whole discographies.
+    # All three only affect timing / which tracks are retried — never tag output (parity-safe).
+    download_retry_passes: int = 2
+    download_retry_backoff_seconds: float = 30.0
+    download_sleep_requests_seconds: float = 0.0
+
     # PO-token provider (issue: YouTube 403). YouTube now requires a GVS PO token
     # for most audio formats; without one the affected clients' format URLs return
     # HTTP 403. Point this at a running bgutil-ytdlp-pot-provider server (e.g. the

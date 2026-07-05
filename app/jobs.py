@@ -62,6 +62,21 @@ def _clean_error(exc: object) -> str:
 # returns an unknown string unchanged, so storing a key stays backward-safe.
 _INDEX_WARNING_KEY = "jobs.index_update_failed"  # delivery OK, but the index wasn't updated
 _SEED_FAILED_KEY = "jobs.seed_failed"            # mark_existing seed couldn't be persisted
+_PARTIAL_KEY = "jobs.partial_delivery"           # some tracks failed (throttle/403) → partial
+
+
+def _delivery_warning(result, index_ok: bool = True) -> tuple[str | None, int, int]:
+    """Pick the job's non-fatal warning from a delivery Result: (key, total, failed).
+
+    A partial delivery (tracks silently dropped by YouTube throttling/403, or files the
+    WebDAV server rejected) is the most important thing to surface — it makes an album that
+    reports "done" but is missing tracks visible instead of a silent success. It outranks the
+    stale-index note (#38). `total`/`failed` are carried so the page can render "N von M"."""
+    failed = result.failed_count + result.upload_failed_count
+    if failed > 0:
+        total = result.expected_count or (result.new_track_count + failed)
+        return _PARTIAL_KEY, total, failed
+    return (None if index_ok else _INDEX_WARNING_KEY), 0, 0
 
 
 @dataclass
@@ -80,6 +95,7 @@ class JobState:
     album: str | None = None
     current_track: int = 0
     total_tracks: int = 0
+    failed_tracks: int = 0   # tracks/files that failed (throttle/403/upload) → partial delivery
     # Album-level progress for an artist run (issue #32); 0 for other modes.
     current_album: int = 0
     total_albums: int = 0
@@ -212,15 +228,18 @@ def _run_artist(job_id: str, url: str, genre: str, destination: Destination,
         indexed = True
         if destination.type == "webdav" and result.delivered:
             indexed = _record_delivered_safe(job_id, js.user_id, result.delivered)
-        warning = None if indexed else _INDEX_WARNING_KEY
+        warning, total, failed = _delivery_warning(result, indexed)
         with _lock:
             js.phase, js.finished_at = "done", _utcnow()
             js.result_path = result.zip_path
             js.result_name = result.zip_name
             js.summary = result.summary
             js.warning = warning
+            js.failed_tracks = failed
+            if total:
+                js.total_tracks = total
         _persist(job_id, phase="done", finished_at=js.finished_at, warning=warning,
-                 artist=js.artist, album=js.album,
+                 artist=js.artist, album=js.album, failed_tracks=failed,
                  current_track=js.current_track, total_tracks=js.total_tracks)
     except Exception as exc:  # noqa: BLE001 - surface any failure to the user
         log.exception("artist download %s failed", job_id)
@@ -259,15 +278,18 @@ def _run(job_id: str, url: str, genre: str, mode: str, destination: Destination,
         indexed = True
         if destination.type == "webdav" and result.delivered:
             indexed = _record_delivered_safe(job_id, js.user_id, result.delivered)
-        warning = None if indexed else _INDEX_WARNING_KEY
+        warning, total, failed = _delivery_warning(result, indexed)
         with _lock:
             js.phase, js.finished_at = "done", _utcnow()
             js.result_path = result.zip_path
             js.result_name = result.zip_name
             js.summary = result.summary
             js.warning = warning
+            js.failed_tracks = failed
+            if total:
+                js.total_tracks = total
         _persist(job_id, phase="done", finished_at=js.finished_at, warning=warning,
-                 artist=js.artist, album=js.album,
+                 artist=js.artist, album=js.album, failed_tracks=failed,
                  current_track=js.current_track, total_tracks=js.total_tracks)
     except Exception as exc:  # noqa: BLE001 - surface any failure to the user
         log.exception("download %s failed", job_id)
@@ -443,7 +465,7 @@ def _run_sync(job_id: str, cfg: _SyncConfig) -> None:
     js = _registry[job_id]
     reporter = _make_reporter(job_id, js)
     try:
-        warning = None  # set to an i18n key below when an index write fails (issue #38)
+        warning, total, failed = None, 0, 0  # set below: index-fail (#38) or partial delivery
         # "mark existing" first run: seed the index from the current playlist and
         # download nothing, so only FUTURE additions are ever fetched (issue #21).
         if cfg.first_run and cfg.initial_mode == "mark_existing":
@@ -493,12 +515,13 @@ def _run_sync(job_id: str, cfg: _SyncConfig) -> None:
                 cookies_txt=cfg.cookies_txt, on_server=on_server, existing_ref=existing_ref,
                 existing_tracks=cfg.existing_tracks, fetch_lyrics=cfg.fetch_lyrics,
             )
-            if result.delivered and not _record_delivered_safe(
-                    job_id, cfg.user_id, result.delivered):
+            index_ok = True
+            if result.delivered:
                 # Delivery succeeded and the manifest is saved below, so the sync stays "ok";
-                # only the ServerTrack index is stale → those tracks re-download next sync.
+                # a stale ServerTrack index just means those tracks re-download next sync.
                 # Surface it on the job (durable in the history), not on the subscription (#38).
-                warning = _INDEX_WARNING_KEY
+                index_ok = _record_delivered_safe(job_id, cfg.user_id, result.delivered)
+            warning, total, failed = _delivery_warning(result, index_ok)
             with session_scope() as session:
                 # Persist whenever we have a manifest (new downloads OR new references), so
                 # the complete rebuilt playlist — including cross-folder refs — is kept (#31).
@@ -511,8 +534,11 @@ def _run_sync(job_id: str, cfg: _SyncConfig) -> None:
         with _lock:
             js.phase, js.finished_at, js.summary = "done", _utcnow(), summary
             js.warning = warning
+            js.failed_tracks = failed
+            if total:
+                js.total_tracks = total
         _persist(job_id, phase="done", finished_at=js.finished_at, warning=warning,
-                 artist=js.artist, album=js.album,
+                 artist=js.artist, album=js.album, failed_tracks=failed,
                  current_track=js.current_track, total_tracks=js.total_tracks)
     except Exception as exc:  # noqa: BLE001 - surface any failure to the user
         log.exception("sync %s failed", job_id)

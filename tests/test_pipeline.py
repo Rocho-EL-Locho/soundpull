@@ -1248,3 +1248,104 @@ def test_run_artist_download_stages_albums_in_parallel(monkeypatch, tmp_path):
     assert albums[0] == (0, 3, "")                         # total published before fan-out
     assert (albums[-1][0], albums[-1][1]) == (3, 3)        # progress reached all-done
     assert {n for _, _, n in albums if n} == {"A", "B", "C"}
+
+
+# --- Throttle hardening: retry + partial-delivery surfacing --------------------
+
+def test_download_with_retries_recovers_missing_tracks(monkeypatch, tmp_path):
+    # A multi-track run re-runs until every EXPECTED track has finished, waiting `backoff`
+    # between passes, and cleans up its per-job download-archive. Simulates a throttle that
+    # lets one more track through on each pass.
+    import app.pipeline as pipeline
+    monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
+    (tmp_path / ".work").mkdir()
+    monkeypatch.setattr(pipeline.settings, "download_retry_passes", 3)
+    monkeypatch.setattr(pipeline.settings, "download_retry_backoff_seconds", 5)
+    monkeypatch.setattr(pipeline.settings, "download_sleep_requests_seconds", 0)
+    sleeps: list = []
+    monkeypatch.setattr(pipeline.time, "sleep", lambda s: sleeps.append(s))
+
+    expected = {"a", "b", "c"}
+    finished: set[str] = set()
+
+    class _FakeYDL:
+        def __init__(self, opts): self.opts = opts
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def download(self, urls):
+            finished.add(sorted(expected - finished)[0])   # one more track completes each pass
+    monkeypatch.setattr(pipeline.yt_dlp, "YoutubeDL", _FakeYDL)
+
+    opts: dict = {}
+    pipeline._download_with_retries(opts, "u", is_multi=True, job_id="jx",
+                                    expected_ids=expected, finished_ids=finished)
+
+    assert finished == expected                            # all three recovered
+    assert sleeps == [5, 5]                                # waited before the 2 needed retries
+    assert opts["download_archive"].endswith("jx.archive")
+    assert not (tmp_path / ".work" / "jx.archive").exists()  # cleaned up
+
+
+def test_download_with_retries_single_is_one_shot(monkeypatch, tmp_path):
+    # A single-track run keeps the original one-shot behaviour: no archive, no retry loop.
+    import app.pipeline as pipeline
+    monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
+    calls = {"n": 0}
+
+    class _FakeYDL:
+        def __init__(self, opts): self.opts = opts
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def download(self, urls): calls["n"] += 1
+    monkeypatch.setattr(pipeline.yt_dlp, "YoutubeDL", _FakeYDL)
+
+    opts: dict = {}
+    pipeline._download_with_retries(opts, "u", is_multi=False, job_id="j",
+                                    expected_ids=set(), finished_ids=set())
+    assert calls["n"] == 1
+    assert "download_archive" not in opts                  # single track → no archive/retry
+
+
+def test_run_download_reports_partial_when_a_track_fails(monkeypatch, tmp_path):
+    # An album where yt-dlp silently drops a throttled track (ignoreerrors='only_download')
+    # must come back with expected_count/failed_count set, so the worker can surface it
+    # instead of the album looking like a clean success.
+    from pathlib import Path
+    import app.pipeline as pipeline
+    monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
+    monkeypatch.setattr(pipeline, "_probe_meta", lambda *a, **k: ("HeXer", "Singlegrind"))
+    monkeypatch.setattr(pipeline, "_fetch_cover", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline.fix_music_tags, "process_directory", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "_zip_dir", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline.settings, "download_retry_passes", 0)  # deterministic: no retry
+
+    class _FakeYDL:
+        validate_outtmpl = staticmethod(pipeline.yt_dlp.YoutubeDL.validate_outtmpl)
+
+        def __init__(self, opts): self.opts = opts
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+        def download(self, urls):
+            outtmpl = self.opts["outtmpl"]
+            tmpl = outtmpl["default"] if isinstance(outtmpl, dict) else outtmpl
+            out_dir = Path(tmpl).parent
+            out_dir.mkdir(parents=True, exist_ok=True)
+            mf = self.opts.get("match_filter")
+            hooks = self.opts.get("progress_hooks", [])
+            for i, vid in enumerate(("v1", "v2", "v3")):
+                info = {"id": vid, "title": f"T{i}", "artist": "HeXer"}
+                if mf:
+                    mf(info, incomplete=False)             # entry passes the filter → EXPECTED
+                if vid != "v3":                            # v3 is the throttled/skipped track
+                    f = out_dir / f"{vid}.mp3"
+                    f.write_bytes(b"x")
+                    for h in hooks:
+                        h({"status": "finished", "filename": str(f), "info_dict": info})
+    monkeypatch.setattr(pipeline.yt_dlp, "YoutubeDL", _FakeYDL)
+
+    res = pipeline.run_download(job_id="jp", url="uAlb", genre="Rap", mode="album",
+                                destination=Destination(type="browser"), reporter=Reporter())
+
+    assert res.expected_count == 3
+    assert res.failed_count == 1                           # v3 never finished → surfaced

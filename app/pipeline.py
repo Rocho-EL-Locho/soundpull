@@ -282,6 +282,14 @@ class Result:
     # caller records it only for WebDAV.
     delivered: list = field(default_factory=list)
     new_track_count: int = 0      # tracks actually downloaded (relevant for sync)
+    # Partial-delivery accounting (throttle/403 hardening): `expected_count` is how many
+    # tracks SHOULD have downloaded (entries that passed the dedup/own-artist filter);
+    # `failed_count` is how many of those never completed after all retry passes;
+    # `upload_failed_count` is how many staged files the WebDAV server rejected. All three
+    # are 0 on a clean run. The worker surfaces a non-zero total as a job warning (#…).
+    expected_count: int = 0
+    failed_count: int = 0
+    upload_failed_count: int = 0
     # Updated ordered m3u manifest for a playlist SYNC (see `existing_tracks`); the
     # caller persists it on the subscription to rebuild the complete playlist next run.
     playlist_files: list = field(default_factory=list)
@@ -962,7 +970,8 @@ def _dedup_staged_tracks(work_base: Path) -> int:
 
 def _make_match_filter(on_server: Callable[[str, str], bool] | None = None,
                        on_skip: Callable[[int | None, str, str], None] | None = None,
-                       own_artist: str | None = None):
+                       own_artist: str | None = None,
+                       on_seen: Callable[[str], None] | None = None):
     """yt-dlp match_filter: skip tracks we don't want to download (issue #21/#31/#56).
 
     yt-dlp extracts each entry's full metadata (artist/track) BEFORE downloading the
@@ -1010,6 +1019,13 @@ def _make_match_filter(on_server: Callable[[str, str], bool] | None = None,
             if on_skip is not None:
                 on_skip(info_dict.get("playlist_index"), d_artist, d_title)
             return f"schon auf dem Server: {d_artist} - {d_title}".strip()
+        # This entry passed every skip check → yt-dlp will (attempt to) download it. Record
+        # its id as EXPECTED so the caller can detect tracks that later fail at the download
+        # stage (silently skipped by ignoreerrors='only_download') and retry / surface them.
+        if on_seen is not None:
+            vid = info_dict.get("id")
+            if vid:
+                on_seen(str(vid))
         return None
     return _filter
 
@@ -1095,6 +1111,50 @@ def _upload_tree(dest: Destination, local_root: Path) -> list[str]:
         log.warning("WebDAV: %d von %d Dateien übersprungen (Server lehnte den Pfad ab): %s",
                     len(failed), len(files), ", ".join(repr(f) for f in failed[:5]))
     return failed
+
+
+def _download_with_retries(opts: dict, url: str, *, is_multi: bool, job_id: str,
+                           expected_ids: set[str], finished_ids: set[str]) -> None:
+    """Run yt-dlp's download, recovering from transient YouTube throttling.
+
+    yt-dlp's default `ignoreerrors='only_download'` silently SKIPS a track that fails at the
+    media-download stage (e.g. a 403 from YouTube throttling the IP after a marathon of
+    downloads), so a big album/playlist can come out partial while the job still ends "done".
+    For a multi-track run we make that recoverable: a per-job **download-archive** records the
+    tracks that completed, so a re-run only re-attempts the still-missing ones (playlist_index
+    and tags stay intact); we optionally pace requests to avoid tripping the throttle at all;
+    and we re-run up to `download_retry_passes` more times — waiting `retry_backoff` between
+    passes so a throttle can clear — until every EXPECTED track has finished. `expected_ids` /
+    `finished_ids` are updated live by the match_filter / progress hook, so the loop stops as
+    soon as nothing is missing. A single-track run keeps the original one-shot behaviour. This
+    only affects timing / which tracks are retried — never the tag pipeline (parity-safe)."""
+    if not is_multi:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+        return
+
+    sleep_req = max(0.0, settings.download_sleep_requests_seconds)
+    if sleep_req:
+        opts["sleep_interval_requests"] = sleep_req  # pace HTTP requests → avoid throttling
+    archive = _WORK_ROOT / f"{job_id}.archive"        # per-job: a retry skips completed tracks
+    opts["download_archive"] = str(archive)
+    passes = max(0, settings.download_retry_passes)
+    backoff = max(0.0, settings.download_retry_backoff_seconds)
+    try:
+        for attempt in range(passes + 1):
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+            missing = expected_ids - finished_ids
+            if not missing:
+                break  # every expected track completed
+            if attempt < passes:
+                log.warning("download %s: %d track(s) still missing after pass %d/%d — "
+                            "retrying in %.0fs", job_id, len(missing), attempt + 1,
+                            passes + 1, backoff)
+                if backoff:
+                    time.sleep(backoff)
+    finally:
+        archive.unlink(missing_ok=True)
 
 
 def run_download(*, job_id: str, url: str, genre: str, mode: str,
@@ -1259,34 +1319,57 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
             # user pasting one album URL still fails loudly), and tag parity holds either way.
             opts["ignoreerrors"] = True
         # Dedup: skip tracks already on the server, capturing each skip so a playlist can
-        # reference the existing copy afterwards (issue #21/#31).
+        # reference the existing copy afterwards (issue #21/#31). A multi-track run also
+        # installs the filter purely to RECORD each entry that will download (`on_seen` →
+        # `expected_ids`), so a track that later fails at the download stage — silently
+        # skipped by yt-dlp's `ignoreerrors='only_download'` — is detectable and retryable.
         skipped: list[tuple[int | None, str, str]] = []  # (playlist_index, artist, title)
-        if on_server is not None or own_artist:
+        _skip_seen: set[tuple] = set()  # dedupe: a retry pass re-runs the filter (idempotent)
+
+        def _on_skip(idx: int | None, a: str, t: str) -> None:
+            key = (idx, a, t)
+            if key not in _skip_seen:
+                _skip_seen.add(key)
+                skipped.append((idx, a, t))
+
+        is_multi = not is_single  # album / playlist / artist span many tracks; single is one
+        expected_ids: set[str] = set()   # entries that passed the filter → should download
+        finished_ids: set[str] = set()   # entries whose media download actually completed
+        if is_multi or on_server is not None or own_artist:
             opts["match_filter"] = _make_match_filter(
-                on_server, on_skip=lambda idx, a, t: skipped.append((idx, a, t)),
-                own_artist=own_artist)
+                on_server, on_skip=_on_skip, own_artist=own_artist, on_seen=expected_ids.add)
 
         finished_dirs: Counter[str] = Counter()
 
         def progress_hook(d: dict) -> None:
             status = d.get("status")
+            info = d.get("info_dict") or {}
             if status == "downloading":
-                info = d.get("info_dict") or {}
                 idx = info.get("playlist_index")
                 total = info.get("n_entries") or info.get("playlist_count") or 0
                 reporter.on_phase("download")
                 if idx:
                     reporter.on_track(int(idx), int(total or 0))
             elif status == "finished":
-                name = d.get("filename") or (d.get("info_dict") or {}).get("filepath")
+                vid = info.get("id")
+                if vid:
+                    finished_ids.add(str(vid))
+                name = d.get("filename") or info.get("filepath")
                 if name:
                     finished_dirs[str(Path(name).parent)] += 1
 
         opts["progress_hooks"] = [progress_hook]
 
         reporter.on_phase("download")
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
+        _download_with_retries(opts, url, is_multi=is_multi, job_id=job_id,
+                               expected_ids=expected_ids, finished_ids=finished_ids)
+        # Tracks that passed the filter but never completed, even after retries (throttle/403).
+        failed_ids = expected_ids - finished_ids
+        expected_count, failed_count = len(expected_ids), len(failed_ids)
+        if failed_count:
+            log.warning("download %s: %d/%d track(s) failed after retries: %s",
+                        job_id, failed_count, expected_count,
+                        ", ".join(sorted(failed_ids)[:8]))
 
         # Resolve dedup-skipped playlist tracks into cross-folder .m3u8 references
         # (issue #31): a skipped track whose existing library path is known is listed at a
@@ -1319,8 +1402,10 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
                         reporter.on_phase("upload")
                         _upload_tree(destination, work_base)
                 return Result(summary="Keine neuen Titel", new_track_count=0,
-                              playlist_files=manifest, playlist_name=pl_title)
-            return Result(summary="Keine neuen Titel", new_track_count=0)
+                              playlist_files=manifest, playlist_name=pl_title,
+                              expected_count=expected_count, failed_count=failed_count)
+            return Result(summary="Keine neuen Titel", new_track_count=0,
+                          expected_count=expected_count, failed_count=failed_count)
 
         # 3) Navidrome tag correction (frozen fix_music_tags logic), gated per
         #    tag_options — all-on keeps the original behaviour. A playlist tags
@@ -1421,24 +1506,26 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
         # accumulate the delivered tracks and combine the delivery.
         if not deliver:
             return Result(summary="", delivered=delivered, new_track_count=len(delivered),
-                          playlist_files=manifest, playlist_name=pl_title)
+                          playlist_files=manifest, playlist_name=pl_title,
+                          expected_count=expected_count, failed_count=failed_count)
 
         # 4) Deliver. WebDAV mirrors the whole work tree into the library (for a
         #    playlist that's the `<name>/` folder with its tracks + .m3u8); browser
         #    ZIPs the staged folder under a single top-level name.
         if destination.type == "webdav":
             reporter.on_phase("upload")
-            _upload_tree(destination, work_base)
+            upload_failed = _upload_tree(destination, work_base) or []
             return Result(summary=f"WebDAV: {webdav_label}", delivered=delivered,
                           new_track_count=len(delivered), playlist_files=manifest,
-                          playlist_name=pl_title)
+                          playlist_name=pl_title, expected_count=expected_count,
+                          failed_count=failed_count, upload_failed_count=len(upload_failed))
 
         reporter.on_phase("packaging")
         zip_path = _WORK_ROOT / f"{job_id}.zip"
         _zip_dir(stage_root, zip_path, root_name)
         return Result(summary=f"{root_name}.zip", zip_path=str(zip_path), zip_name=f"{root_name}.zip",
                       delivered=delivered, new_track_count=len(delivered), playlist_files=manifest,
-                      playlist_name=pl_title)
+                      playlist_name=pl_title, expected_count=expected_count, failed_count=failed_count)
     finally:
         # Only remove the work dir we created; a shared `stage_dir` is the caller's to clean.
         if stage_dir is None:
@@ -1519,6 +1606,8 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
 
         delivered_all: list = []
         new_count = 0
+        expected_all = 0   # tracks that should have downloaded across all releases
+        failed_all = 0     # tracks that never completed after retries (throttle/403)
         failed: list[str] = []
         done = 0
         reporter.on_phase("download")
@@ -1545,6 +1634,8 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
                     sub = fut.result()
                     delivered_all += sub.delivered
                     new_count += sub.new_track_count
+                    expected_all += sub.expected_count
+                    failed_all += sub.failed_count
                 except Exception:  # noqa: BLE001 - one bad release must not abort the whole run
                     log.exception("artist release failed: %s", album_name)
                     failed.append(album_name)
@@ -1576,9 +1667,11 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
         note = f" ({len(failed)} übersprungen)" if failed else ""
         if destination.type == "webdav":
             reporter.on_phase("upload")
-            _upload_tree(destination, work_base)
+            upload_failed = _upload_tree(destination, work_base) or []
             return Result(summary=f"WebDAV: {artist} — {new_count} Titel / {total} Releases{note}",
-                          delivered=delivered_all, new_track_count=new_count)
+                          delivered=delivered_all, new_track_count=new_count,
+                          expected_count=expected_all, failed_count=failed_all,
+                          upload_failed_count=len(upload_failed))
 
         reporter.on_phase("packaging")
         # Releases stage under a single `<Artist>/` dir; zip that so the archive root is the
@@ -1588,7 +1681,8 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
         zip_path = _WORK_ROOT / f"{job_id}.zip"
         _zip_dir(stage_root, zip_path, artist)
         return Result(summary=f"{artist}.zip{note}", zip_path=str(zip_path),
-                      zip_name=f"{artist}.zip", delivered=delivered_all, new_track_count=new_count)
+                      zip_name=f"{artist}.zip", delivered=delivered_all, new_track_count=new_count,
+                      expected_count=expected_all, failed_count=failed_all)
     finally:
         shutil.rmtree(work_base, ignore_errors=True)
         if cookie_path:
