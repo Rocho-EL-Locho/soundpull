@@ -39,6 +39,7 @@ from app.pipeline import (
     _safe_segment,
     _square_crop_jpeg,
     _strip_own_artist_prefix,
+    _strip_title_noise,
     _unify_album_year,
     _upload_with_retry,
     _write_cookie_file,
@@ -525,14 +526,36 @@ def test_repair_broken_title_parses_label_uploads():
     # … or a parenthetical (only a segment STARTING with a bracket counts as a version)
     assert R("BCee - Just One Second - Hospital Records (UK)", "BCee") == (
         "BCee", "Just One Second")
+    # a trailing producer credit is dropped so the recovered title equals the clean album track
+    # (else the single dupes the album track — issue #56)
+    assert R("HeXer - Es wird kälter (prod. by a3)", "HeXer") == ("HeXer", "Es wird kälter")
+    assert R("HeXer - Hextech (prod. a3)", "HeXer") == ("HeXer", "Hextech")
+    # an "x"/"×" collab prefix credits own_artist and is split like "&"
+    assert R("HeXer x AzudemSK - 341 (prod. a3)", "HeXer") == ("HeXer / AzudemSK", "341")
+    assert R("HeXer × Ronnie78 - Bierball Remix", "HeXer") == ("HeXer / Ronnie78", "Bierball Remix")
+
+
+def test_strip_title_noise():
+    # issue #56: trailing producer/video-name suffixes dropped so a single's title matches the album
+    N = _strip_title_noise
+    assert N("Es wird kälter (prod. by a3)") == "Es wird kälter"
+    assert N("Hextech (prod. a3)") == "Hextech"
+    assert N("Track [prod. X]") == "Track"
+    assert N("Song (produced by Y)") == "Song"
+    assert N("Beat (prod. a3) (Official Audio)") == "Beat"     # looped: strips both
+    assert N("Song (Live)") == "Song (Live)"                   # not a producer/video suffix
+    assert N("Northpoint (ft. Riya)") == "Northpoint (ft. Riya)"  # feat left for fix_music_tags
+    assert N("Reproduction") == "Reproduction"                 # "prod" mid-word, no bracket
 
 
 def test_strip_own_artist_prefix():
-    # issue #56: a credited self-upload titled "<Artist> - <Song>" loses only the artist prefix.
+    # issue #56: a credited self-upload titled "<Artist> - <Song>" loses the artist prefix and any
+    # trailing producer/video-name suffix (so it matches the clean album track and dedups).
     S = _strip_own_artist_prefix
     assert S("HeXer - Es wird kälter", "HeXer") == "Es wird kälter"
-    # everything after the prefix is kept verbatim (no label/suffix heuristics for a credited
-    # track — its own title is trustworthy), unlike _repair_broken_title
+    assert S("HeXer - Es wird kälter (prod. by a3)", "HeXer") == "Es wird kälter"  # prod dropped
+    assert S("HeXer x AzudemSK - 341 (prod. a3)", "HeXer") == "341"                # collab prefix
+    # a real internal " - " in the song title is kept (only trailing noise is stripped)
     assert S("BCee - Live at XOYO - Part 1", "BCee") == "Live at XOYO - Part 1"
     assert S("BCee & Lomax - Brazilian Wax", "BCee") == "Brazilian Wax"  # feat/co in prefix
     assert S("Colours", "BCee") is None                       # no " - " → nothing to strip
@@ -726,6 +749,44 @@ def test_dedup_staged_tracks_keeps_biggest_album(tmp_path):
         "BCee/These Are The Days/Lies.m4a"}
     assert not single.exists()                               # single copy removed
     assert not (tmp_path / "BCee" / "Colours").exists()      # emptied folder + cover removed
+
+
+def test_repaired_single_dedups_against_album_track(tmp_path):
+    # issue #56 (the reported bug): a raw self-upload single ("<Artist> - <Song> (prod. …)") is
+    # repaired to the clean song title, so it then dedups against the SAME recording already in a
+    # real album — instead of landing as a duplicate because the producer suffix broke the match.
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("ffmpeg not on PATH")
+    from mutagen import File as MutagenFile
+
+    def mk(folder, filename, title):
+        d = tmp_path / folder
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / filename
+        subprocess.run([ffmpeg, "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t",
+                        "0.1", "-metadata", f"title={title}", "-metadata", "artist=HeXer",
+                        "-c:a", "aac", str(p)], capture_output=True, check=True)
+        return p
+
+    # clean topic-channel album (2 tracks) + the raw self-upload single of the same recording
+    # (artist tag backfilled from the channel, so it looks credited)
+    mk("HeXer/Singlegrind", "Es wird kälter.m4a", "Es wird kälter")
+    mk("HeXer/Singlegrind", "Chorgesang.m4a", "Chorgesang")
+    mk("HeXer/single", "HeXer - Es wird kälter (prod. by a3).m4a",
+       "HeXer - Es wird kälter (prod. by a3)")
+
+    _repair_album_titles(tmp_path / "HeXer" / "single", "HeXer")
+    repaired = next((tmp_path / "HeXer" / "single").glob("*.m4a"))
+    assert MutagenFile(str(repaired), easy=True)["title"] == ["Es wird kälter"]  # now matches album
+
+    removed = _dedup_staged_tracks(tmp_path)
+
+    assert removed == 1                                          # the redundant single is dropped
+    assert not (tmp_path / "HeXer" / "single").exists()          # emptied folder removed
+    assert {str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*.m4a")} == {
+        "HeXer/Singlegrind/Es wird kälter.m4a",
+        "HeXer/Singlegrind/Chorgesang.m4a"}
 
 
 def test_dedup_staged_tracks_keeps_distinct_same_title_album_tracks(tmp_path):
