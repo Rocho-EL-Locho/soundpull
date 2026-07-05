@@ -4,11 +4,40 @@ from contextlib import contextmanager
 from sqlalchemy.exc import IntegrityError
 
 from app import jobs
-from app.jobs import _clean_error, _record_delivered_safe
+from app.jobs import (
+    _INDEX_WARNING_KEY, _PARTIAL_KEY, _clean_error, _delivery_warning, _record_delivered_safe,
+)
+from app.pipeline import Result
 
 
 def _integrity_error() -> IntegrityError:
     return IntegrityError("INSERT", {}, Exception("UNIQUE constraint failed"))
+
+
+def test_delivery_warning_clean_run_has_no_warning():
+    # Every expected track delivered and the index wrote → no note at all.
+    assert _delivery_warning(Result(expected_count=10, new_track_count=10)) == (None, 0, 0)
+
+
+def test_delivery_warning_index_failure_only():
+    # Full delivery but the server-index write failed → the stale-index note (#38).
+    key, total, failed = _delivery_warning(Result(new_track_count=10), index_ok=False)
+    assert (key, total, failed) == (_INDEX_WARNING_KEY, 0, 0)
+
+
+def test_delivery_warning_partial_outranks_index_and_carries_counts():
+    # Tracks silently dropped (throttle/403) is the important signal — it wins over the
+    # index note and reports "9 von 30" so a partial album is visible, not a silent success.
+    key, total, failed = _delivery_warning(
+        Result(expected_count=30, new_track_count=9, failed_count=21), index_ok=False)
+    assert (key, total, failed) == (_PARTIAL_KEY, 30, 21)
+
+
+def test_delivery_warning_counts_upload_failures_and_backfills_total():
+    # Files the WebDAV server rejected also count as failed; with no download-stage total the
+    # displayed total falls back to delivered + failed (8 + 2 = 10).
+    key, total, failed = _delivery_warning(Result(new_track_count=8, upload_failed_count=2))
+    assert (key, total, failed) == (_PARTIAL_KEY, 10, 2)
 
 
 def test_clean_error_strips_ansi_colour_codes():

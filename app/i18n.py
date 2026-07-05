@@ -97,6 +97,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
                                     "Sync erneut geladen werden.",
         "jobs.seed_failed": "Der Playlist-Index konnte nicht initialisiert werden – der "
                             "nächste Sync versucht es automatisch erneut.",
+        "jobs.partial_delivery": "Unvollständig: {failed} von {total} Titeln fehlen – von "
+                                 "YouTube gedrosselt oder geblockt. Bitte erneut herunterladen.",
         # history page
         "history.heading": "Verlauf",
         "history.empty": "Noch keine Downloads.",
@@ -298,6 +300,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         # job warnings (issue #38) — set as keys by the worker, resolved at render time
         "jobs.index_update_failed": "Upload succeeded, but updating the server index failed — "
                                     "these tracks may be downloaded again on the next sync.",
+        "jobs.partial_delivery": "Incomplete: {failed} of {total} tracks are missing — "
+                                 "throttled or blocked by YouTube. Please download again.",
         "jobs.seed_failed": "The playlist index could not be initialised — the next sync will "
                             "automatically try again.",
         # history page

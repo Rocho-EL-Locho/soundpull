@@ -100,6 +100,10 @@ class DownloadHistory(SQLModel, table=True):
     phase: str = "queued"  # queued | metadata | download | tags | upload | done | error
     current_track: int = 0
     total_tracks: int = 0
+    # Tracks that never completed after retries (throttle/403) + files the WebDAV server
+    # rejected — the size of a silent partial delivery. 0 on a clean run; a non-zero value
+    # pairs with the `jobs.partial_delivery` warning so the history shows "N von M" (#…).
+    failed_tracks: int = 0
     error: str | None = None
     # Non-fatal note on a completed job (issue #38): e.g. the WebDAV upload succeeded but the
     # server-index update failed, so those tracks may be re-downloaded on the next sync. The
