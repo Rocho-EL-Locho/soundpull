@@ -751,6 +751,40 @@ _VIDEO_NAME_SUFFIX = re.compile(
     r"music\s+video|lyric(?:s)?(?:\s+video)?|visuali[sz]er|audio|hd|hq|4k|"
     r"free\s+download|out\s+now|premiere)\s*[\)\]]\s*$", re.IGNORECASE)
 
+# Trailing producer credit a self-upload video name carries, e.g. "(prod. by a3)", "(prod. a3)",
+# "[produced by X]". Dropped when repairing so the recovered title equals the clean album-track
+# title — else the SAME recording arriving both as a single and inside an album fails to dedup
+# (`_dedup_staged_tracks`) on the mismatched titles and both land in the library (issue #56).
+_PRODUCER_SUFFIX = re.compile(
+    r"\s*[\(\[]\s*prod(?:\.|uced)?\b[^)\]]*[\)\]]\s*$", re.IGNORECASE)
+
+
+def _strip_title_noise(title: str) -> str:
+    """Drop trailing video-name and producer-credit suffixes from a recovered title (issue #56).
+
+    Looped so a title carrying more than one (``… (prod. a3) (Official Audio)``) is fully cleaned.
+    """
+    prev = None
+    out = (title or "").strip()
+    while out != prev:
+        prev = out
+        out = _PRODUCER_SUFFIX.sub("", _VIDEO_NAME_SUFFIX.sub("", out)).strip()
+    return out
+
+
+def _prefix_artists(prefix: str) -> list[str]:
+    """Individual artists in a ``<Artist> - `` video-name prefix (issue #56).
+
+    Normalises ``feat.``/``ft.`` AND an ``x``/``×`` collab separator (``HeXer x AzudemSK``) to the
+    ``&`` that `split_artists` splits on, so a collab prefix yields each name — letting `own_artist`
+    match one of them (and a repaired collab title lose the whole prefix). Done locally, NOT in the
+    frozen `split_artists`, so only artist-mode title repair sees the ``x`` rule.
+    """
+    norm = re.sub(r"\b(?:featuring|feat|ft)\b\.?", "&", prefix, flags=re.IGNORECASE)
+    norm = re.sub(r"\s+[x×]\s+", " & ", norm, flags=re.IGNORECASE)
+    return fix_music_tags.split_artists(norm)
+
+
 def _repair_broken_title(raw_title: str, own_artist: str) -> tuple[str, str] | None:
     """Parse a label-upload video name back into ``(artist, title)`` — issue #56.
 
@@ -780,10 +814,10 @@ def _repair_broken_title(raw_title: str, own_artist: str) -> tuple[str, str] | N
     if not target:
         return None
     prefix, _, rest = raw_title.partition(" - ")
-    # Split the prefix into individual credited artists (feat./ft. → separator) and require
-    # own_artist to be EXACTLY one of them — so "Wax" doesn't match the artist "Wax Tailor".
-    prefix_norm = re.sub(r"\b(?:featuring|feat|ft)\b\.?", "&", prefix, flags=re.IGNORECASE)
-    prefix_artists = fix_music_tags.split_artists(prefix_norm)
+    # Split the prefix into individual credited artists (feat./ft. and an "x"/"×" collab →
+    # separator) and require own_artist to be EXACTLY one of them — so "Wax" doesn't match the
+    # artist "Wax Tailor".
+    prefix_artists = _prefix_artists(prefix)
     if not any(_norm_name(a) == target for a in prefix_artists):
         return None
     segs = [s.strip() for s in rest.split(" - ") if s.strip()]
@@ -796,7 +830,7 @@ def _repair_broken_title(raw_title: str, own_artist: str) -> tuple[str, str] | N
     title = segs[0]
     for seg in segs[1:]:
         title += (" " if seg[:1] in "([" else " - ") + seg
-    title = _VIDEO_NAME_SUFFIX.sub("", title).strip()
+    title = _strip_title_noise(title)
     if not title:
         return None
     artist = " / ".join(prefix_artists) or prefix.strip()
@@ -809,20 +843,20 @@ def _strip_own_artist_prefix(title: str, own_artist: str) -> str | None:
     A self-upload on the artist's own channel is often named ``<Artist> - <Song>`` yet carries
     a real artist tag, so `_repair_broken_title` (which only touches uncredited uploads) leaves
     it alone — but the artist name is redundant in the TITLE; only the song belongs there.
-    When `title` starts with EXACTLY `own_artist` (a whole credited prefix name, so "Wax" won't
-    strip "Wax Tailor - …" — the same anchor `_repair_broken_title` uses), return the remaining
-    song title; else None. Everything after the artist prefix is kept verbatim — a credited
-    track's own title is trustworthy, so (unlike `_repair_broken_title`) no trailing-label or
-    video-name-suffix heuristics apply.
+    When `title` starts with EXACTLY `own_artist` (a whole credited prefix name — an "x"/"×"
+    collab counts, so "HeXer x AzudemSK - …" matches "HeXer"; but "Wax" won't strip
+    "Wax Tailor - …", the same anchor `_repair_broken_title` uses), return the song title with a
+    trailing video-name/producer suffix dropped (`_strip_title_noise`) so it equals the clean
+    album-track title and dedups; else None. No label-segment heuristic — a credited track's own
+    title beyond the artist prefix is otherwise trustworthy.
     """
     target = _norm_name(own_artist)
     if not target or " - " not in title:
         return None
     prefix, _, rest = title.partition(" - ")
-    prefix_norm = re.sub(r"\b(?:featuring|feat|ft)\b\.?", "&", prefix, flags=re.IGNORECASE)
-    if not any(_norm_name(a) == target for a in fix_music_tags.split_artists(prefix_norm)):
+    if not any(_norm_name(a) == target for a in _prefix_artists(prefix)):
         return None
-    return rest.strip() or None
+    return _strip_title_noise(rest) or None
 
 
 def _save_easy_tags(mf) -> None:
