@@ -38,6 +38,7 @@ from app.pipeline import (
     _repair_broken_title,
     _safe_segment,
     _square_crop_jpeg,
+    _strip_own_artist_prefix,
     _unify_album_year,
     _upload_with_retry,
     _write_cookie_file,
@@ -526,6 +527,22 @@ def test_repair_broken_title_parses_label_uploads():
         "BCee", "Just One Second")
 
 
+def test_strip_own_artist_prefix():
+    # issue #56: a credited self-upload titled "<Artist> - <Song>" loses only the artist prefix.
+    S = _strip_own_artist_prefix
+    assert S("HeXer - Es wird kälter", "HeXer") == "Es wird kälter"
+    # everything after the prefix is kept verbatim (no label/suffix heuristics for a credited
+    # track — its own title is trustworthy), unlike _repair_broken_title
+    assert S("BCee - Live at XOYO - Part 1", "BCee") == "Live at XOYO - Part 1"
+    assert S("BCee & Lomax - Brazilian Wax", "BCee") == "Brazilian Wax"  # feat/co in prefix
+    assert S("Colours", "BCee") is None                       # no " - " → nothing to strip
+    assert S("Es wird kälter", "HeXer") is None               # prefix isn't the artist
+    assert S("HeXer - ", "HeXer") is None                     # empty remainder
+    assert S("X", "") is None                                 # blank artist never strips
+    # exact-artist anchor: "Wax" must NOT strip the foreign "Wax Tailor - …"
+    assert S("Wax Tailor - Que Sera", "Wax") is None
+
+
 def test_match_filter_keeps_repairable_broken_upload():
     # issue #56: a broken upload with no artist tag but a name STARTING with the artist is KEPT
     # (repaired after download), while one that neither credits nor starts with it is dropped.
@@ -561,8 +578,24 @@ def test_match_filter_repaired_dedups_under_own_artist():
         own_artist="BCee")
     assert mf({"_type": "video", "artist": None,
                "title": "Lomax & BCee - Brazilian Wax - Spearhead Records"}) is not None
-    # a credited (clean) track is deduped on its RAW title, not a speculative repair of it
+    # a credited track with NO artist prefix is deduped on its raw title
     assert mf({"_type": "video", "artist": "BCee", "title": "Brazilian Wax"}) is not None
+
+
+def test_match_filter_dedups_credited_prefixed_title_on_stripped_key():
+    # issue #56: a credited self-upload titled "<Artist> - <Song>" is re-titled to the bare song
+    # after download, so dedup must match on that STRIPPED key — else the pre-download key
+    # ("hexer", "hexer - es wird kälter") and the indexed key ("hexer", "es wird kälter") diverge
+    # and every sync re-downloads it.
+    known = {("hexer", "es wird kälter")}
+    mf = _make_match_filter(
+        on_server=lambda a, t: (a.split("/")[0].strip().casefold(), t.casefold()) in known,
+        own_artist="HeXer")
+    assert mf({"_type": "video", "artist": "HeXer",
+               "title": "HeXer - Es wird kälter"}) is not None   # skipped: already on server
+    # a credited prefixed track NOT on the server still downloads (to be re-titled after)
+    assert mf({"_type": "video", "artist": "HeXer",
+               "title": "HeXer - Brandneuer Song"}) is None
 
 
 def test_repair_album_titles_rewrites_tags_and_renames(tmp_path):
@@ -584,7 +617,8 @@ def test_repair_album_titles_rewrites_tags_and_renames(tmp_path):
     mk("BCee & Lomax - Brazilian Wax - Spearhead Records")
     clean = mk("Colours")
     c = MutagenFile(str(clean), easy=True); c["artist"] = ["BCee"]; c.save()
-    # a CLEAN track whose title happens to look broken but has a real artist tag → left alone
+    # a credited self-upload titled "<Artist> - <Song>" keeps its artist tag but the redundant
+    # "BCee - " prefix is stripped from the TITLE (only the song belongs there)
     weird = mk("BCee - Live at XOYO - Part 1")
     w = MutagenFile(str(weird), easy=True); w["artist"] = ["BCee"]; w.save()
 
@@ -592,14 +626,15 @@ def test_repair_album_titles_rewrites_tags_and_renames(tmp_path):
 
     assert {p.name for p in tmp_path.iterdir()} == {
         "Little Bird.m4a", "Brazilian Wax.m4a", "Colours.m4a",
-        "BCee - Live at XOYO - Part 1.m4a"}
+        "Live at XOYO - Part 1.m4a"}
     tags = {p.name: MutagenFile(str(p), easy=True) for p in tmp_path.iterdir()}
     assert tags["Little Bird.m4a"]["title"] == ["Little Bird"]
     assert tags["Little Bird.m4a"]["artist"] == ["BCee"]
     assert tags["Brazilian Wax.m4a"]["artist"] == ["BCee / Lomax"]
-    assert tags["Colours.m4a"]["title"] == ["Colours"]        # clean track untouched
-    # credited track with a broken-looking title is NOT rewritten (its tags win)
-    assert tags["BCee - Live at XOYO - Part 1.m4a"]["title"] == ["BCee - Live at XOYO - Part 1"]
+    assert tags["Colours.m4a"]["title"] == ["Colours"]        # clean track (no prefix) untouched
+    # credited track with an "<Artist> - " title: prefix stripped from title, artist tag kept
+    assert tags["Live at XOYO - Part 1.m4a"]["title"] == ["Live at XOYO - Part 1"]
+    assert tags["Live at XOYO - Part 1.m4a"]["artist"] == ["BCee"]
 
 
 def test_repair_album_titles_never_clobbers_another_file(tmp_path):

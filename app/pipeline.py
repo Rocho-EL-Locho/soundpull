@@ -803,6 +803,28 @@ def _repair_broken_title(raw_title: str, own_artist: str) -> tuple[str, str] | N
     return artist, title
 
 
+def _strip_own_artist_prefix(title: str, own_artist: str) -> str | None:
+    """Strip a leading ``<own_artist> - `` from a CREDITED track's title (issue #56).
+
+    A self-upload on the artist's own channel is often named ``<Artist> - <Song>`` yet carries
+    a real artist tag, so `_repair_broken_title` (which only touches uncredited uploads) leaves
+    it alone — but the artist name is redundant in the TITLE; only the song belongs there.
+    When `title` starts with EXACTLY `own_artist` (a whole credited prefix name, so "Wax" won't
+    strip "Wax Tailor - …" — the same anchor `_repair_broken_title` uses), return the remaining
+    song title; else None. Everything after the artist prefix is kept verbatim — a credited
+    track's own title is trustworthy, so (unlike `_repair_broken_title`) no trailing-label or
+    video-name-suffix heuristics apply.
+    """
+    target = _norm_name(own_artist)
+    if not target or " - " not in title:
+        return None
+    prefix, _, rest = title.partition(" - ")
+    prefix_norm = re.sub(r"\b(?:featuring|feat|ft)\b\.?", "&", prefix, flags=re.IGNORECASE)
+    if not any(_norm_name(a) == target for a in fix_music_tags.split_artists(prefix_norm)):
+        return None
+    return rest.strip() or None
+
+
 def _save_easy_tags(mf) -> None:
     """Save an ``easy=True`` mutagen file, keeping MP3 on ID3v2.3.
 
@@ -825,8 +847,10 @@ def _repair_album_titles(album_dir: Path, own_artist: str) -> None:
     and whose title `_repair_broken_title` can recover, rewrite its title/artist tags and rename
     the file to the clean title, so `fix_music_tags` then normalises it like any clean track
     (feat cleanup, forced album_artist) and the delivered/indexed name is clean too. A track
-    already crediting `own_artist` is CLEAN — its tags are authoritative and left untouched (even
-    if its real title happens to look like `<Artist> - … - …`). Every original name is reserved
+    already crediting `own_artist` keeps its authoritative ARTIST tag, but a redundant
+    `<Artist> - ` prefix in its TITLE (a self-upload named `<Artist> - <Song>`) is stripped via
+    `_strip_own_artist_prefix` so the title holds only the song (the match_filter dedups the same
+    stripped key, so a sync doesn't re-download it). Every original name is reserved
     up front so a rename can never overwrite another file. Tag-write and rename are coupled and
     best-effort: if the tag write fails the file is NOT renamed (name and tags stay consistent —
     never a clean filename over a still-raw title tag). Runs BEFORE `process_directory`.
@@ -847,19 +871,26 @@ def _repair_album_titles(album_dir: Path, own_artist: str) -> None:
             continue
         cur_title = (mf.get("title") or [None])[0]
         cur_artist = (mf.get("artist") or [None])[0]
-        # A track already credited to own_artist is CLEAN — its tags are authoritative, never
-        # rewrite it (even if its real title happens to look like "<Artist> - … - …").
+        # A track already credited to own_artist keeps its authoritative ARTIST tag — but a
+        # redundant "<Artist> - " prefix in the TITLE (a self-upload named "<Artist> - <Song>")
+        # is still stripped, so the title holds only the song. An uncredited upload is fully
+        # repaired (title + artist) from its video name instead.
         if _credits_artist({"artist": cur_artist or ""}, own_artist):
-            continue
-        repaired = _repair_broken_title(cur_title or path.stem, own_artist)
-        if repaired is None:
-            continue
-        new_artist, new_title = repaired
+            stripped = _strip_own_artist_prefix(cur_title or "", own_artist)
+            if stripped is None:
+                continue
+            new_artist, new_title = cur_artist, stripped
+        else:
+            repaired = _repair_broken_title(cur_title or path.stem, own_artist)
+            if repaired is None:
+                continue
+            new_artist, new_title = repaired
         try:
             if mf.tags is None:
                 mf.add_tags()
             mf["title"] = [new_title]
-            mf["artist"] = [new_artist]
+            if new_artist:
+                mf["artist"] = [new_artist]
             _save_easy_tags(mf)
         except Exception:  # noqa: BLE001 - tag write failed → skip rename too, so name and
             continue        # tags stay consistent (never a clean name over a raw title tag)
@@ -1014,7 +1045,15 @@ def _make_match_filter(on_server: Callable[[str, str], bool] | None = None,
         # Dedup on the key the track will actually be INDEXED under: a repaired upload is filed
         # under own_artist + its recovered title (so a clean copy already on the server skips,
         # and the pre/post-download keys agree — issue #56); a normal track uses its raw meta.
-        d_artist, d_title = (own_artist, repaired[1]) if repaired else (artist, title)
+        if repaired:
+            d_artist, d_title = own_artist, repaired[1]
+        else:
+            d_artist, d_title = artist, title
+            # A credited self-upload titled "<Artist> - <Song>" is re-titled to the bare song
+            # after download (`_repair_album_titles`), so dedup on that stripped key too — else
+            # the pre/post-download keys diverge and every sync re-downloads it (issue #56).
+            if own_artist:
+                d_title = _strip_own_artist_prefix(title, own_artist) or d_title
         if on_server is not None and d_title and on_server(d_artist, d_title):
             if on_skip is not None:
                 on_skip(info_dict.get("playlist_index"), d_artist, d_title)
