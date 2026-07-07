@@ -1641,7 +1641,14 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
         artist, releases = enumerate_artist(
             url, cookiefile=str(cookie_path) if cookie_path else None, limit=max_items)
         if not releases:
-            raise RuntimeError("Keine Releases gefunden — ist das eine YouTube-Music-Künstlerseite?")
+            # No `/releases` tab / no album playlists. The usual cause is an auto-generated
+            # "… - Topic" channel (or a plain uploads channel), which only exposes a flat list
+            # of tracks — there are no albums to enumerate. Point the user at a URL that works.
+            raise RuntimeError(
+                "Keine Alben gefunden. Diese Seite hat keine Album-Releases zum Herunterladen "
+                "— meist ein automatisch erzeugter „… - Topic\"-Kanal ohne Releases-Tab. "
+                "Bitte die offizielle Künstlerseite (mit Alben) verwenden, oder direkt eine "
+                "Album- bzw. Playlist-URL einfügen.")
         reporter.on_meta(artist, "")
 
         # Skip third-party compilation / "appears-on" / label uploads (issue #56): the

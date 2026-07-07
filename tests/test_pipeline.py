@@ -1295,7 +1295,8 @@ def test_run_artist_download_raises_when_no_releases(monkeypatch, tmp_path):
     monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
     monkeypatch.setattr(pipeline, "enumerate_artist",
                         lambda url, cookiefile=None, limit=0: ("Artist", []))
-    with pytest.raises(RuntimeError):
+    # The message must explain WHY (no album releases), not just "not an artist page".
+    with pytest.raises(RuntimeError, match="Album"):
         run_artist_download(job_id="j3", url="u", genre="Rap",
                             destination=Destination(type="browser"), reporter=Reporter())
 
