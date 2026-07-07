@@ -20,7 +20,7 @@ dependencies = [
     # yt-dlp's), needed to solve YouTube's JS signature/n challenges. That needs
     # a JS runtime too — the Docker image ships a Deno binary (see Dockerfile).
     # Parity is unaffected: yt-dlp itself stays pinned, only companion deps change.
-    "yt-dlp[default]==2026.6.9",
+    "yt-dlp[default]==2026.7.4",
     # PO-token plugin: yt-dlp auto-discovers it via the yt_dlp_plugins namespace.
     # It fetches GVS PO tokens (YouTube 403 fix) from a bgutil-ytdlp-pot-provider
     # server (docker-compose sidecar). Pin to match the provider image tag; the
