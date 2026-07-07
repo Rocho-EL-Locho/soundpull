@@ -200,18 +200,19 @@ def _make_artist_reporter(job_id: str, js: JobState) -> Reporter:
 
 def _run_artist(job_id: str, url: str, genre: str, destination: Destination,
                 audio_format: str, tag_options: TagOptions, cookies_txt: str | None,
-                fetch_lyrics: bool = False) -> None:
+                dedup: bool = True, fetch_lyrics: bool = False) -> None:
     js = _registry[job_id]
     reporter = _make_artist_reporter(job_id, js)
 
     try:
-        # Artist runs ALWAYS reconcile against the server on WebDAV (auto-dedup, issue #31): a
-        # re-download of a big discography then only pulls tracks not already in the library,
-        # instead of re-processing all N releases. No per-download toggle — a browser ZIP still
-        # has no library to dedup against, so it stays a plain full download. `existing_ref` is
-        # playlist-only (m3u cross-refs), so it is unused here (albums write no m3u).
+        # Artist runs default to reconciling against the server on WebDAV (auto-dedup, issue
+        # #31): a re-download of a big discography then only pulls tracks not already in the
+        # library, instead of re-processing all N releases. The per-download `dedup` toggle can
+        # turn this off to force a full re-download. A browser ZIP has no library to dedup
+        # against, so it stays a plain full download regardless. `existing_ref` is playlist-only
+        # (m3u cross-refs), so it is unused here (albums write no m3u).
         on_server = None
-        if destination.type == "webdav":
+        if dedup and destination.type == "webdav":
             with session_scope() as session:
                 paths = library_index.load_index_paths(session, js.user_id)
             on_server = lambda a, t: library_index.track_key(t, a) in paths  # noqa: E731
@@ -343,10 +344,11 @@ def start_job(*, user_id: int, url: str, genre: str, mode: str, destination_type
     with _lock:
         _registry[job_id] = js
     if mode == "artist":
-        # An artist run (issue #32) fans out into N album downloads under one job; it always
-        # auto-dedups on WebDAV, so the per-download `dedup` toggle isn't forwarded.
+        # An artist run (issue #32) fans out into N album downloads under one job. It defaults
+        # to auto-dedup on WebDAV (skip tracks already in the library) but honours the
+        # per-download `dedup` toggle, so the user can force a full re-download.
         _executor.submit(_run_artist, job_id, url, genre, destination, audio_format,
-                         tag_options, cookies_txt, fetch_lyrics)
+                         tag_options, cookies_txt, dedup, fetch_lyrics)
     else:
         _executor.submit(_run, job_id, url, genre, mode, destination, audio_format,
                          tag_options, cookies_txt, dedup, fetch_lyrics)
