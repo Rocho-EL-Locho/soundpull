@@ -74,6 +74,26 @@ def split_artists(feat_string: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
+# Ein feat./ft./featuring-Marker DIREKT im Artist-Tag (nicht im Titel), z.B.
+# "A feat. B & C". Nur der feat-Marker trennt Primär- von Feature-Künstlern —
+# absichtlich NICHT '&'/' x '/' und ', denn die sind auch in echten Bandnamen
+# gebräuchlich ("Simon & Garfunkel", "Earth, Wind & Fire", "Malcolm X").
+_ARTIST_FEAT_RE = re.compile(r'\s+(?:feat\.?|ft\.?|featuring)\s+', re.IGNORECASE)
+
+
+def _split_artist_feat(artist: str) -> tuple[str, list[str]]:
+    """Trennt einen Artist-Tag an einem eingebetteten feat.-Marker.
+
+    "A feat. B & C" → ("A", ["B", "C"]). Ohne Marker → (artist, []). '&'/','/'und'
+    werden NUR im Feature-Teil aufgesplittet (via `split_artists`), damit ein echter
+    Bandname im Primärteil erhalten bleibt.
+    """
+    m = _ARTIST_FEAT_RE.search(artist)
+    if not m:
+        return artist, []
+    return artist[:m.start()].strip(), split_artists(artist[m.end():])
+
+
 def parse_featured_artists(title: str, artist: str) -> tuple[str, str, str]:
     """
     Extrahiert Featured Artists aus dem Titel und normalisiert den Artist-Tag.
@@ -99,29 +119,39 @@ def parse_featured_artists(title: str, artist: str) -> tuple[str, str, str]:
             clean_title = re.sub(pattern, '', clean_title, flags=re.IGNORECASE).strip()
             break
 
-    if not featured_from_title:
-        # Kein feat. im Titel → nur Komma-Trennung normalisieren falls vorhanden
+    # Ein feat.-Marker kann auch DIREKT im Artist-Tag stehen (z.B. "A feat. B"), nicht
+    # nur im Titel. Den normalisieren wir ebenfalls zu " / ". Für einen reinen Komma-Tag
+    # ("A, B") ist `artist_primary == artist` und `featured_from_artist == []`, also bleibt
+    # der eingefrorene Pfad unten unverändert.
+    artist_primary, featured_from_artist = _split_artist_feat(artist)
+
+    if not featured_from_title and not featured_from_artist:
+        # Kein feat. (weder im Titel noch im Artist-Tag) → nur Komma-Trennung normalisieren
         if ", " in artist:
             parts = [a.strip() for a in artist.split(", ")]
             return title, " / ".join(parts), parts[0]
         return title, artist, artist
 
-    # yt-dlp schreibt Artist-Tag oft als "Primär, Feat1, Feat2" (komma-separiert).
-    # Wir extrahieren den Primärkünstler als den Teil VOR dem ersten ", Feat-Artist".
-    # Strategie: Entferne alle bekannten Featured Artists aus dem Artist-Tag
-    # um den Primärkünstler zu isolieren.
-    artist_parts = [a.strip() for a in artist.split(", ")]
+    # yt-dlp schreibt Artist-Tag oft als "Primär, Feat1, Feat2" (komma-separiert) ODER
+    # "Primär feat. Feat1 & Feat2". Feat-Marker ist bereits abgetrennt (`artist_primary`),
+    # bleibt die Komma-Liste. Primärkünstler = Teile, die NICHT featured sind.
+    artist_parts = [a.strip() for a in artist_primary.split(", ")]
 
-    # Normalisiere Featured Artists (lowercase für Vergleich)
-    feat_lower = {f.lower() for f in featured_from_title}
+    # Featured aus Titel UND Artist-Tag zusammenführen (Reihenfolge erhalten, ci-dedupe),
+    # sonst landet ein doppelt genannter Feature-Artist zweimal im Tag ("A / B / B").
+    featured = list(featured_from_title)
+    seen = {f.lower() for f in featured}
+    for f in featured_from_artist:
+        if f.lower() not in seen:
+            seen.add(f.lower())
+            featured.append(f)
 
-    # Primärkünstler = alle Teile die NICHT in den Featured Artists sind
+    feat_lower = {f.lower() for f in featured}
     primary_parts = [p for p in artist_parts if p.lower() not in feat_lower]
     primary_artist = ", ".join(primary_parts) if primary_parts else artist_parts[0]
 
     # Finaler Artist-Tag: Primärkünstler / Feat1 / Feat2
-    all_artists = [primary_artist] + featured_from_title
-    new_artist = " / ".join(all_artists)
+    new_artist = " / ".join([primary_artist] + featured)
 
     return clean_title, new_artist, primary_artist
 
