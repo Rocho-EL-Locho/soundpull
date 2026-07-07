@@ -117,8 +117,8 @@ def _arm_artist_job(monkeypatch, dest_type):
 
 
 def test_run_artist_auto_dedups_on_webdav(monkeypatch):
-    # Artist runs on WebDAV ALWAYS build the on_server closure (no per-download toggle), and the
-    # album pool is clamped to the 1–4 range regardless of the env value.
+    # Artist runs on WebDAV default to building the on_server closure (dedup defaults on), and
+    # the album pool is clamped to the 1–4 range regardless of the env value.
     from app.fix_music_tags import TagOptions
     from app.pipeline import Result
 
@@ -150,5 +150,22 @@ def test_run_artist_no_dedup_for_browser(monkeypatch):
 
     jobs._run_artist("art1", "u", "Rap", jobs.Destination(type="browser"),
                      "mp3_320", TagOptions(), None)
+
+    assert captured["on_server"] is None
+
+
+def test_run_artist_dedup_off_skips_reconcile_on_webdav(monkeypatch):
+    # The per-download toggle can turn dedup OFF even on WebDAV → on_server stays None so the
+    # whole discography is re-downloaded instead of skipping existing tracks.
+    from app.fix_music_tags import TagOptions
+    from app.pipeline import Result
+
+    _arm_artist_job(monkeypatch, "webdav")
+    captured = {}
+    monkeypatch.setattr(jobs, "run_artist_download",
+                        lambda **kw: captured.update(kw) or Result(summary="ok"))
+
+    jobs._run_artist("art1", "u", "Rap", jobs.Destination(type="webdav"),
+                     "mp3_320", TagOptions(), None, dedup=False)
 
     assert captured["on_server"] is None
