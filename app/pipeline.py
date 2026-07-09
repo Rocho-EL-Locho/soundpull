@@ -352,6 +352,22 @@ def _apply_pot_provider(opts: dict) -> None:
     opts.setdefault("extractor_args", {})["youtubepot-bgutilhttp"] = {"base_url": [base_url]}
 
 
+def _apply_socket_timeout(opts: dict) -> None:
+    """Cap yt-dlp's per-socket wait so a stalled connection can't hang a worker forever (issue #40).
+
+    yt-dlp defaults `socket_timeout` to None → a half-open / stalled TCP read blocks the worker
+    thread indefinitely (with the default 2-worker pool, one stuck job halves throughput for
+    everyone). Setting it makes a stall raise a socket timeout, which yt-dlp's own
+    `retries`/`fragment_retries` recover from on a multi-track download (and `_download_with_retries`
+    re-attempts whatever is still missing). It is a per-socket-operation deadline, not a
+    whole-download one, so a slow-but-progressing large file keeps resetting it and isn't aborted.
+    Timing-only → never touches the frozen flag lists or tag chain (parity-safe). 0/negative leaves
+    yt-dlp's default (no timeout). Applied next to the cookie/PO-token policy at every yt-dlp call."""
+    timeout = settings.download_socket_timeout_seconds
+    if timeout and timeout > 0:
+        opts["socket_timeout"] = timeout
+
+
 def _primary_artist(raw: str | None) -> str:
     """Main artist = part before the first ', ' (mirrors `sed 's/, .*//'`)."""
     if not raw or raw == "NA":
@@ -370,6 +386,7 @@ def _probe_meta(url: str, is_album: bool, cookiefile: str | None = None) -> tupl
     }
     _apply_cookie_policy(opts, cookiefile)
     _apply_pot_provider(opts)
+    _apply_socket_timeout(opts)
     if is_album:
         opts["playlist_items"] = "1"
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -404,6 +421,7 @@ def _probe_playlist(url: str, cookiefile: str | None = None) -> tuple[str, str, 
     }
     _apply_cookie_policy(opts, cookiefile)
     _apply_pot_provider(opts)
+    _apply_socket_timeout(opts)
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False) or {}
     title = info.get("title") or "Playlist"
@@ -435,6 +453,7 @@ def enumerate_playlist_tracks(url: str, cookiefile: str | None = None,
     }
     _apply_cookie_policy(opts, cookiefile)
     _apply_pot_provider(opts)
+    _apply_socket_timeout(opts)
     if limit and limit > 0:
         opts["playlistend"] = limit
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -475,6 +494,7 @@ def enumerate_artist(url: str, cookiefile: str | None = None,
     }
     _apply_cookie_policy(opts, cookiefile)
     _apply_pot_provider(opts)
+    _apply_socket_timeout(opts)
 
     releases_url = url if url.rstrip("/").endswith("/releases") else None
     if releases_url is None:
@@ -559,6 +579,7 @@ def _fetch_cover(url: str, is_album: bool, dest: Path, cookiefile: str | None = 
     opts = {"quiet": True, "no_warnings": True, "skip_download": True, "logger": _QuietLogger()}
     _apply_cookie_policy(opts, cookiefile)
     _apply_pot_provider(opts)
+    _apply_socket_timeout(opts)
     if is_album:
         opts["extract_flat"] = True  # playlist-level thumbnails (the album art)
     try:
@@ -1127,14 +1148,16 @@ def _zip_dir(src_dir: Path, zip_path: Path, root_name: str) -> None:
                 zf.write(path, f"{root_name}/{path.relative_to(src_dir).as_posix()}")
 
 
-_UPLOAD_ATTEMPTS = 3
+_UPLOAD_ATTEMPTS = 4
+_UPLOAD_BACKOFF_BASE = 2.0  # seconds; exponential waits between attempts: 2, 4, 8
 
 
 def _upload_with_retry(client, local: str, remote: str) -> None:
     """Upload one file, retrying TRANSIENT network failures (timeout / transport error).
 
     A single slow or dropped PUT during a big artist upload must not abort the whole job (which
-    would discard every already-downloaded album); retry a few times with linear backoff. A
+    would discard every already-downloaded album); retry a few times with bounded EXPONENTIAL
+    backoff (issue #40) so a longer server hiccup gets progressively more time to clear. A
     non-transient error (bad path, auth, 4xx) is not retried — it re-raises immediately.
     """
     for attempt in range(1, _UPLOAD_ATTEMPTS + 1):
@@ -1144,9 +1167,10 @@ def _upload_with_retry(client, local: str, remote: str) -> None:
         except httpx.TransportError as exc:  # timeout / connect / read / write / network
             if attempt == _UPLOAD_ATTEMPTS:
                 raise
-            log.warning("WebDAV upload %r failed (attempt %d/%d): %s — retrying",
-                        remote, attempt, _UPLOAD_ATTEMPTS, exc)
-            time.sleep(2.0 * attempt)
+            delay = _UPLOAD_BACKOFF_BASE * 2 ** (attempt - 1)  # exponential: 2, 4, 8 …
+            log.warning("WebDAV upload %r failed (attempt %d/%d): %s — retrying in %.0fs",
+                        remote, attempt, _UPLOAD_ATTEMPTS, exc, delay)
+            time.sleep(delay)
 
 
 def _upload_tree(dest: Destination, local_root: Path) -> list[str]:
@@ -1382,6 +1406,7 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
         opts.update({"quiet": True, "no_warnings": True, "noprogress": True, "logger": _QuietLogger()})
         _apply_cookie_policy(opts, cookiefile)
         _apply_pot_provider(opts)
+        _apply_socket_timeout(opts)
         if is_playlist and settings.max_playlist_items > 0:
             opts["playlistend"] = settings.max_playlist_items  # cap runaway playlists
         if is_playlist or own_artist:
