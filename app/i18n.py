@@ -225,6 +225,48 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "subs.notify_created": "Abo angelegt",
         "subs.notify_deleted": "Abo gelöscht",
         "subs.notify_sync_started": "Synchronisierung gestartet",
+        # Benachrichtigungen (issue #42) — Meldungsinhalte (off-request via translate())
+        "notify.new_tracks_title": "Soundpull",
+        "notify.new_tracks_body": "{playlist}: {count} neue Titel",
+        "notify.error_title": "Soundpull: Job fehlgeschlagen",
+        "notify.error_body": "{kind} fehlgeschlagen: {error}",
+        "notify.kind_sync": "Playlist-Sync",
+        "notify.kind_download": "Download",
+        "notify.test_title": "Soundpull: Test",
+        "notify.test_body": "Testbenachrichtigung — deine Einstellungen funktionieren. 🎵",
+        # Benachrichtigungen (issue #42) — Einstellungen
+        "notify.heading": "Benachrichtigungen",
+        "notify.desc": "Optional bei Hintergrund-Ereignissen benachrichtigen lassen. Wähle die "
+                       "Ereignisse und mindestens einen Kanal (ntfy, Webhook oder E-Mail). "
+                       "Keine Passwörter oder Tokens werden im Inhalt mitgesendet.",
+        "notify.event_new_tracks": "Neue Titel bei Playlist-Sync",
+        "notify.event_sync_error": "Fehlgeschlagener Playlist-Sync",
+        "notify.event_download_error": "Fehlgeschlagener Download",
+        "notify.ntfy_heading": "ntfy (Push)",
+        "notify.ntfy_url_label": "ntfy-Topic-URL (z. B. https://ntfy.sh/mein-topic)",
+        "notify.ntfy_token_label": "Zugriffstoken (optional)",
+        "notify.ntfy_token_placeholder_set": "•••••••• (gesetzt — leer lassen zum Behalten)",
+        "notify.ntfy_token_clear": "Gespeichertes Token entfernen",
+        "notify.webhook_heading": "Webhook",
+        "notify.webhook_url_label": "Webhook-URL (JSON-POST)",
+        "notify.email_heading": "E-Mail (SMTP)",
+        "notify.email_to_label": "Empfänger (An)",
+        "notify.email_from_label": "Absender (Von)",
+        "notify.smtp_host_label": "SMTP-Server",
+        "notify.smtp_port_label": "Port",
+        "notify.smtp_user_label": "SMTP-Benutzer",
+        "notify.smtp_password_label": "SMTP-Passwort",
+        "notify.smtp_password_placeholder_set": "•••••••• (gesetzt — leer lassen zum Behalten)",
+        "notify.smtp_password_clear": "Gespeichertes SMTP-Passwort entfernen",
+        "notify.security_label": "Verschlüsselung",
+        "notify.security_starttls": "STARTTLS",
+        "notify.security_ssl": "SSL/TLS",
+        "notify.security_none": "Keine",
+        "notify.test_button": "Test senden",
+        "notify.test_running": "Testbenachrichtigung wird gesendet …",
+        "notify.test_sent": "Testbenachrichtigung gesendet an: {channels}",
+        "notify.test_none": "Kein Kanal konfiguriert — bitte zuerst speichern.",
+        "notify.test_error": "Test fehlgeschlagen: {error}",
     },
     "en": {
         # nav / app shell
@@ -428,6 +470,48 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "subs.notify_created": "Subscription created",
         "subs.notify_deleted": "Subscription deleted",
         "subs.notify_sync_started": "Sync started",
+        # Notifications (issue #42) — message content (off-request via translate())
+        "notify.new_tracks_title": "Soundpull",
+        "notify.new_tracks_body": "{playlist}: {count} new tracks",
+        "notify.error_title": "Soundpull: job failed",
+        "notify.error_body": "{kind} failed: {error}",
+        "notify.kind_sync": "Playlist sync",
+        "notify.kind_download": "Download",
+        "notify.test_title": "Soundpull: test",
+        "notify.test_body": "Test notification — your settings work. 🎵",
+        # Notifications (issue #42) — settings
+        "notify.heading": "Notifications",
+        "notify.desc": "Optionally get notified about background events. Pick the events and at "
+                       "least one channel (ntfy, webhook or e-mail). No passwords or tokens are "
+                       "ever included in the payload.",
+        "notify.event_new_tracks": "New tracks on playlist sync",
+        "notify.event_sync_error": "Failed playlist sync",
+        "notify.event_download_error": "Failed download",
+        "notify.ntfy_heading": "ntfy (push)",
+        "notify.ntfy_url_label": "ntfy topic URL (e.g. https://ntfy.sh/my-topic)",
+        "notify.ntfy_token_label": "Access token (optional)",
+        "notify.ntfy_token_placeholder_set": "•••••••• (set — leave empty to keep)",
+        "notify.ntfy_token_clear": "Remove stored token",
+        "notify.webhook_heading": "Webhook",
+        "notify.webhook_url_label": "Webhook URL (JSON POST)",
+        "notify.email_heading": "E-mail (SMTP)",
+        "notify.email_to_label": "Recipient (To)",
+        "notify.email_from_label": "Sender (From)",
+        "notify.smtp_host_label": "SMTP server",
+        "notify.smtp_port_label": "Port",
+        "notify.smtp_user_label": "SMTP username",
+        "notify.smtp_password_label": "SMTP password",
+        "notify.smtp_password_placeholder_set": "•••••••• (set — leave empty to keep)",
+        "notify.smtp_password_clear": "Remove stored SMTP password",
+        "notify.security_label": "Encryption",
+        "notify.security_starttls": "STARTTLS",
+        "notify.security_ssl": "SSL/TLS",
+        "notify.security_none": "None",
+        "notify.test_button": "Send test",
+        "notify.test_running": "Sending test notification …",
+        "notify.test_sent": "Test notification sent to: {channels}",
+        "notify.test_none": "No channel configured — please save first.",
+        "notify.test_error": "Test failed: {error}",
     },
 }
 
@@ -445,6 +529,25 @@ def current_language() -> str:
     return lang if lang in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
 
 
+def translate(lang: str, key: str, /, **fmt: object) -> str:
+    """Translate `key` for an EXPLICIT language.
+
+    Same fallback/format behaviour as `t()`, but the language is passed in rather
+    than read from the session. Used off-request (e.g. the notification worker in
+    `app.notifications`, issue #42), where there is no session to read the active
+    language from — so notification strings still live in this catalog.
+    """
+    lang = lang if lang in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
+    table = TRANSLATIONS.get(lang) or {}
+    text = table.get(key) or TRANSLATIONS[DEFAULT_LANGUAGE].get(key) or key
+    if not fmt:
+        return text
+    try:
+        return text.format(**fmt)
+    except (KeyError, IndexError):
+        return text
+
+
 def t(key: str, /, **fmt: object) -> str:
     """Translate `key` for the active language.
 
@@ -453,14 +556,7 @@ def t(key: str, /, **fmt: object) -> str:
     A translation that references a slot the caller didn't supply degrades to
     the unformatted template rather than raising and crashing the page.
     """
-    table = TRANSLATIONS.get(current_language()) or {}
-    text = table.get(key) or TRANSLATIONS[DEFAULT_LANGUAGE].get(key) or key
-    if not fmt:
-        return text
-    try:
-        return text.format(**fmt)
-    except (KeyError, IndexError):
-        return text
+    return translate(current_language(), key, **fmt)
 
 
 def audio_format_labels() -> dict[str, str]:
