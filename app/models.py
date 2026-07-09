@@ -71,6 +71,26 @@ class UserSettings(SQLModel, table=True):
     # exposed in plaintext to the client.
     youtube_cookies_enc: str | None = None
 
+    # Notifications (issue #42): per-user push/webhook/e-mail alerts for background
+    # events. All opt-in (default off), fanned out to whatever channels are configured.
+    # Event toggles — chosen independently so the user controls exactly which events fire.
+    notify_new_tracks: bool = False       # an interval-sync found new tracks
+    notify_sync_error: bool = False       # a background interval-sync failed
+    notify_download_error: bool = False   # a manual/artist download failed
+    # ntfy push (simple HTTP POST to a topic URL; no SMTP needed).
+    notify_ntfy_url: str | None = None            # e.g. https://ntfy.sh/my-topic
+    notify_ntfy_token_enc: str | None = None      # optional Bearer token; Fernet-encrypted
+    # Generic webhook (JSON POST) — keeps integrations flexible.
+    notify_webhook_url: str | None = None
+    # E-mail via SMTP (stdlib smtplib; no extra dependency).
+    notify_email_to: str | None = None
+    notify_smtp_host: str | None = None
+    notify_smtp_port: int = 587
+    notify_smtp_user: str | None = None
+    notify_smtp_password_enc: str | None = None   # Fernet-encrypted
+    notify_smtp_from: str | None = None
+    notify_smtp_security: str = "starttls"        # "starttls" | "ssl" | "none"
+
     updated_at: datetime = Field(default_factory=_utcnow)
 
     user: User = Relationship(back_populates="settings")
@@ -82,6 +102,14 @@ class UserSettings(SQLModel, table=True):
     @property
     def has_youtube_cookies(self) -> bool:
         return bool(self.youtube_cookies_enc)
+
+    @property
+    def has_ntfy_token(self) -> bool:
+        return bool(self.notify_ntfy_token_enc)
+
+    @property
+    def has_smtp_password(self) -> bool:
+        return bool(self.notify_smtp_password_enc)
 
 
 class DownloadHistory(SQLModel, table=True):

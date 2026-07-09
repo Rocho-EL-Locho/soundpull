@@ -82,6 +82,11 @@ class Settings(BaseSettings):
     # Empty = no restriction (any host the server can reach is allowed).
     webdav_allowed_hosts: str = ""
 
+    # Optional SSRF guard for notification targets (ntfy / webhook URLs, issue #42).
+    # Comma-separated host allowlist; empty = no restriction. Same trust model as WebDAV:
+    # each user configures their own notification endpoint.
+    notify_allowed_hosts: str = ""
+
     @property
     def oidc_configured(self) -> bool:
         return bool(self.oidc_discovery_url and self.oidc_client_id and self.oidc_client_secret)
@@ -99,6 +104,10 @@ class Settings(BaseSettings):
     @property
     def webdav_host_allowlist(self) -> set[str]:
         return {h.strip().lower() for h in self.webdav_allowed_hosts.split(",") if h.strip()}
+
+    @property
+    def notify_host_allowlist(self) -> set[str]:
+        return {h.strip().lower() for h in self.notify_allowed_hosts.split(",") if h.strip()}
 
 
 settings = Settings()

@@ -44,6 +44,21 @@ def settings_content() -> None:
             "lyrics": bool(us.fetch_synced_lyrics),
             # Only the "is one stored?" flag — never the plaintext cookie (issue #9).
             "has_cookie": us.has_youtube_cookies,
+            # Notifications (issue #42): toggles + channel config. Secrets are exposed
+            # only as "is one stored?" flags (has_ntfy_token / has_smtp_password).
+            "n_new_tracks": bool(us.notify_new_tracks),
+            "n_sync_error": bool(us.notify_sync_error),
+            "n_dl_error": bool(us.notify_download_error),
+            "n_ntfy_url": us.notify_ntfy_url or "",
+            "n_has_token": us.has_ntfy_token,
+            "n_webhook_url": us.notify_webhook_url or "",
+            "n_email_to": us.notify_email_to or "",
+            "n_email_from": us.notify_smtp_from or "",
+            "n_smtp_host": us.notify_smtp_host or "",
+            "n_smtp_port": int(us.notify_smtp_port or 587),
+            "n_smtp_user": us.notify_smtp_user or "",
+            "n_has_smtp_pw": us.has_smtp_password,
+            "n_security": us.notify_smtp_security or "starttls",
         }
 
     with ui.card().classes("glass w-full rounded-2xl p-6 gap-4"):
@@ -87,6 +102,92 @@ def settings_content() -> None:
             .props("dark").classes("text-sm")
         if not snap["has_cookie"]:
             cookie_clear.set_visibility(False)  # nothing to remove yet
+
+    # Notifications (issue #42): push/webhook/e-mail alerts for background events.
+    # Defined before the WebDAV card so the shared save() closure below persists them;
+    # secrets (ntfy token / SMTP password) follow the same clear/keep logic as the cookie.
+    with ui.card().classes("glass w-full rounded-2xl p-6 gap-3"):
+        ui.label(t("notify.heading")).classes("text-lg font-semibold")
+        ui.label(t("notify.desc")).classes("text-xs text-white/50")
+        n_new_sw = ui.switch(t("notify.event_new_tracks"), value=snap["n_new_tracks"]) \
+            .props("dark").classes("text-sm")
+        n_syncerr_sw = ui.switch(t("notify.event_sync_error"), value=snap["n_sync_error"]) \
+            .props("dark").classes("text-sm")
+        n_dlerr_sw = ui.switch(t("notify.event_download_error"), value=snap["n_dl_error"]) \
+            .props("dark").classes("text-sm")
+
+        ui.label(t("notify.ntfy_heading")).classes("text-sm font-semibold mt-2 text-white/80")
+        n_ntfy_url = ui.input(t("notify.ntfy_url_label"), value=snap["n_ntfy_url"]) \
+            .props("outlined dense dark").classes("w-full")
+        token_ph = t("notify.ntfy_token_placeholder_set") if snap["n_has_token"] \
+            else t("notify.ntfy_token_label")
+        n_ntfy_token = ui.input(t("notify.ntfy_token_label"), password=True,
+                                placeholder=token_ph) \
+            .props("outlined dense dark autocomplete=new-password").classes("w-full")
+        n_token_clear = ui.switch(t("notify.ntfy_token_clear"), value=False) \
+            .props("dark").classes("text-sm")
+        if not snap["n_has_token"]:
+            n_token_clear.set_visibility(False)
+
+        ui.label(t("notify.webhook_heading")).classes("text-sm font-semibold mt-2 text-white/80")
+        n_webhook_url = ui.input(t("notify.webhook_url_label"), value=snap["n_webhook_url"]) \
+            .props("outlined dense dark").classes("w-full")
+
+        ui.label(t("notify.email_heading")).classes("text-sm font-semibold mt-2 text-white/80")
+        with ui.row().classes("w-full gap-3 flex-wrap"):
+            n_email_to = ui.input(t("notify.email_to_label"), value=snap["n_email_to"]) \
+                .props("outlined dense dark").classes("flex-1 min-w-40")
+            n_email_from = ui.input(t("notify.email_from_label"), value=snap["n_email_from"]) \
+                .props("outlined dense dark").classes("flex-1 min-w-40")
+        with ui.row().classes("w-full gap-3 flex-wrap items-end"):
+            n_smtp_host = ui.input(t("notify.smtp_host_label"), value=snap["n_smtp_host"]) \
+                .props("outlined dense dark").classes("flex-1 min-w-40")
+            n_smtp_port = ui.number(t("notify.smtp_port_label"), value=snap["n_smtp_port"],
+                                    min=1, max=65535, format="%d") \
+                .props("outlined dense dark").classes("w-28")
+            n_security = ui.select({"starttls": t("notify.security_starttls"),
+                                    "ssl": t("notify.security_ssl"),
+                                    "none": t("notify.security_none")},
+                                   value=snap["n_security"], label=t("notify.security_label")) \
+                .props("outlined dense dark").classes("min-w-36")
+        n_smtp_user = ui.input(t("notify.smtp_user_label"), value=snap["n_smtp_user"]) \
+            .props("outlined dense dark autocomplete=off").classes("w-full")
+        smtp_pw_ph = t("notify.smtp_password_placeholder_set") if snap["n_has_smtp_pw"] \
+            else t("notify.smtp_password_label")
+        n_smtp_pw = ui.input(t("notify.smtp_password_label"), password=True,
+                             placeholder=smtp_pw_ph) \
+            .props("outlined dense dark autocomplete=new-password").classes("w-full")
+        n_smtp_pw_clear = ui.switch(t("notify.smtp_password_clear"), value=False) \
+            .props("dark").classes("text-sm")
+        if not snap["n_has_smtp_pw"]:
+            n_smtp_pw_clear.set_visibility(False)
+
+        async def send_test_notification() -> None:
+            from app import notifications
+
+            def _load_and_send() -> list[str]:
+                # Building the config decrypts the token / SMTP password, so it must stay
+                # inside the try below — a wrong FERNET_KEY raises RuntimeError.
+                with session_scope() as session:
+                    row = session.exec(
+                        select(UserSettings).where(UserSettings.user_id == uid)).first()
+                    cfg = notifications.NotifyConfig.from_settings(row) if row else None
+                return notifications.send_test(cfg) if cfg is not None else []
+
+            ui.notify(t("notify.test_running"), type="ongoing")
+            try:
+                sent = await run.io_bound(_load_and_send)
+            except Exception as exc:  # noqa: BLE001 - surface a misconfigured channel/secret
+                ui.notify(t("notify.test_error", error=exc), type="negative")
+                return
+            if sent:
+                ui.notify(t("notify.test_sent", channels=", ".join(sent)), type="positive")
+            else:
+                ui.notify(t("notify.test_none"), type="warning")
+
+        ui.button(t("notify.test_button"), icon="notifications",
+                  on_click=send_test_notification) \
+            .props("outline").classes("text-white/90 self-start")
 
     with ui.card().classes("glass w-full rounded-2xl p-6 gap-3"):
         ui.label(t("settings.webdav_heading")).classes("text-lg font-semibold")
@@ -268,6 +369,27 @@ def settings_content() -> None:
                     row.youtube_cookies_enc = None
                 elif (cookie_ta.value or "").strip():
                     row.youtube_cookies_enc = encrypt_secret(cookie_ta.value.strip())
+                # Notifications (issue #42): toggles + channel config.
+                row.notify_new_tracks = bool(n_new_sw.value)
+                row.notify_sync_error = bool(n_syncerr_sw.value)
+                row.notify_download_error = bool(n_dlerr_sw.value)
+                row.notify_ntfy_url = (n_ntfy_url.value or "").strip() or None
+                row.notify_webhook_url = (n_webhook_url.value or "").strip() or None
+                row.notify_email_to = (n_email_to.value or "").strip() or None
+                row.notify_smtp_from = (n_email_from.value or "").strip() or None
+                row.notify_smtp_host = (n_smtp_host.value or "").strip() or None
+                row.notify_smtp_port = int(n_smtp_port.value or 587)
+                row.notify_smtp_user = (n_smtp_user.value or "").strip() or None
+                row.notify_smtp_security = n_security.value or "starttls"
+                # Secrets: clear wins → else store new → else keep (like the cookie above).
+                if n_token_clear.value:
+                    row.notify_ntfy_token_enc = None
+                elif (n_ntfy_token.value or "").strip():
+                    row.notify_ntfy_token_enc = encrypt_secret(n_ntfy_token.value.strip())
+                if n_smtp_pw_clear.value:
+                    row.notify_smtp_password_enc = None
+                elif (n_smtp_pw.value or "").strip():
+                    row.notify_smtp_password_enc = encrypt_secret(n_smtp_pw.value.strip())
                 row.updated_at = datetime.now(timezone.utc)
                 session.add(row)
             ui.notify(t("settings.saved"), type="positive")

@@ -20,7 +20,7 @@ from pathlib import Path
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
-from app import library_index, pipeline
+from app import library_index, notifications, pipeline
 from app.config import settings
 from app.db import session_scope
 from app.fix_music_tags import TAG_OPTION_FIELDS, TagOptions
@@ -158,6 +158,28 @@ def _record_delivered_safe(job_id: str, user_id: int, delivered: list) -> bool:
     return False  # unreachable (the loop always returns), kept for a total function
 
 
+def _notify_safe(user_id: int, dispatch) -> None:
+    """Fire a notification for a background event (issue #42). Best-effort, off-thread.
+
+    Loads the user's current notification config fresh from the DB, then hands it to
+    `dispatch(cfg)` (a small closure that calls a `notifications.notify_*` function). Runs
+    on its OWN daemon thread — never the download pool — so a slow/unreachable channel can't
+    delay the job or hold a worker; any error (config load, decrypt, network) is swallowed.
+    """
+    def _run() -> None:
+        try:
+            with session_scope() as session:
+                us = session.exec(
+                    select(UserSettings).where(UserSettings.user_id == user_id)).first()
+                cfg = notifications.NotifyConfig.from_settings(us) if us else None
+            if cfg is not None:
+                dispatch(cfg)
+        except Exception:  # noqa: BLE001 - a notification must never affect the job
+            log.exception("notification dispatch failed for user %s", user_id)
+
+    threading.Thread(target=_run, name="notify", daemon=True).start()
+
+
 def _make_reporter(job_id: str, js: JobState) -> Reporter:
     """Wire pipeline callbacks to live JobState + durable DB row (shared by run/sync)."""
     def on_phase(phase: str) -> None:
@@ -248,6 +270,8 @@ def _run_artist(job_id: str, url: str, genre: str, destination: Destination,
         with _lock:
             js.phase, js.error, js.finished_at = "error", err, _utcnow()
         _persist(job_id, phase="error", error=err, finished_at=js.finished_at)
+        _notify_safe(js.user_id, lambda c: notifications.notify_error(
+            c, kind="download", url=url, error=err))
 
 
 def _run(job_id: str, url: str, genre: str, mode: str, destination: Destination,
@@ -298,6 +322,8 @@ def _run(job_id: str, url: str, genre: str, mode: str, destination: Destination,
         with _lock:
             js.phase, js.error, js.finished_at = "error", err, _utcnow()
         _persist(job_id, phase="error", error=err, finished_at=js.finished_at)
+        _notify_safe(js.user_id, lambda c: notifications.notify_error(
+            c, kind="download", url=url, error=err))
 
 
 def start_job(*, user_id: int, url: str, genre: str, mode: str, destination_type: str,
@@ -468,6 +494,7 @@ def _run_sync(job_id: str, cfg: _SyncConfig) -> None:
     reporter = _make_reporter(job_id, js)
     try:
         warning, total, failed = None, 0, 0  # set below: index-fail (#38) or partial delivery
+        new_count, playlist_label = 0, ""    # for the "new tracks" notification (issue #42)
         # "mark existing" first run: seed the index from the current playlist and
         # download nothing, so only FUTURE additions are ever fetched (issue #21).
         if cfg.first_run and cfg.initial_mode == "mark_existing":
@@ -532,6 +559,8 @@ def _run_sync(job_id: str, cfg: _SyncConfig) -> None:
                             playlist_files=result.playlist_files or None,
                             name=result.playlist_name or None)
             summary = result.summary
+            new_count = result.new_track_count
+            playlist_label = result.playlist_name or js.album or ""
 
         with _lock:
             js.phase, js.finished_at, js.summary = "done", _utcnow(), summary
@@ -542,6 +571,9 @@ def _run_sync(job_id: str, cfg: _SyncConfig) -> None:
         _persist(job_id, phase="done", finished_at=js.finished_at, warning=warning,
                  artist=js.artist, album=js.album, failed_tracks=failed,
                  current_track=js.current_track, total_tracks=js.total_tracks)
+        if new_count > 0:
+            _notify_safe(cfg.user_id, lambda c: notifications.notify_new_tracks(
+                c, playlist=playlist_label, count=new_count))
     except Exception as exc:  # noqa: BLE001 - surface any failure to the user
         log.exception("sync %s failed", job_id)
         err = _clean_error(exc)
@@ -550,6 +582,8 @@ def _run_sync(job_id: str, cfg: _SyncConfig) -> None:
         _persist(job_id, phase="error", error=err, finished_at=js.finished_at)
         with session_scope() as session:
             _sub_result(session, cfg.subscription_id, status="error", error=err)
+        _notify_safe(cfg.user_id, lambda c: notifications.notify_error(
+            c, kind="sync", url=cfg.url, error=err))
 
 
 def _prune_locked() -> None:
