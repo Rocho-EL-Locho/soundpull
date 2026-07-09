@@ -159,22 +159,25 @@ def _record_delivered_safe(job_id: str, user_id: int, delivered: list) -> bool:
 
 
 def _notify_safe(user_id: int, dispatch) -> None:
-    """Fire a notification for a background event (issue #42). Best-effort.
+    """Fire a notification for a background event (issue #42). Best-effort, off-thread.
 
     Loads the user's current notification config fresh from the DB, then hands it to
-    `dispatch(cfg)` (a small closure that calls a `notifications.notify_*` function). It
-    runs on the worker thread AFTER the job's terminal state is persisted, so it can never
-    fail or delay the download/sync; any error (config load, decrypt, network) is swallowed.
+    `dispatch(cfg)` (a small closure that calls a `notifications.notify_*` function). Runs
+    on its OWN daemon thread — never the download pool — so a slow/unreachable channel can't
+    delay the job or hold a worker; any error (config load, decrypt, network) is swallowed.
     """
-    try:
-        with session_scope() as session:
-            us = session.exec(
-                select(UserSettings).where(UserSettings.user_id == user_id)).first()
-            cfg = notifications.NotifyConfig.from_settings(us) if us else None
-        if cfg is not None:
-            dispatch(cfg)
-    except Exception:  # noqa: BLE001 - a notification must never affect the job
-        log.exception("notification dispatch failed for user %s", user_id)
+    def _run() -> None:
+        try:
+            with session_scope() as session:
+                us = session.exec(
+                    select(UserSettings).where(UserSettings.user_id == user_id)).first()
+                cfg = notifications.NotifyConfig.from_settings(us) if us else None
+            if cfg is not None:
+                dispatch(cfg)
+        except Exception:  # noqa: BLE001 - a notification must never affect the job
+            log.exception("notification dispatch failed for user %s", user_id)
+
+    threading.Thread(target=_run, name="notify", daemon=True).start()
 
 
 def _make_reporter(job_id: str, js: JobState) -> Reporter:

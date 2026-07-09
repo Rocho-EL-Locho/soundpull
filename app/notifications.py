@@ -28,6 +28,7 @@ import logging
 import smtplib
 from dataclasses import dataclass
 from email.message import EmailMessage
+from email.utils import formatdate, make_msgid
 from urllib.parse import urlparse
 
 import httpx
@@ -161,6 +162,10 @@ def _send_email(cfg: NotifyConfig, title: str, message: str) -> None:
     msg["Subject"] = title
     msg["From"] = cfg.smtp_from or cfg.smtp_user or cfg.email_to
     msg["To"] = cfg.email_to
+    # RFC 5322 requires a Date; smtplib.send_message adds neither Date nor Message-ID, and a
+    # missing Date makes strict MTAs/spam filters reject or penalise the mail.
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid()
     msg.set_content(message)
     if cfg.smtp_security == "ssl":
         smtp: smtplib.SMTP = smtplib.SMTP_SSL(cfg.smtp_host, cfg.smtp_port, timeout=_TIMEOUT)

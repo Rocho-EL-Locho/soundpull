@@ -165,17 +165,19 @@ def settings_content() -> None:
         async def send_test_notification() -> None:
             from app import notifications
 
-            with session_scope() as session:
-                row = session.exec(
-                    select(UserSettings).where(UserSettings.user_id == uid)).first()
-                cfg = notifications.NotifyConfig.from_settings(row) if row else None
-            if cfg is None:
-                ui.notify(t("notify.test_none"), type="warning")
-                return
+            def _load_and_send() -> list[str]:
+                # Building the config decrypts the token / SMTP password, so it must stay
+                # inside the try below — a wrong FERNET_KEY raises RuntimeError.
+                with session_scope() as session:
+                    row = session.exec(
+                        select(UserSettings).where(UserSettings.user_id == uid)).first()
+                    cfg = notifications.NotifyConfig.from_settings(row) if row else None
+                return notifications.send_test(cfg) if cfg is not None else []
+
             ui.notify(t("notify.test_running"), type="ongoing")
             try:
-                sent = await run.io_bound(notifications.send_test, cfg)
-            except Exception as exc:  # noqa: BLE001 - surface a misconfigured channel
+                sent = await run.io_bound(_load_and_send)
+            except Exception as exc:  # noqa: BLE001 - surface a misconfigured channel/secret
                 ui.notify(t("notify.test_error", error=exc), type="negative")
                 return
             if sent:
