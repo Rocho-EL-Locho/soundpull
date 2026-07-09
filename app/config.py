@@ -54,10 +54,15 @@ class Settings(BaseSettings):
     #   - sleep_requests_seconds: paced delay between yt-dlp HTTP requests on a multi-track
     #     run to AVOID tripping the throttle in the first place. 0 = off (fastest). A small
     #     value (e.g. 0.5) helps when pulling whole discographies.
-    # All three only affect timing / which tracks are retried — never tag output (parity-safe).
+    #   - socket_timeout_seconds: cap on yt-dlp's per-socket wait (issue #40). yt-dlp defaults
+    #     to no timeout, so a STALLED (half-open) connection blocks the worker thread forever —
+    #     with the default 2-worker pool, one stuck job halves throughput for everyone. A
+    #     deadline turns a stall into a retryable error. 0/negative = yt-dlp's default (none).
+    # All four only affect timing / which tracks are retried — never tag output (parity-safe).
     download_retry_passes: int = 2
     download_retry_backoff_seconds: float = 30.0
     download_sleep_requests_seconds: float = 0.0
+    download_socket_timeout_seconds: float = 60.0
 
     # PO-token provider (issue: YouTube 403). YouTube now requires a GVS PO token
     # for most audio formats; without one the affected clients' format URLs return

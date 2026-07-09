@@ -23,6 +23,7 @@ from app.pipeline import (
     _apply_audio_format,
     _apply_cookie_policy,
     _apply_pot_provider,
+    _apply_socket_timeout,
     _apply_tag_options,
     _build_playlist_manifest,
     _build_ydl_opts,
@@ -363,6 +364,24 @@ def test_apply_pot_provider_injects_base_url_only_when_configured(monkeypatch):
     opts = {}
     _apply_pot_provider(opts)
     assert opts["extractor_args"]["youtubepot-bgutilhttp"] == {"base_url": ["http://host:9"]}
+
+
+def test_apply_socket_timeout_sets_option_when_configured(monkeypatch):
+    # issue #40: a per-socket deadline stops a stalled connection hanging a worker forever.
+    from app import pipeline
+
+    # Configured (>0) → the yt-dlp socket_timeout option is set to that value.
+    monkeypatch.setattr(pipeline.settings, "download_socket_timeout_seconds", 45.0)
+    opts = {}
+    _apply_socket_timeout(opts)
+    assert opts["socket_timeout"] == 45.0
+
+    # 0 / negative → no-op: leave yt-dlp's default (no timeout), key stays absent.
+    for disabled in (0, -1):
+        monkeypatch.setattr(pipeline.settings, "download_socket_timeout_seconds", disabled)
+        opts = {}
+        _apply_socket_timeout(opts)
+        assert "socket_timeout" not in opts
 
 
 def test_genre_flags_forces_real_genre_but_skips_empty():
@@ -874,6 +893,22 @@ def test_upload_with_retry_does_not_retry_non_transient(monkeypatch):
     with pytest.raises(ValueError):
         _upload_with_retry(_C(), "/tmp/a.mp3", "r/a.mp3")
     assert calls["n"] == 1
+
+
+def test_upload_with_retry_backoff_is_exponential(monkeypatch):
+    # issue #40: waits between transient retries grow exponentially (2, 4, 8), bounded by attempts.
+    import app.pipeline as pipeline
+    delays: list[float] = []
+    monkeypatch.setattr(pipeline.time, "sleep", lambda s: delays.append(s))
+
+    class _C:
+        def upload_file(self, *a, **k):
+            raise httpx.ReadTimeout("The read operation timed out")
+
+    with pytest.raises(httpx.ReadTimeout):
+        _upload_with_retry(_C(), "/tmp/a.mp3", "r/a.mp3")
+    # 4 attempts → 3 waits before the final re-raise, doubling each time.
+    assert delays == [2.0, 4.0, 8.0]
 
 
 def test_upload_tree_skips_rejected_path_but_uploads_rest(monkeypatch, tmp_path):
