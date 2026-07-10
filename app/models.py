@@ -137,6 +137,11 @@ class DownloadHistory(SQLModel, table=True):
     # server-index update failed, so those tracks may be re-downloaded on the next sync. The
     # job still ends `done` (files are delivered); this just surfaces the risk in the history.
     warning: str | None = None
+    # Human-readable event timeline of the job (issue #44): one line per phase/event
+    # (queued → metadata → … → done/error), filled by the worker via `jobs._log_event`.
+    # A technical trace like `error` — deliberately neutral/untranslated (the worker runs
+    # off the request thread, so it has no session language). Shown in the detail dialog.
+    log: str | None = None
 
     created_at: datetime = Field(default_factory=_utcnow, index=True)
     finished_at: datetime | None = None

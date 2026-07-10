@@ -169,3 +169,66 @@ def test_run_artist_dedup_off_skips_reconcile_on_webdav(monkeypatch):
                      "mp3_320", TagOptions(), None, dedup=False)
 
     assert captured["on_server"] is None
+
+
+# --- event timeline (issue #44) --------------------------------------------
+
+def _bind_mem_db(monkeypatch, *, phase="queued"):
+    """In-memory DB with a seeded DownloadHistory row; jobs.session_scope points at it."""
+    import app.models  # noqa: F401 - register tables
+    from sqlalchemy.pool import StaticPool
+    from sqlmodel import Session, SQLModel, create_engine
+    from app.models import DownloadHistory
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False},
+                           poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as s:
+        s.add(DownloadHistory(id="j", user_id=1, url="u", genre="Pop", mode="album",
+                              audio_format="mp3_320", destination_type="webdav", phase=phase))
+        s.commit()
+
+    @contextmanager
+    def scope():
+        sess = Session(engine)
+        try:
+            yield sess
+            sess.commit()
+        finally:
+            sess.close()
+
+    monkeypatch.setattr(jobs, "session_scope", scope)
+    return engine
+
+
+def test_on_phase_logs_only_on_transition(monkeypatch):
+    # on_phase fires on every progress tick; the timeline must record a phase only when it
+    # actually changes, else it floods with thousands of identical "download" lines (issue #44).
+    _bind_mem_db(monkeypatch)
+    js = jobs.JobState(id="j", user_id=1, url="u", genre="Pop", mode="album",
+                       destination_type="webdav")
+    reporter = jobs._make_reporter("j", js)
+
+    for _ in range(5):
+        reporter.on_phase("download")   # simulate 5 progress ticks in one phase
+    reporter.on_phase("tags")
+
+    assert js.phase == "tags"                      # live state always current
+    assert len(js.log_lines) == 2                  # only the two real transitions
+    assert js.log_lines[0].endswith("download")
+    assert js.log_lines[1].endswith("tags")
+
+
+def test_log_event_is_best_effort_on_persist_failure(monkeypatch):
+    # A failed timeline write must be swallowed — it must never propagate and (e.g. in a
+    # terminal block) flip a delivered job to "error" or skip its notification (issue #44).
+    def boom(*a, **k):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(jobs, "_persist", boom)
+    js = jobs.JobState(id="j", user_id=1, url="u", genre="Pop", mode="album",
+                       destination_type="webdav")
+
+    jobs._log_event(js, "done")  # must not raise
+
+    assert js.log_lines and js.log_lines[-1].endswith("done")
