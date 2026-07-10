@@ -101,6 +101,7 @@ class JobState:
     total_albums: int = 0
     error: str | None = None
     warning: str | None = None   # non-fatal note on a done job (e.g. index update failed, #38)
+    log_lines: list[str] = field(default_factory=list)  # event timeline (issue #44)
     created_at: datetime = field(default_factory=_utcnow)
     finished_at: datetime | None = None
     result_path: str | None = None   # ZIP path for browser destination
@@ -125,6 +126,27 @@ def _persist(job_id: str, **fields) -> None:
         for key, value in fields.items():
             setattr(row, key, value)
         session.add(row)
+
+
+def _log_event(js: JobState, message: str) -> None:
+    """Append a timestamped line to the job's event timeline and persist it (issue #44).
+
+    Best-effort: the timeline is a non-essential diagnostic, so a failed write is logged and
+    swallowed — it must never fail or flip a job (mirroring the notification/cover/lyrics side
+    effects; a raise here inside a terminal block would otherwise turn a delivered job into an
+    "error", skip its notification, or orphan a queued job). `_lock` guards the append + join
+    because an artist run forwards `on_meta` from several parallel album threads, so `log_lines`
+    can be touched concurrently; the DB write happens outside the lock. The joined text lands in
+    `DownloadHistory.log` for the detail dialog, surviving after the JobState is pruned.
+    """
+    try:
+        entry = f"[{_utcnow().strftime('%H:%M:%S')}] {message}"
+        with _lock:
+            js.log_lines.append(entry)
+            blob = "\n".join(js.log_lines)
+        _persist(js.id, log=blob)
+    except Exception:  # noqa: BLE001 - a diagnostic log must never affect the job
+        log.exception("log-event persist failed for %s", js.id)
 
 
 def _record_delivered_safe(job_id: str, user_id: int, delivered: list) -> bool:
@@ -183,14 +205,21 @@ def _notify_safe(user_id: int, dispatch) -> None:
 def _make_reporter(job_id: str, js: JobState) -> Reporter:
     """Wire pipeline callbacks to live JobState + durable DB row (shared by run/sync)."""
     def on_phase(phase: str) -> None:
+        # on_phase fires on EVERY yt-dlp progress tick (pipeline progress_hook), so persist and
+        # log only on an actual transition — otherwise the timeline floods with thousands of
+        # identical "download" lines and the row is rewritten per tick (issue #44).
         with _lock:
+            changed = js.phase != phase
             js.phase = phase
-        _persist(job_id, phase=phase)
+        if changed:
+            _persist(job_id, phase=phase)
+            _log_event(js, phase)
 
     def on_meta(artist: str, album: str) -> None:
         with _lock:
             js.artist, js.album = artist, album
         _persist(job_id, artist=artist, album=album)
+        _log_event(js, f"{artist or '?'} — {album or '?'}")
 
     def on_track(cur: int, tot: int) -> None:
         with _lock:
@@ -215,6 +244,7 @@ def _make_artist_reporter(job_id: str, js: JobState) -> Reporter:
                 js.album = name
         if name:
             _persist(job_id, album=name)
+            _log_event(js, f"album {current}/{total}: {name}")
 
     return Reporter(on_phase=base.on_phase, on_meta=base.on_meta,
                     on_track=base.on_track, on_album=on_album)
@@ -264,12 +294,14 @@ def _run_artist(job_id: str, url: str, genre: str, destination: Destination,
         _persist(job_id, phase="done", finished_at=js.finished_at, warning=warning,
                  artist=js.artist, album=js.album, failed_tracks=failed,
                  current_track=js.current_track, total_tracks=js.total_tracks)
+        _log_event(js, f"done, {failed}/{total} missing" if failed else "done")
     except Exception as exc:  # noqa: BLE001 - surface any failure to the user
         log.exception("artist download %s failed", job_id)
         err = _clean_error(exc)
         with _lock:
             js.phase, js.error, js.finished_at = "error", err, _utcnow()
         _persist(job_id, phase="error", error=err, finished_at=js.finished_at)
+        _log_event(js, f"error: {err}")
         _notify_safe(js.user_id, lambda c: notifications.notify_error(
             c, kind="download", url=url, error=err))
 
@@ -316,12 +348,14 @@ def _run(job_id: str, url: str, genre: str, mode: str, destination: Destination,
         _persist(job_id, phase="done", finished_at=js.finished_at, warning=warning,
                  artist=js.artist, album=js.album, failed_tracks=failed,
                  current_track=js.current_track, total_tracks=js.total_tracks)
+        _log_event(js, f"done, {failed}/{total} missing" if failed else "done")
     except Exception as exc:  # noqa: BLE001 - surface any failure to the user
         log.exception("download %s failed", job_id)
         err = _clean_error(exc)
         with _lock:
             js.phase, js.error, js.finished_at = "error", err, _utcnow()
         _persist(job_id, phase="error", error=err, finished_at=js.finished_at)
+        _log_event(js, f"error: {err}")
         _notify_safe(js.user_id, lambda c: notifications.notify_error(
             c, kind="download", url=url, error=err))
 
@@ -369,6 +403,7 @@ def start_job(*, user_id: int, url: str, genre: str, mode: str, destination_type
                   tag_options=tag_options)
     with _lock:
         _registry[job_id] = js
+    _log_event(js, "queued")
     if mode == "artist":
         # An artist run (issue #32) fans out into N album downloads under one job. It defaults
         # to auto-dedup on WebDAV (skip tracks already in the library) but honours the
@@ -465,6 +500,7 @@ def start_sync(subscription_id: int) -> str | None:
                   tag_options=cfg.tag_options, subscription_id=subscription_id)
     with _lock:
         _registry[job_id] = js
+    _log_event(js, "queued")
     _executor.submit(_run_sync, job_id, cfg)
     return job_id
 
@@ -571,6 +607,7 @@ def _run_sync(job_id: str, cfg: _SyncConfig) -> None:
         _persist(job_id, phase="done", finished_at=js.finished_at, warning=warning,
                  artist=js.artist, album=js.album, failed_tracks=failed,
                  current_track=js.current_track, total_tracks=js.total_tracks)
+        _log_event(js, f"done, {failed}/{total} missing" if failed else "done")
         if new_count > 0:
             _notify_safe(cfg.user_id, lambda c: notifications.notify_new_tracks(
                 c, playlist=playlist_label, count=new_count))
@@ -580,6 +617,7 @@ def _run_sync(job_id: str, cfg: _SyncConfig) -> None:
         with _lock:
             js.phase, js.error, js.finished_at = "error", err, _utcnow()
         _persist(job_id, phase="error", error=err, finished_at=js.finished_at)
+        _log_event(js, f"error: {err}")
         with session_scope() as session:
             _sub_result(session, cfg.subscription_id, status="error", error=err)
         _notify_safe(cfg.user_id, lambda c: notifications.notify_error(
