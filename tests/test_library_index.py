@@ -109,6 +109,35 @@ def test_record_tracks_backfills_null_path():
         assert paths[("drake", "hotline bling")] == "Drake/Views/Hotline Bling.mp3"
 
 
+def test_scan_skips_soundpull_trash_dir():
+    # Roadmap 01 acceptance criterion 1: a trashed file lives under `.soundpull-trash/…`,
+    # which the scan already skips (leading-dot rule) — so it's never re-indexed. The dir
+    # is also listed explicitly in _SKIP_DIR_NAMES for self-documentation.
+    from app.library_ops import TRASH_DIR
+    assert library_index._is_skippable_dir(TRASH_DIR)
+    assert library_index._is_skippable_dir(f"lib/{TRASH_DIR}")
+    assert TRASH_DIR in library_index._SKIP_DIR_NAMES
+
+
+def test_remove_by_rel_path_and_update_rel_path():
+    # Roadmap 01: the ops layer keeps the index in sync path-based.
+    with _mem_session() as session:
+        record_tracks(session, 1, [("Drake", "One Dance", "Drake/Views/One Dance.mp3")])
+        session.commit()
+        # Repoint to a moved location.
+        assert library_index.update_rel_path(
+            session, 1, "Drake/Views/One Dance.mp3", "Drake/Best Of/One Dance.mp3") == 1
+        session.commit()
+        assert library_index.load_index_paths(session, 1)[("drake", "one dance")] \
+            == "Drake/Best Of/One Dance.mp3"
+        # Remove by the new path.
+        assert library_index.remove_by_rel_path(session, 1, "Drake/Best Of/One Dance.mp3") == 1
+        session.commit()
+        assert library_index.load_index(session, 1) == set()
+        # Removing an unknown path is a no-op.
+        assert library_index.remove_by_rel_path(session, 1, "nope.mp3") == 0
+
+
 def test_record_tracks_keeps_first_known_path():
     # Once a path is known, a later DELIVERY of the same track does not overwrite it.
     with _mem_session() as session:

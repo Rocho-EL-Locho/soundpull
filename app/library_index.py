@@ -166,7 +166,11 @@ def _artist_title_from_path(rel_parts: list[str]) -> tuple[str, str]:
 # Directory basenames that are caches / internal state, never music — skipped whole
 # (case-insensitive) so the scan doesn't PROPFIND the hash-sharded subtrees underneath
 # (e.g. an ``attachments/<hash>/…`` store beside the sized-thumbnail cache).
-_SKIP_DIR_NAMES = {"attachments", "thumbnails", "previews", "cache"}
+_SKIP_DIR_NAMES = {"attachments", "thumbnails", "previews", "cache",
+                   # Soundpull's own trash (roadmap 01) — already covered by the leading-dot
+                   # rule below, listed here for self-documentation. Kept in sync with
+                   # `app.library_ops.TRASH_DIR`.
+                   ".soundpull-trash"}
 
 
 def _is_skippable_dir(name: str) -> bool:
@@ -252,6 +256,42 @@ def _walk_audio_with_lrc(client, path: str, depth: int, max_depth: int,
             yield name, (name.rsplit(".", 1)[0] + ".lrc") in files
     for sub in subdirs:
         yield from _walk_audio_with_lrc(client, sub, depth + 1, max_depth, errors)
+
+
+def remove_by_rel_path(session: Session, user_id: int, rel_path: str) -> int:
+    """Delete the index row(s) whose stored `rel_path` matches (roadmap 01).
+
+    Path-based (like `_prune_missing`), so a track deleted/trashed via the ops layer drops
+    out of the "on server" index and won't be re-referenced or block a re-download. Returns
+    the number of rows removed (0 if the path isn't indexed — e.g. a mark_existing seed).
+    """
+    from app.models import ServerTrack
+
+    rows = session.exec(
+        select(ServerTrack).where(ServerTrack.user_id == user_id,
+                                  ServerTrack.rel_path == rel_path)
+    ).all()
+    for row in rows:
+        session.delete(row)
+    return len(rows)
+
+
+def update_rel_path(session: Session, user_id: int, old_rel: str, new_rel: str) -> int:
+    """Point index row(s) at a moved file's new `rel_path` (roadmap 01).
+
+    Used by `move_track` so a moved/renamed file keeps its index entry (the key is unchanged;
+    only the location moved). Returns the number of rows updated.
+    """
+    from app.models import ServerTrack
+
+    rows = session.exec(
+        select(ServerTrack).where(ServerTrack.user_id == user_id,
+                                  ServerTrack.rel_path == old_rel)
+    ).all()
+    for row in rows:
+        row.rel_path = new_rel
+        session.add(row)
+    return len(rows)
 
 
 def _prune_missing(session: Session, user_id: int, found_paths: set[str]) -> int:
