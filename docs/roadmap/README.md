@@ -133,7 +133,7 @@ milestones are content-defined, not date- or number-defined.
 
 Track progress by checking items off here when the PR is merged:
 
-- [ ] 01 WebDAV file operations + trash
+- [x] 01 WebDAV file operations + trash
 - [x] 02 Multi-source architecture
 - [ ] 03 Library browser
 - [ ] 04 Duplicate finder & cleanup
