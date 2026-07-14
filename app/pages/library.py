@@ -194,11 +194,15 @@ def library_content() -> None:
 
     # --- panes ---------------------------------------------------------------------------
     def _row_button(label: str, count: int, active: bool, on_click) -> None:
-        cls = "w-full text-left no-caps justify-between " + (
-            "accent-grad text-white" if active else "text-white/85")
-        with ui.button(on_click=on_click).props("flat dense align=left").classes(cls):
-            ui.label(label).classes("truncate")
-            ui.label(str(count)).classes("text-xs opacity-70 pl-2 shrink-0")
+        # A clickable flex row (not a ui.button): Quasar's button content wraps, which pushed
+        # the count onto a second line for long names. `flex-nowrap` + a shrinking `min-w-0`
+        # label keeps every row a single truncated line.
+        base = ("w-full flex flex-nowrap items-center justify-between gap-2 px-3 py-2 "
+                "rounded-lg cursor-pointer transition")
+        active_cls = "accent-grad text-white" if active else "text-white/85 hover:bg-white/10"
+        with ui.row().classes(f"{base} {active_cls}").on("click", on_click):
+            ui.label(label).classes("truncate flex-1 min-w-0 text-sm")
+            ui.label(str(count)).classes("text-xs opacity-70 shrink-0")
 
     def _artist_pane(view) -> None:
         with ui.card().classes("glass rounded-xl p-3 gap-1 w-full md:flex-1 md:min-w-0 "
@@ -256,8 +260,8 @@ def library_content() -> None:
                     "text-xs uppercase tracking-widest text-white/50 px-1")
                 ui.label(t("library.pick_album")).classes("text-white/40 text-sm px-1")
                 return
-            with ui.row().classes("w-full items-center justify-between gap-1 px-1"):
-                ui.label(album.name).classes("font-semibold truncate")
+            with ui.row().classes("w-full flex-nowrap items-center gap-1 px-1"):
+                ui.label(album.name).classes("font-semibold truncate min-w-0")
             # Album-level actions: delete folder, backfill lyrics, open in Navidrome (albums
             # only — a playlist folder has no Navidrome album to point at).
             with ui.row().classes("items-center gap-1 flex-wrap px-1 pb-1"):
@@ -273,11 +277,12 @@ def library_content() -> None:
                     ui.link(t("library.open_navidrome"), nav_url, new_tab=True) \
                         .classes("text-cyan-300 text-sm self-center no-underline pl-1")
             for track in album.tracks:
-                with ui.row().classes("w-full items-center justify-between gap-2 px-1"):
-                    ui.label(track.title).classes("text-sm text-white/85 truncate")
+                with ui.row().classes("w-full flex-nowrap items-center justify-between "
+                                      "gap-2 px-1"):
+                    ui.label(track.title).classes("text-sm text-white/85 truncate flex-1 min-w-0")
                     ui.button(icon="delete",
                               on_click=lambda tr=track: _confirm_trash_track(tr)) \
-                        .props("flat dense round size=sm").classes("text-white/50") \
+                        .props("flat dense round size=sm").classes("text-white/50 shrink-0") \
                         .tooltip(t("library.delete_track"))
 
     # --- render --------------------------------------------------------------------------
