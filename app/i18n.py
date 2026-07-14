@@ -220,6 +220,20 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
                                "vorhandene Datei verwiesen (kein Duplikat). Nur bei WebDAV.",
         "index.dedup_label": "Vorhandene Titel überspringen",
         "index.dedup_hint": "Nur bei Ziel „WebDAV“ verfügbar.",
+        # Papierkorb / Datei-Operationen (roadmap 01)
+        "settings.trash_retention": "Papierkorb-Aufbewahrung (Tage)",
+        "settings.trash_retention_hint": "Gelöschte Titel werden zunächst in einen "
+                                         "Papierkorb-Ordner verschoben und erst nach so vielen "
+                                         "Tagen endgültig entfernt. 0 = sofort löschen. Nur bei "
+                                         "WebDAV.",
+        "settings.trash_title": "Papierkorb",
+        "settings.trash_refresh": "Aktualisieren",
+        "settings.trash_restore": "Wiederherstellen",
+        "settings.trash_empty": "Papierkorb leeren",
+        "settings.trash_empty_state": "Papierkorb ist leer.",
+        "settings.trash_restored": "Wiederhergestellt: {path}",
+        "settings.trash_emptied": "{count} Papierkorb-Ordner geleert",
+        "settings.trash_error": "Papierkorb-Vorgang fehlgeschlagen: {error}",
         # Synchronisierter Liedtext (issue #43)
         "settings.lyrics_label": "Synchronisierten Liedtext (.lrc) laden",
         "settings.lyrics_desc": "Lädt — soweit vorhanden — synchronisierten Liedtext von "
@@ -499,6 +513,19 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
                                "duplicate). WebDAV only.",
         "index.dedup_label": "Skip tracks I already have",
         "index.dedup_hint": "Only available with the WebDAV destination.",
+        # Trash / file operations (roadmap 01)
+        "settings.trash_retention": "Trash retention (days)",
+        "settings.trash_retention_hint": "Deleted tracks are first moved to a trash folder and "
+                                         "only permanently removed after this many days. "
+                                         "0 = delete immediately. WebDAV only.",
+        "settings.trash_title": "Trash",
+        "settings.trash_refresh": "Refresh",
+        "settings.trash_restore": "Restore",
+        "settings.trash_empty": "Empty trash",
+        "settings.trash_empty_state": "Trash is empty.",
+        "settings.trash_restored": "Restored: {path}",
+        "settings.trash_emptied": "Emptied {count} trash folder(s)",
+        "settings.trash_error": "Trash operation failed: {error}",
         # Synced lyrics (issue #43)
         "settings.lyrics_label": "Fetch synced lyrics (.lrc)",
         "settings.lyrics_desc": "When available, fetch synced lyrics from LRCLIB and drop a "

@@ -1165,20 +1165,6 @@ def _make_match_filter(on_server: Callable[[str, str], bool] | None = None,
     return _filter
 
 
-def _ensure_remote_dir(client, posix_dir: str) -> None:
-    parts = [p for p in posix_dir.split("/") if p]
-    cumulative = ""
-    for part in parts:
-        cumulative = f"{cumulative}/{part}" if cumulative else part
-        try:
-            if not client.exists(cumulative):
-                client.mkdir(cumulative)
-        except Exception:
-            # Race / already-exists on some servers — verify and continue.
-            if not client.exists(cumulative):
-                raise
-
-
 def _zip_dir(src_dir: Path, zip_path: Path, root_name: str) -> None:
     """Zip the contents of src_dir under a top-level folder `root_name`."""
     root_name = root_name.replace("/", "-").replace("\\", "-").strip() or "Album"
@@ -1189,29 +1175,19 @@ def _zip_dir(src_dir: Path, zip_path: Path, root_name: str) -> None:
                 zf.write(path, f"{root_name}/{path.relative_to(src_dir).as_posix()}")
 
 
-_UPLOAD_ATTEMPTS = 4
-_UPLOAD_BACKOFF_BASE = 2.0  # seconds; exponential waits between attempts: 2, 4, 8
-
-
 def _upload_with_retry(client, local: str, remote: str) -> None:
     """Upload one file, retrying TRANSIENT network failures (timeout / transport error).
 
     A single slow or dropped PUT during a big artist upload must not abort the whole job (which
     would discard every already-downloaded album); retry a few times with bounded EXPONENTIAL
     backoff (issue #40) so a longer server hiccup gets progressively more time to clear. A
-    non-transient error (bad path, auth, 4xx) is not retried — it re-raises immediately.
+    non-transient error (bad path, auth, 4xx) is not retried — it re-raises immediately. The
+    retry policy is shared with the file-ops primitives (`webdav_util.retry_transient`).
     """
-    for attempt in range(1, _UPLOAD_ATTEMPTS + 1):
-        try:
-            client.upload_file(local, remote, overwrite=True)
-            return
-        except httpx.TransportError as exc:  # timeout / connect / read / write / network
-            if attempt == _UPLOAD_ATTEMPTS:
-                raise
-            delay = _UPLOAD_BACKOFF_BASE * 2 ** (attempt - 1)  # exponential: 2, 4, 8 …
-            log.warning("WebDAV upload %r failed (attempt %d/%d): %s — retrying in %.0fs",
-                        remote, attempt, _UPLOAD_ATTEMPTS, exc, delay)
-            time.sleep(delay)
+    from app.webdav_util import retry_transient
+
+    retry_transient(lambda: client.upload_file(local, remote, overwrite=True),
+                    desc=f"upload {remote!r}")
 
 
 def _upload_tree(dest: Destination, local_root: Path) -> list[str]:
@@ -1223,7 +1199,7 @@ def _upload_tree(dest: Destination, local_root: Path) -> list[str]:
     If NOT ONE file uploads, the failure is systemic (auth, bad base URL, unreachable) → raise so
     the job surfaces as an error rather than a silent empty upload.
     """
-    from app.webdav_util import make_client
+    from app.webdav_util import ensure_remote_dir, make_client
 
     client = make_client(dest.webdav_url, dest.webdav_username, dest.webdav_password)
     prefix = (dest.webdav_folder or "").strip("/")
@@ -1236,7 +1212,7 @@ def _upload_tree(dest: Destination, local_root: Path) -> list[str]:
         parent = "/".join(remote.split("/")[:-1])
         try:
             if parent:
-                _ensure_remote_dir(client, parent)
+                ensure_remote_dir(client, parent)
             _upload_with_retry(client, str(path), remote)
             uploaded += 1
         except Exception as exc:  # noqa: BLE001 - one rejected path must not lose the whole upload

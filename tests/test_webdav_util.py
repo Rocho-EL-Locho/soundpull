@@ -6,9 +6,10 @@ is `[^?#]*`, so a literal `#`/`?` in a folder or file name (both legal on disk a
 server) blew up the WebDAV client before any HTTP happened. `_SafePathClient` pre-encodes
 those chars so the upload proceeds.
 """
+import pytest
 from httpx import URL
 
-from app.webdav_util import _encode_webdav_path, _SafePathClient, make_client
+from app.webdav_util import _encode_webdav_path, _SafePathClient, make_client, resolve_rel
 
 
 def _client() -> _SafePathClient:
@@ -63,6 +64,36 @@ def test_request_and_response_paths_decode_to_same_key():
 def test_make_client_returns_safe_path_client():
     c = make_client("https://cloud.example.com/dav", "u", "p")
     assert isinstance(c, _SafePathClient)
+
+
+def test_resolve_rel_accepts_ordinary_paths():
+    assert resolve_rel("a/b/c.mp3") == "a/b/c.mp3"
+    assert resolve_rel("Artist/Album/01 - Song.mp3") == "Artist/Album/01 - Song.mp3"
+    # A `.` or double-slash segment is harmless and collapsed, not rejected.
+    assert resolve_rel("a/./b//c.mp3") == "a/b/c.mp3"
+    # Leading/trailing whitespace is trimmed.
+    assert resolve_rel("  a/b.mp3  ") == "a/b.mp3"
+
+
+@pytest.mark.parametrize("bad", [
+    "", "   ", "/abs/path", "../x", "a/../..", "a/b/../../..",
+    # Backslash / control chars: a server normalising `\` to `/` must not gain traversal;
+    # \x00 (null), \t (C0) and \x7f (DEL) are all refused.
+    "..\\..\\etc", "a\\b.mp3", "a/b\x00.mp3", "a/\tb.mp3", "a/b\x7f.mp3",
+])
+def test_resolve_rel_rejects_traversal_absolute_and_unsafe_chars(bad):
+    """Traversal / absolute / empty / backslash / control-char paths raise BEFORE any
+    network call (roadmap 01)."""
+    with pytest.raises(ValueError):
+        resolve_rel(bad)
+
+
+@pytest.mark.parametrize("ok", [
+    "a/b/c.mp3", "Ärtist/Ålbum/01 - Sóng.mp3",  # Unicode filenames (>= 0x80) must NOT be rejected
+    ".soundpull-trash/2026-07-14/A/B/x.mp3",
+])
+def test_resolve_rel_keeps_unicode(ok):
+    assert resolve_rel(ok) == ok
 
 
 def test_make_client_sets_generous_upload_timeout():

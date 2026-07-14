@@ -1,6 +1,7 @@
 """Settings page: per-user defaults, WebDAV target, and the bookmarklet."""
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 
 from sqlmodel import select
@@ -18,6 +19,8 @@ from app.pipeline import normalize_audio_format
 from app.security import decrypt_secret, encrypt_secret
 from app.theme import tag_option_switches
 from app.webdav_util import list_dirs, make_client
+
+log = logging.getLogger("settings")
 
 
 def settings_content() -> None:
@@ -42,6 +45,7 @@ def settings_content() -> None:
             "wd_folder": us.webdav_folder or "", "has_pw": us.has_webdav_password,
             "dedup": bool(us.dedup_skip_existing),
             "lyrics": bool(us.fetch_synced_lyrics),
+            "trash_retention": int(us.trash_retention_days or 0),
             # Only the "is one stored?" flag — never the plaintext cookie (issue #9).
             "has_cookie": us.has_youtube_cookies,
             # Notifications (issue #42): toggles + channel config. Secrets are exposed
@@ -296,7 +300,7 @@ def settings_content() -> None:
         ui.label(t("settings.scan_desc")).classes("text-xs text-white/50")
 
         async def scan_server() -> None:
-            from app import library_index
+            from app import library_index, library_ops
 
             ui.notify(t("settings.scan_running"), type="ongoing")
             try:
@@ -304,6 +308,12 @@ def settings_content() -> None:
             except Exception as exc:  # noqa: BLE001 - surface config/connection errors
                 ui.notify(t("settings.scan_error", error=exc), type="negative")
                 return
+            # Opportunistic trash purge (roadmap 01): expired trash folders are cleaned up
+            # here so no separate scheduler is needed. Best-effort — never fails the scan.
+            try:
+                await run.io_bound(library_ops.purge_trash, uid)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("opportunistic trash purge failed: %s", exc)
             # Distinguish a healthy-but-empty scan from an INCOMPLETE one: unreadable
             # sub-folders mean the index may be stale and pruning was skipped (issue #38).
             if errors:
@@ -345,6 +355,72 @@ def settings_content() -> None:
         dedup_sw = ui.switch(t("settings.dedup_label"), value=snap["dedup"]) \
             .props("dark").classes("text-sm")
 
+        # Trash safety net (roadmap 01): a deleted library file is first moved into a dated
+        # trash folder and hard-deleted only after this many days (0 = delete immediately).
+        ui.label(t("settings.trash_retention_hint")).classes("text-xs text-white/50 mt-2")
+        trash_retention_num = ui.number(t("settings.trash_retention"), min=0, step=1,
+                                        value=snap["trash_retention"]) \
+            .props("outlined dense dark").classes("w-full")
+
+        # Optional: browse the trash, restore a file or empty it (features 03/04 bring the
+        # real library UI; this is the minimal management surface).
+        with ui.expansion(t("settings.trash_title"), icon="delete").classes("w-full"):
+            trash_list = ui.column().classes("w-full gap-1")
+
+            async def refresh_trash() -> None:
+                from app import library_ops
+
+                trash_list.clear()
+                try:
+                    entries = await run.io_bound(library_ops.list_trash, uid)
+                except Exception as exc:  # noqa: BLE001 - surface config/connection errors
+                    with trash_list:
+                        ui.label(t("settings.trash_error", error=exc)) \
+                            .classes("text-red-400 text-sm")
+                    return
+                with trash_list:
+                    if not entries:
+                        ui.label(t("settings.trash_empty_state")).classes("text-white/40 text-sm")
+                        return
+                    for entry in entries:
+                        async def _restore(e=entry) -> None:
+                            from app import library_ops
+                            try:
+                                await run.io_bound(library_ops.restore_track, uid, e.trash_rel)
+                            except Exception as exc:  # noqa: BLE001
+                                ui.notify(t("settings.trash_error", error=exc), type="negative")
+                                return
+                            ui.notify(t("settings.trash_restored", path=e.original_rel),
+                                      type="positive")
+                            await refresh_trash()
+
+                        with ui.row().classes("w-full items-center justify-between gap-2"):
+                            ui.label(f"🗑 {entry.original_rel} ({entry.date})") \
+                                .classes("text-sm text-white/80 truncate")
+                            ui.button(t("settings.trash_restore"), icon="restore",
+                                      on_click=_restore) \
+                                .props("flat dense no-caps").classes("text-white/90")
+
+            async def empty_trash() -> None:
+                from app import library_ops
+
+                try:
+                    removed = await run.io_bound(
+                        lambda: library_ops.purge_trash(uid, force_all=True))
+                except Exception as exc:  # noqa: BLE001
+                    ui.notify(t("settings.trash_error", error=exc), type="negative")
+                    return
+                ui.notify(t("settings.trash_emptied", count=removed), type="positive")
+                await refresh_trash()
+
+            with ui.row().classes("w-full gap-2 pt-1"):
+                ui.button(t("settings.trash_refresh"), icon="refresh",
+                          on_click=refresh_trash).props("flat dense no-caps") \
+                    .classes("text-white/90")
+                ui.button(t("settings.trash_empty"), icon="delete_forever",
+                          on_click=empty_trash).props("flat dense no-caps") \
+                    .classes("text-red-300")
+
         def save() -> None:
             with session_scope() as session:
                 row = session.exec(select(UserSettings).where(UserSettings.user_id == uid)).first()
@@ -362,6 +438,7 @@ def settings_content() -> None:
                 row.webdav_username = (wd_user.value or "").strip() or None
                 row.dedup_skip_existing = bool(dedup_sw.value)
                 row.fetch_synced_lyrics = bool(lyrics_sw.value)
+                row.trash_retention_days = max(int(trash_retention_num.value or 0), 0)
                 if (wd_pass.value or "").strip():
                     row.webdav_password_enc = encrypt_secret(wd_pass.value.strip())
                 # YouTube cookie (issue #9): remove wins; else store new; else keep.

@@ -66,6 +66,11 @@ class UserSettings(SQLModel, table=True):
     # write them as sidecar files (applies to ZIP and WebDAV); default off (opt-in).
     fetch_synced_lyrics: bool = False
 
+    # Trash safety net (roadmap 01): when a library file is deleted via the ops layer
+    # it's first moved into `.soundpull-trash/<date>/…` and hard-deleted only after this
+    # many days. `0` = delete immediately (no trash). WebDAV-only.
+    trash_retention_days: int = 30
+
     # Per-user YouTube cookie (issue #9), a Netscape cookies.txt fed to yt-dlp so
     # age-gated / bot-checked / throttled tracks download. Fernet-encrypted; never
     # exposed in plaintext to the client.
