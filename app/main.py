@@ -15,6 +15,7 @@ from app.scheduler import start_scheduler, stop_scheduler
 # Page content builders, mounted client-side by the app-shell sub_pages router.
 from app.pages.history import history_content  # noqa: E402
 from app.pages.index import index_content  # noqa: E402
+from app.pages.library import library_content  # noqa: E402
 from app.pages.settings import settings_content  # noqa: E402
 from app.pages.subscriptions import subscriptions_content  # noqa: E402
 from app.theme import frame  # noqa: E402
@@ -67,6 +68,7 @@ def healthz() -> dict:
 # route that renders the same shell; the router then shows the matching sub-page.
 _SUB_PAGES = {
     "/": index_content,
+    "/library": library_content,
     "/history": history_content,
     "/subscriptions": subscriptions_content,
     "/settings": settings_content,
@@ -74,6 +76,7 @@ _SUB_PAGES = {
 
 
 @ui.page("/")
+@ui.page("/library")
 @ui.page("/history")
 @ui.page("/subscriptions")
 @ui.page("/settings")

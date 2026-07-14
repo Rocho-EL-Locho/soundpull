@@ -15,7 +15,7 @@ from sqlmodel import select
 
 from app.config import settings
 from app.db import session_scope
-from app.models import PlaylistSubscription
+from app.models import PlaylistSubscription, UserSettings
 
 log = logging.getLogger("scheduler")
 
@@ -40,13 +40,34 @@ def _is_due(sub: PlaylistSubscription, now: datetime) -> bool:
     return now - last >= timedelta(hours=interval)
 
 
+def _library_scan_due(us: UserSettings, now: datetime) -> bool:
+    """True if a scheduled library scan is due for this user (roadmap 03).
+
+    Off when `library_scan_interval_hours <= 0`; a user who has never scanned is due
+    immediately; otherwise the interval must have elapsed since `last_library_scan_at`.
+    Only meaningful with a WebDAV target configured.
+    """
+    interval = int(us.library_scan_interval_hours or 0)
+    if interval <= 0 or not us.webdav_url:
+        return False
+    last = us.last_library_scan_at
+    if last is None:
+        return True
+    if last.tzinfo is None:  # SQLite hands back naive datetimes — treat as UTC
+        last = last.replace(tzinfo=timezone.utc)
+    return now - last >= timedelta(hours=interval)
+
+
 def _tick() -> None:
-    from app.jobs import is_sync_running, start_sync
+    from app.jobs import is_scan_running, is_sync_running, start_scan, start_sync
 
     now = _utcnow()
     with session_scope() as session:
         subs = session.exec(select(PlaylistSubscription)).all()
         due = [s.id for s in subs if _is_due(s, now)]
+        # Roadmap 03: enqueue a library scan for each user whose interval has elapsed.
+        scan_due = [us.user_id for us in session.exec(select(UserSettings)).all()
+                    if _library_scan_due(us, now)]
     for sid in due:
         if is_sync_running(sid):
             continue
@@ -55,6 +76,14 @@ def _tick() -> None:
             log.info("enqueued interval-sync for subscription %s", sid)
         except Exception:  # noqa: BLE001 - one bad subscription must not kill the loop
             log.exception("failed to enqueue sync for subscription %s", sid)
+    for uid in scan_due:
+        if is_scan_running(uid):
+            continue
+        try:
+            if start_scan(uid):
+                log.info("enqueued scheduled library scan for user %s", uid)
+        except Exception:  # noqa: BLE001 - one bad user must not kill the loop
+            log.exception("failed to enqueue library scan for user %s", uid)
 
 
 def _loop() -> None:

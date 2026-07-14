@@ -10,7 +10,7 @@ from contextlib import contextmanager
 import app.models  # noqa: F401 — registers tables on SQLModel.metadata
 import pytest
 from sqlalchemy.pool import StaticPool
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from app import library_index
 from app.library_index import is_on_server, load_index, record_tracks, track_key
@@ -431,3 +431,186 @@ def test_backfill_lyrics_writes_missing_and_skips_existing(monkeypatch):
     assert errors == []
     assert list(uploaded) == ["Artist/Album/02 - Get.lrc"]
     assert uploaded["Artist/Album/02 - Get.lrc"].decode() == "[00:00.00]la"
+
+
+def _dav_env(monkeypatch, dav, folder: str = ""):
+    """In-memory DB + a WebDAV-configured user, with `dav` as the make_client result."""
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False},
+                           poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as s:
+        s.add(UserSettings(user_id=1, webdav_url="http://dav.example", webdav_folder=folder))
+        s.commit()
+
+    @contextmanager
+    def fake_scope():
+        session = Session(engine)
+        try:
+            yield session
+            session.commit()
+        finally:
+            session.close()
+
+    monkeypatch.setattr("app.db.session_scope", fake_scope)
+    monkeypatch.setattr("app.webdav_util.make_client", lambda *a, **k: dav)
+    return engine
+
+
+def test_backfill_lyrics_prefix_scopes_to_folder(monkeypatch):
+    # roadmap 03: an album-scoped backfill only touches files under the given prefix.
+    tree = {
+        "": [{"name": "A", "type": "directory"}, {"name": "B", "type": "directory"}],
+        "A": [{"name": "A/Alb", "type": "directory"}],
+        "A/Alb": [{"name": "A/Alb/01 - X.mp3", "type": "file"}],
+        "B": [{"name": "B/Alb", "type": "directory"}],
+        "B/Alb": [{"name": "B/Alb/01 - Y.mp3", "type": "file"}],
+    }
+    uploaded: dict[str, bytes] = {}
+
+    class FakeDav:
+        def ls(self, path, detail=True):
+            return tree.get(path, [])
+
+        def upload_fileobj(self, fileobj, to_path, overwrite=False, **kw):
+            uploaded[to_path] = fileobj.read()
+
+    _dav_env(monkeypatch, FakeDav())
+    monkeypatch.setattr("app.lyrics.fetch_synced_lyrics",
+                        lambda artist, title, album=None, duration=None: "[00:00.00]la")
+
+    written, _skipped, _missing, errors = library_index.backfill_lyrics(1, prefix="A/Alb")
+
+    assert errors == []
+    assert written == 1
+    assert list(uploaded) == ["A/Alb/01 - X.lrc"]   # B/Alb left untouched
+
+
+def test_scan_webdav_stamps_last_scan(monkeypatch):
+    # roadmap 03: a successful scan records `last_library_scan_at` for the "scanned Nh ago"
+    # display and the scheduled-scan due-check.
+    def walk(client, base, depth, max_depth, errors=None):
+        yield "Artist/Album/Song.mp3"
+
+    engine = _scan_env(monkeypatch, walk)
+    library_index.scan_webdav(1)
+    with Session(engine) as s:
+        us = s.exec(select(UserSettings).where(UserSettings.user_id == 1)).first()
+        assert us.last_library_scan_at is not None
+
+
+# --- Library browser: grouping + search (roadmap 03) --------------------------
+
+def test_is_playlist_folder():
+    assert library_index.is_playlist_folder("DnB Mix [PLabcdefghij]")
+    assert library_index.is_playlist_folder("Chill [OLAK5uy_abcdefghij]")
+    assert not library_index.is_playlist_folder("Best of BCee [Deluxe]")  # short → an album
+    assert not library_index.is_playlist_folder("BCee")
+
+
+def test_split_rel_path():
+    assert library_index.split_rel_path("BCee/Northpoint/01 - Intro.mp3") == \
+        ("BCee", "Northpoint", "01 - Intro.mp3")
+    # A single containing folder → no album level.
+    assert library_index.split_rel_path("PL [id]/0001 - T.mp3")[1] == "—"
+    assert library_index.split_rel_path("loose.mp3") == ("—", "—", "loose.mp3")
+
+
+def _seed_tree(session) -> None:
+    library_index.record_tracks(session, 1, [
+        ("BCee", "Intro", "BCee/Northpoint/01 - Intro.mp3"),
+        ("BCee", "Outro", "BCee/Northpoint/02 - Outro.mp3"),
+        ("BCee", "Solo", "BCee/Best Of/01 - Solo.mp3"),
+        ("A.M.C", "Fast", "A.M.C/Album/01 - Fast.mp3"),
+        ("x", "PlTrack", "DnB Mix [PLabcdefghij]/0001 - PlTrack.mp3"),
+    ])
+    session.commit()
+
+
+def test_library_tree_groups_artists_albums_playlists():
+    with _mem_session() as s:
+        _seed_tree(s)
+        tree = library_index.library_tree(s, 1)
+        assert [a.name for a in tree.artists] == ["A.M.C", "BCee"]   # sorted, case-insensitive
+        bcee = next(a for a in tree.artists if a.name == "BCee")
+        assert bcee.track_count == 3
+        assert sorted(al.name for al in bcee.albums) == ["Best Of", "Northpoint"]
+        assert [p.name for p in tree.playlists] == ["DnB Mix [PLabcdefghij]"]
+        assert (tree.total_artists, tree.total_albums, tree.total_tracks) == (2, 4, 5)
+        # Display titles come from the filename (index prefix stripped), not the stored key.
+        northpoint = next(al for al in bcee.albums if al.name == "Northpoint")
+        assert sorted(t.title for t in northpoint.tracks) == ["Intro", "Outro"]
+
+
+def test_library_tree_skips_rows_without_path():
+    with _mem_session() as s:
+        library_index.record_tracks(s, 1, [("Ghost", "NoPath")])  # 2-tuple → rel_path None
+        s.commit()
+        assert library_index.library_tree(s, 1).total_tracks == 0
+
+
+def test_count_stats():
+    with _mem_session() as s:
+        _seed_tree(s)
+        assert library_index.count_stats(s, 1) == {"artists": 2, "albums": 4, "tracks": 5}
+
+
+def test_filter_tree_matches_artist_album_and_title():
+    with _mem_session() as s:
+        _seed_tree(s)
+        tree = library_index.library_tree(s, 1)
+        # by artist name → whole artist kept
+        assert [a.name for a in library_index.filter_tree(tree, "bcee").artists] == ["BCee"]
+        # by album name → only the matching album
+        f = library_index.filter_tree(tree, "northpoint")
+        assert [al.name for a in f.artists for al in a.albums] == ["Northpoint"]
+        # by track title → only matching tracks survive
+        f2 = library_index.filter_tree(tree, "intro")
+        assert [t.title for a in f2.artists for al in a.albums for t in al.tracks] == ["Intro"]
+        # playlist match
+        assert [p.name for p in library_index.filter_tree(tree, "dnb").playlists] == \
+            ["DnB Mix [PLabcdefghij]"]
+        # empty query → unchanged
+        assert library_index.filter_tree(tree, "") is tree
+
+
+def test_remove_by_prefix_drops_only_folder_rows():
+    with _mem_session() as s:
+        _seed_tree(s)
+        removed = library_index.remove_by_prefix(s, 1, "BCee/Northpoint")
+        s.commit()
+        assert removed == 2
+        paths = set(library_index.load_index_paths(s, 1).values())
+        assert "BCee/Northpoint/01 - Intro.mp3" not in paths
+        assert "BCee/Best Of/01 - Solo.mp3" in paths          # sibling album untouched
+
+
+def test_folder_has_nested_tracks():
+    with _mem_session() as s:
+        record_tracks(s, 1, [
+            ("BCee", "Solo", "BCee/Best Of/01 - Solo.mp3"),   # real leaf album
+            ("BCee", "Loose", "BCee/loose.mp3"),              # loose file at artist root
+        ])
+        s.commit()
+        # A real album folder holds tracks directly → leaf.
+        assert library_index.folder_has_nested_tracks(s, 1, "BCee/Best Of") is False
+        # The artist root contains a sub-album → not a leaf (whole-folder trash unsafe).
+        assert library_index.folder_has_nested_tracks(s, 1, "BCee") is True
+
+
+def test_folder_queries_treat_underscore_literally_not_as_like_wildcard():
+    # Folder names legitimately contain `_` (metadata `/` is mapped to `_`), which is a LIKE
+    # single-char wildcard — the queries must escape it so they don't over-match a sibling
+    # whose name differs only in that position.
+    with _mem_session() as s:
+        record_tracks(s, 1, [
+            ("AC_DC", "Song", "AC_DC/Album/01 - Song.mp3"),   # target folder (has `_`)
+            ("ACxDC", "Other", "ACxDC/Album/01 - Other.mp3"),  # would match `AC_DC%` if unescaped
+        ])
+        s.commit()
+        # folder_has_nested_tracks("AC_DC/Album") must not be tricked by the `_`.
+        assert library_index.folder_has_nested_tracks(s, 1, "AC_DC/Album") is False
+        removed = library_index.remove_by_prefix(s, 1, "AC_DC")
+        s.commit()
+        assert removed == 1                                    # only the real AC_DC row
+        assert set(library_index.load_index_paths(s, 1).values()) == \
+            {"ACxDC/Album/01 - Other.mp3"}                     # sibling untouched

@@ -236,6 +236,67 @@ def test_purge_trash_force_all(env):
     removed = library_ops.purge_trash(1, force_all=True)
 
     assert removed == 1
+
+
+# --- folder-level trash (roadmap 03) ---------------------------------------
+
+def test_trash_folder_moves_whole_album_and_drops_index(env):
+    engine, client, scope = env
+    _seed_track(scope, client, "Artist/Album/01 - Song.mp3")
+    _seed_track(scope, client, "Artist/Album/02 - Other.mp3")
+    # A sibling album must survive untouched.
+    _seed_track(scope, client, "Artist/Other/01 - Keep.mp3")
+
+    trel = library_ops.trash_folder(1, "Artist/Album")
+
+    assert trel == trash_rel("Artist/Album", date.today())
+    assert f"lib/{trel}/01 - Song.mp3" in client.files
+    assert f"lib/{trel}/02 - Other.mp3" in client.files
+    assert not any(f == "lib/Artist/Album/01 - Song.mp3" for f in client.files)
+    assert "lib/Artist/Other/01 - Keep.mp3" in client.files  # sibling kept
+    with scope() as s:
+        rows = s.exec(select(ServerTrack).where(ServerTrack.user_id == 1)).all()
+        assert {r.rel_path for r in rows} == {"Artist/Other/01 - Keep.mp3"}
+
+
+def test_trash_folder_retention_zero_hard_deletes(env):
+    engine, client, scope = env
+    _set_retention(scope, 0)
+    _seed_track(scope, client, "Artist/Album/01 - Song.mp3")
+
+    result = library_ops.trash_folder(1, "Artist/Album")
+
+    assert result is None
+    assert not any(f.startswith("lib/Artist/Album/") for f in client.files)
+    assert not any(f.startswith(f"lib/{TRASH_DIR}/") for f in client.files)
+    with scope() as s:
+        assert s.exec(select(ServerTrack).where(ServerTrack.user_id == 1)).first() is None
+
+
+def test_trash_folder_rejects_empty(env):
+    engine, client, scope = env
+    with pytest.raises(ValueError):
+        library_ops.trash_folder(1, "")
+    with pytest.raises(ValueError):
+        library_ops.trash_folder(1, "/")
+
+
+def test_trash_folder_refuses_folder_with_subalbums(env):
+    # An artist-root "pseudo-album" (loose files beside real sub-albums) must NOT be
+    # trashable as a whole — it would sweep the sibling album into the trash too.
+    engine, client, scope = env
+    _seed_track(scope, client, "Artist/loose.mp3")            # loose file at artist root
+    _seed_track(scope, client, "Artist/Real Album/01 - Keep.mp3")  # a real sub-album
+
+    with pytest.raises(ValueError):
+        library_ops.trash_folder(1, "Artist")
+
+    # Nothing moved; both files and both index rows are intact.
+    assert "lib/Artist/loose.mp3" in client.files
+    assert "lib/Artist/Real Album/01 - Keep.mp3" in client.files
+    with scope() as s:
+        rows = s.exec(select(ServerTrack).where(ServerTrack.user_id == 1)).all()
+        assert len(rows) == 2
     assert not any(f.startswith(f"lib/{TRASH_DIR}/") for f in client.files)
 
 

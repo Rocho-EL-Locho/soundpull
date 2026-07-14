@@ -38,6 +38,7 @@ _WORDMARK = (
 # Sidebar entries: (i18n key, route, active-key, Material icon).
 _NAV_ITEMS = [
     ("nav.download", "/", "download", "download"),
+    ("nav.library", "/library", "library", "library_music"),
     ("nav.history", "/history", "history", "history"),
     ("nav.subscriptions", "/subscriptions", "subscriptions", "sync"),
     ("nav.settings", "/settings", "settings", "settings"),

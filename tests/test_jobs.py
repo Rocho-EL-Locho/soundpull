@@ -232,3 +232,40 @@ def test_log_event_is_best_effort_on_persist_failure(monkeypatch):
     jobs._log_event(js, "done")  # must not raise
 
     assert js.log_lines and js.log_lines[-1].endswith("done")
+
+
+# --- scheduled/manual scan guard (roadmap 03) ------------------------------
+
+def test_run_scan_sync_runs_and_releases_slot(monkeypatch):
+    calls = []
+    monkeypatch.setattr("app.library_index.scan_webdav",
+                        lambda uid: calls.append(uid) or (1, 0, []))
+
+    assert jobs.run_scan_sync(7) == (1, 0, [])
+    assert calls == [7]
+    assert not jobs.is_scan_running(7)          # slot released after the run
+
+
+def test_run_scan_sync_skips_when_already_running(monkeypatch):
+    calls = []
+    monkeypatch.setattr("app.library_index.scan_webdav",
+                        lambda uid: calls.append(uid) or (1, 0, []))
+
+    jobs._scans_running.add(7)                   # simulate a scan already in flight
+    try:
+        assert jobs.run_scan_sync(7) is None     # guarded → skipped
+        assert calls == []                       # scan_webdav never called
+    finally:
+        jobs._scans_running.discard(7)
+
+
+def test_run_scan_sync_releases_slot_on_error(monkeypatch):
+    def boom(uid):
+        raise RuntimeError("dav down")
+
+    monkeypatch.setattr("app.library_index.scan_webdav", boom)
+    try:
+        jobs.run_scan_sync(7)
+    except RuntimeError:
+        pass
+    assert not jobs.is_scan_running(7)           # slot released even when the scan raised

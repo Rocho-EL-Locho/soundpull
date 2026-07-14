@@ -112,6 +112,13 @@ def _remove_from_index(user_id: int, rel: str) -> None:
         library_index.remove_by_rel_path(session, user_id, rel)
 
 
+def _remove_prefix_from_index(user_id: int, folder_rel: str) -> None:
+    from app.db import session_scope
+
+    with session_scope() as session:
+        library_index.remove_by_prefix(session, user_id, folder_rel)
+
+
 # --- Public operations -----------------------------------------------------
 
 def trash_track(user_id: int, rel_path: str) -> str | None:
@@ -135,6 +142,42 @@ def trash_track(user_id: int, rel_path: str) -> str | None:
         _purge(client, base, retention, force_all=False)
     except Exception as exc:  # noqa: BLE001 - purge is opportunistic, never fail the delete
         log.warning("trash purge after delete failed: %s", exc)
+    return trel
+
+
+def trash_folder(user_id: int, folder_rel: str) -> str | None:
+    """Delete a whole album/folder safely: move it into the dated trash, drop its index rows.
+
+    The folder-level counterpart of `trash_track` (roadmap 03). With
+    ``trash_retention_days == 0`` the folder is hard-deleted immediately (no trash) and this
+    returns ``None``; otherwise it returns the new trash-relative folder path. A best-effort
+    purge of expired trash runs afterwards. `folder_rel` must be a non-empty sub-folder — an
+    empty value would target the whole library and is rejected.
+    """
+    rel = resolve_rel(folder_rel).strip("/")
+    if not rel:
+        raise ValueError("Kein gültiger Ordner zum Löschen.")
+    # Refuse a folder that CONTAINS sub-albums: an artist-root "pseudo-album" (loose files
+    # beside real sub-albums) would otherwise drag its sibling albums into the trash too
+    # (roadmap 03 review). A real album/playlist folder holds its tracks directly → allowed.
+    from app.db import session_scope
+
+    with session_scope() as session:
+        if library_index.folder_has_nested_tracks(session, user_id, rel):
+            raise ValueError("Ordner enthält Unteralben – bitte Titel einzeln löschen.")
+    client, base, retention = _load(user_id)
+    src = _join(base, rel)
+    if retention <= 0:
+        webdav_util.delete_path(client, src)
+        _remove_prefix_from_index(user_id, rel)
+        return None
+    trel = trash_rel(rel, date.today())
+    webdav_util.move_path(client, src, _join(base, trel), overwrite=True)
+    _remove_prefix_from_index(user_id, rel)
+    try:
+        _purge(client, base, retention, force_all=False)
+    except Exception as exc:  # noqa: BLE001 - purge is opportunistic, never fail the delete
+        log.warning("trash purge after folder delete failed: %s", exc)
     return trel
 
 
