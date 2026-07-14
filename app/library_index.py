@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from dataclasses import dataclass, field
 
 from sqlmodel import Session, select
 
@@ -86,6 +87,177 @@ def load_index_paths(session: Session, user_id: int) -> dict[tuple[str, str], st
         .where(ServerTrack.user_id == user_id)
     ).all()
     return {(a, t): p for a, t, p in rows}
+
+
+# --- Library browser (roadmap 03) ------------------------------------------
+#
+# The browser derives its artist → album → track structure from the stored `rel_path`
+# segments at query time — there is no separate display table. A full load of one user's
+# rows (tens of thousands at most) grouped in Python is well within budget, so this stays
+# pure and simple rather than pushing grouping into SQL.
+
+# Display names for tracks that don't fit the `<Artist>/<Album>/<file>` layout.
+_UNKNOWN_ARTIST_DISPLAY = "—"
+_NO_ALBUM_DISPLAY = "—"
+
+# A delivered playlist folder is ``<name> [<playlist_id>]`` (see
+# `app.pipeline._playlist_folder_name`). YouTube playlist ids are long id-like tokens
+# (``PL…``, ``OLAK5uy_…``, ``RDCLAK…``), so requiring ≥10 id chars keeps a normal album
+# whose name merely ends in brackets (``… [Deluxe]``) from being mistaken for a playlist.
+_PLAYLIST_FOLDER_RE = re.compile(r".+\s\[[A-Za-z0-9_-]{10,}\]$")
+
+
+@dataclass
+class LibTrack:
+    """One library track for display (all fields already detached from the DB session)."""
+    title: str          # display title (filename stem, index prefix stripped)
+    rel_path: str       # path relative to `webdav_folder` — the trash/reference frame
+
+
+@dataclass
+class LibAlbum:
+    """An album folder (or a playlist folder) with its tracks."""
+    name: str                 # display name (folder basename)
+    folder_rel: str           # folder path relative to `webdav_folder` (for trash/backfill)
+    tracks: list[LibTrack] = field(default_factory=list)
+
+
+@dataclass
+class LibArtist:
+    name: str
+    albums: list[LibAlbum] = field(default_factory=list)
+
+    @property
+    def track_count(self) -> int:
+        return sum(len(a.tracks) for a in self.albums)
+
+
+@dataclass
+class LibraryTree:
+    """The whole browsable library: real artists plus a separate playlist-folder bucket."""
+    artists: list[LibArtist] = field(default_factory=list)
+    playlists: list[LibAlbum] = field(default_factory=list)
+
+    @property
+    def total_artists(self) -> int:
+        return len(self.artists)
+
+    @property
+    def total_albums(self) -> int:
+        return sum(len(a.albums) for a in self.artists) + len(self.playlists)
+
+    @property
+    def total_tracks(self) -> int:
+        return (sum(a.track_count for a in self.artists)
+                + sum(len(p.tracks) for p in self.playlists))
+
+
+def is_playlist_folder(name: str) -> bool:
+    """True if a top-level folder name is a delivered playlist (``<name> [<id>]``)."""
+    return bool(_PLAYLIST_FOLDER_RE.match((name or "").strip()))
+
+
+def split_rel_path(rel_path: str) -> tuple[str, str, str]:
+    """Best-effort ``(artist, album, filename)`` from a library-relative path.
+
+    Mirrors Soundpull's own layout ``<Artist>/<Album>/<file>``; a shallower path (a file
+    directly under one folder, or at the root) falls back to display placeholders. Pure —
+    it does not know about playlist folders; `library_tree` classifies those separately.
+    """
+    parts = [p for p in (rel_path or "").split("/") if p]
+    filename = parts[-1] if parts else ""
+    dirs = parts[:-1]
+    if len(dirs) >= 2:
+        return dirs[-2], dirs[-1], filename
+    if len(dirs) == 1:
+        return dirs[0], _NO_ALBUM_DISPLAY, filename
+    return _UNKNOWN_ARTIST_DISPLAY, _NO_ALBUM_DISPLAY, filename
+
+
+def library_tree(session: Session, user_id: int) -> LibraryTree:
+    """Group a user's indexed tracks into artists → albums → tracks for the browser.
+
+    Loads every row once (via `load_index_paths`), skips rows with no known `rel_path`
+    (they can't be placed or acted on), routes playlist folders into their own bucket, and
+    sorts everything case-insensitively for a stable display. Returns plain dataclasses so
+    the caller can use the result after the session closes.
+    """
+    artists: dict[str, dict[str, LibAlbum]] = {}
+    playlists: dict[str, LibAlbum] = {}
+    for (_a, _t), rel in load_index_paths(session, user_id).items():
+        if not rel:
+            continue  # known track without a path — nothing to display or act on
+        parts = [p for p in rel.split("/") if p]
+        if not parts:
+            continue
+        _, title = _artist_title_from_path(parts)
+        title = title or parts[-1]
+        top = parts[0]
+        if len(parts) >= 2 and is_playlist_folder(top):
+            album = playlists.setdefault(top, LibAlbum(name=top, folder_rel=top))
+            album.tracks.append(LibTrack(title=title, rel_path=rel))
+            continue
+        artist, album_name, _ = split_rel_path(rel)
+        folder_rel = "/".join(parts[:-1])
+        albums = artists.setdefault(artist, {})
+        album = albums.get(folder_rel)
+        if album is None:
+            album = albums[folder_rel] = LibAlbum(name=album_name, folder_rel=folder_rel)
+        album.tracks.append(LibTrack(title=title, rel_path=rel))
+
+    def _by_name(s: str) -> str:
+        return s.casefold()
+
+    tree = LibraryTree()
+    for artist_name in sorted(artists, key=_by_name):
+        albums = [artists[artist_name][k] for k in sorted(artists[artist_name], key=_by_name)]
+        for alb in albums:
+            alb.tracks.sort(key=lambda tr: tr.rel_path.casefold())
+        tree.artists.append(LibArtist(name=artist_name, albums=albums))
+    for pl_name in sorted(playlists, key=_by_name):
+        pl = playlists[pl_name]
+        pl.tracks.sort(key=lambda tr: tr.rel_path.casefold())
+        tree.playlists.append(pl)
+    return tree
+
+
+def count_stats(session: Session, user_id: int) -> dict[str, int]:
+    """``{"artists", "albums", "tracks"}`` counts for the library header (browsable rows)."""
+    tree = library_tree(session, user_id)
+    return {"artists": tree.total_artists, "albums": tree.total_albums,
+            "tracks": tree.total_tracks}
+
+
+def filter_tree(tree: LibraryTree, query: str) -> LibraryTree:
+    """Return a copy of `tree` keeping only entries matching `query` (artist/album/title).
+
+    Case-insensitive substring match. An artist stays if its name matches (all albums kept)
+    or if any of its tracks/albums match (only the matching ones kept); a playlist stays on a
+    name or track match. An empty query returns the tree unchanged. Pure — used for the
+    page's live search over the already-loaded tree (no DB round-trip per keystroke).
+    """
+    q = (query or "").strip().casefold()
+    if not q:
+        return tree
+
+    def _album_hit(alb: LibAlbum, keep_all: bool) -> LibAlbum | None:
+        if keep_all or q in alb.name.casefold():
+            return alb
+        tracks = [tr for tr in alb.tracks if q in tr.title.casefold()]
+        return LibAlbum(name=alb.name, folder_rel=alb.folder_rel, tracks=tracks) if tracks \
+            else None
+
+    out = LibraryTree()
+    for artist in tree.artists:
+        keep_all = q in artist.name.casefold()
+        albums = [a for a in (_album_hit(alb, keep_all) for alb in artist.albums) if a]
+        if albums:
+            out.artists.append(LibArtist(name=artist.name, albums=albums))
+    for pl in tree.playlists:
+        hit = _album_hit(pl, q in pl.name.casefold())
+        if hit:
+            out.playlists.append(hit)
+    return out
 
 
 def is_on_server(session: Session, user_id: int, artist: str, title: str) -> bool:
@@ -276,6 +448,53 @@ def remove_by_rel_path(session: Session, user_id: int, rel_path: str) -> int:
     return len(rows)
 
 
+def folder_has_nested_tracks(session: Session, user_id: int, folder_rel: str) -> bool:
+    """True if any indexed track under ``<folder_rel>/`` sits in a SUB-folder (roadmap 03).
+
+    A real album/playlist folder holds its tracks directly (``Artist/Album/01.mp3`` → one
+    segment under ``Artist/Album/``). An artist-root "pseudo-album" (loose files beside real
+    sub-albums) has tracks nested deeper (``Artist/RealAlbum/x.mp3``). `trash_folder` uses
+    this to REFUSE a whole-folder delete that would otherwise sweep sibling albums into the
+    trash along with the loose files.
+    """
+    from app.models import ServerTrack
+
+    prefix = folder_rel.rstrip("/") + "/"
+    rels = session.exec(
+        select(ServerTrack.rel_path).where(
+            ServerTrack.user_id == user_id,
+            ServerTrack.rel_path.is_not(None),
+            # autoescape: a folder name legitimately contains `_`/`%` (metadata `/` is mapped
+            # to `_`), which are LIKE wildcards — without escaping they'd over-match rows.
+            ServerTrack.rel_path.startswith(prefix, autoescape=True))
+    ).all()
+    return any("/" in rel[len(prefix):] for rel in rels)
+
+
+def remove_by_prefix(session: Session, user_id: int, folder_rel: str) -> int:
+    """Delete every index row whose `rel_path` lies under `folder_rel/` (roadmap 03).
+
+    The path-based counterpart of `remove_by_rel_path` for a whole-folder trash: a folder
+    ``Artist/Album`` drops all its tracks from the index in one query. `folder_rel` must be
+    non-empty (guarded by the caller) so this can never match the entire library. Returns the
+    number of rows removed.
+    """
+    from app.models import ServerTrack
+
+    prefix = folder_rel.rstrip("/") + "/"
+    rows = session.exec(
+        select(ServerTrack).where(
+            ServerTrack.user_id == user_id,
+            ServerTrack.rel_path.is_not(None),
+            # autoescape: `_`/`%` occur in real folder names (metadata `/` → `_`) and are LIKE
+            # wildcards — escape them so a delete never over-matches an unrelated sibling album.
+            ServerTrack.rel_path.startswith(prefix, autoescape=True))
+    ).all()
+    for row in rows:
+        session.delete(row)
+    return len(rows)
+
+
 def update_rel_path(session: Session, user_id: int, old_rel: str, new_rel: str) -> int:
     """Point index row(s) at a moved file's new `rel_path` (roadmap 01).
 
@@ -376,15 +595,27 @@ def scan_webdav(user_id: int, max_depth: int = 8) -> tuple[int, int, list]:
                         "transient error can't delete valid index rows", len(errors))
         else:
             pruned = _prune_missing(session, user_id, found_paths)
+        # Stamp the scan time so the library page can show "scanned Nh ago" and the
+        # scheduled-scan due-check has a reference point (roadmap 03).
+        us = session.exec(select(UserSettings).where(UserSettings.user_id == user_id)).first()
+        if us is not None:
+            from datetime import datetime, timezone
+            us.last_library_scan_at = datetime.now(timezone.utc)
+            session.add(us)
     return added, pruned, errors
 
 
-def backfill_lyrics(user_id: int, progress=None, max_depth: int = 8) -> tuple[int, int, int, list]:
+def backfill_lyrics(user_id: int, progress=None, max_depth: int = 8, *,
+                    prefix: str | None = None) -> tuple[int, int, int, list]:
     """Write a `.lrc` sidecar for every library track that lacks one (LRCGET-style backfill).
 
     Walks the user's WebDAV target folder (path-based, like `scan_webdav`) and, for each audio
     file WITHOUT a sibling `.lrc`, fetches synced lyrics from LRCLIB and uploads the sidecar
     next to the track. Best-effort and WebDAV-only; never touches existing `.lrc` files.
+
+    `prefix` (roadmap 03) scopes the backfill to one album/folder: only files whose library-
+    relative path starts with ``<prefix>/`` are considered. The settings-page button passes
+    ``None`` (whole library — unchanged); the library page passes an album's `folder_rel`.
 
     Returns ``(written, skipped, missing, errors)``:
       - ``written`` — sidecars newly uploaded
@@ -413,17 +644,22 @@ def backfill_lyrics(user_id: int, progress=None, max_depth: int = 8) -> tuple[in
         base = (us.webdav_folder or "").strip("/")
 
     client = make_client(url, username, password)
-    prefix = f"{base}/" if base else ""
     errors: list = []
+
+    # An album-scoped backfill only considers files under `<scope>/` (relative to base).
+    scope = prefix.rstrip("/") + "/" if prefix else None
+    base_prefix = f"{base}/" if base else ""
 
     # 1) Enumerate audio files still missing a sidecar (one listing per dir; `.lrc` inline).
     targets: list[tuple[str, str, str]] = []   # (audio_path, artist, title)
     skipped = 0
     for full, has_lrc in _walk_audio_with_lrc(client, base, 0, max_depth, errors):
+        rel = full[len(base_prefix):] if base_prefix and full.startswith(base_prefix) else full
+        if scope and not rel.startswith(scope):
+            continue  # outside the requested album/folder — not part of this backfill
         if has_lrc:
             skipped += 1
             continue
-        rel = full[len(prefix):] if prefix and full.startswith(prefix) else full
         parts = [p for p in rel.split("/") if p]
         artist, title = _artist_title_from_path(parts)
         if artist and title:

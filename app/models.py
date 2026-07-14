@@ -71,6 +71,16 @@ class UserSettings(SQLModel, table=True):
     # many days. `0` = delete immediately (no trash). WebDAV-only.
     trash_retention_days: int = 30
 
+    # Library browser (roadmap 03): a scheduled WebDAV scan keeps the `ServerTrack` index
+    # fresh without pressing the manual button. `0` = off (default — no behaviour change);
+    # otherwise the scheduler enqueues a scan once `last_library_scan_at` is this many hours
+    # old. `last_library_scan_at` is stamped by every scan (manual or scheduled) and shown
+    # as "scanned Nh ago" on the library page. `navidrome_base_url` (optional) turns album
+    # rows into a "open in Navidrome" search deep link — a plain link, no API coupling.
+    library_scan_interval_hours: int = Field(default=0)
+    last_library_scan_at: datetime | None = Field(default=None)
+    navidrome_base_url: str = Field(default="")
+
     # Per-user YouTube cookie (issue #9), a Netscape cookies.txt fed to yt-dlp so
     # age-gated / bot-checked / throttled tracks download. Fernet-encrypted; never
     # exposed in plaintext to the client.

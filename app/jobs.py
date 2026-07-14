@@ -434,6 +434,86 @@ def running_sync_phase(subscription_id: int) -> str | None:
     return None
 
 
+# User ids with a library scan currently queued/running (roadmap 03). A scan is a lightweight
+# maintenance task (no history row), so it's tracked here rather than in `_registry`. The set
+# is the single guard shared by BOTH the scheduled path (`start_scan`) and the user-triggered
+# path (`run_scan_sync`), so a manual rescan and a scheduled scan can never run concurrently
+# for the same user (redundant WebDAV walk + interleaved index prune/add).
+_scans_running: set[int] = set()
+
+
+def is_scan_running(user_id: int) -> bool:
+    """True if a library scan for this user is currently queued/running (scheduler guard)."""
+    with _lock:
+        return user_id in _scans_running
+
+
+def _acquire_scan(user_id: int) -> bool:
+    """Claim the scan slot for a user; False if one is already held."""
+    with _lock:
+        if user_id in _scans_running:
+            return False
+        _scans_running.add(user_id)
+        return True
+
+
+def _release_scan(user_id: int) -> None:
+    with _lock:
+        _scans_running.discard(user_id)
+
+
+def run_scan_sync(user_id: int):
+    """Run a guarded library scan and BLOCK until done (for UI handlers via `run.io_bound`).
+
+    Returns `scan_webdav`'s ``(added, pruned, errors)`` tuple, or ``None`` if a scan for this
+    user is already running (so the caller can show a "busy" note instead of starting a second
+    concurrent walk). Shares `_scans_running` with the scheduled path.
+    """
+    if not _acquire_scan(user_id):
+        return None
+    try:
+        from app import library_index
+        return library_index.scan_webdav(user_id)
+    finally:
+        _release_scan(user_id)
+
+
+def start_scan(user_id: int) -> bool:
+    """Enqueue a scheduled library scan on the worker pool (roadmap 03). False if already running.
+
+    Claims `last_library_scan_at = now` up front — mirroring how `start_sync` claims
+    `last_checked_at` — so a failing scan doesn't re-fire every scheduler tick; `scan_webdav`
+    re-stamps it on completion. The scan runs off the scheduler thread (it opens its own DB
+    session, so it's worker-safe).
+    """
+    if not _acquire_scan(user_id):
+        return False
+    try:
+        with session_scope() as session:
+            us = session.exec(
+                select(UserSettings).where(UserSettings.user_id == user_id)).first()
+            if us is not None:
+                us.last_library_scan_at = _utcnow()
+                session.add(us)
+
+        def _run_scan() -> None:
+            from app import library_index
+            try:
+                added, pruned, errors = library_index.scan_webdav(user_id)
+                log.info("scheduled scan for user %s: +%d/-%d (%d errors)",
+                         user_id, added, pruned, len(errors))
+            except Exception:  # noqa: BLE001 - a failed scan must not kill the worker
+                log.exception("scheduled library scan for user %s failed", user_id)
+            finally:
+                _release_scan(user_id)
+
+        _executor.submit(_run_scan)
+        return True
+    except Exception:  # noqa: BLE001 - submit/claim failed → don't leak the scan slot
+        _release_scan(user_id)
+        raise
+
+
 @dataclass
 class _SyncConfig:
     """Everything a sync worker needs, snapshotted from the DB before it starts."""

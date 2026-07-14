@@ -15,6 +15,7 @@ from app.fix_music_tags import TAG_OPTION_FIELDS, TagOptions
 from app.genres import ALLOWED_GENRES
 from app.i18n import audio_format_labels, t
 from app.models import UserSettings
+from app.pages._shared import run_library_task
 from app.pipeline import normalize_audio_format
 from app.security import decrypt_secret, encrypt_secret
 from app.theme import tag_option_switches
@@ -46,6 +47,8 @@ def settings_content() -> None:
             "dedup": bool(us.dedup_skip_existing),
             "lyrics": bool(us.fetch_synced_lyrics),
             "trash_retention": int(us.trash_retention_days or 0),
+            "scan_interval": int(us.library_scan_interval_hours or 0),
+            "navidrome_url": us.navidrome_base_url or "",
             # Only the "is one stored?" flag — never the plaintext cookie (issue #9).
             "has_cookie": us.has_youtube_cookies,
             # Notifications (issue #42): toggles + channel config. Secrets are exposed
@@ -299,28 +302,34 @@ def settings_content() -> None:
         # playlist sync only fetches new ones. Runs off-thread (WebDAV walk is I/O).
         ui.label(t("settings.scan_desc")).classes("text-xs text-white/50")
 
-        async def scan_server() -> None:
-            from app import library_index, library_ops
-
-            ui.notify(t("settings.scan_running"), type="ongoing")
-            try:
-                added, pruned, errors = await run.io_bound(library_index.scan_webdav, uid)
-            except Exception as exc:  # noqa: BLE001 - surface config/connection errors
-                ui.notify(t("settings.scan_error", error=exc), type="negative")
-                return
-            # Opportunistic trash purge (roadmap 01): expired trash folders are cleaned up
-            # here so no separate scheduler is needed. Best-effort — never fails the scan.
-            try:
-                await run.io_bound(library_ops.purge_trash, uid)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("opportunistic trash purge failed: %s", exc)
+        def _scan_done(result) -> tuple[str, str]:
+            if result is None:  # a scan for this user is already running (shared guard)
+                return "warning", t("settings.scan_busy")
+            added, pruned, errors = result
             # Distinguish a healthy-but-empty scan from an INCOMPLETE one: unreadable
             # sub-folders mean the index may be stale and pruning was skipped (issue #38).
             if errors:
-                ui.notify(t("settings.scan_incomplete", count=added, failed=len(errors)),
-                          type="warning")
-                return
-            ui.notify(t("settings.scan_done", count=added, removed=pruned), type="positive")
+                return "warning", t("settings.scan_incomplete", count=added, failed=len(errors))
+            return "positive", t("settings.scan_done", count=added, removed=pruned)
+
+        async def scan_server() -> None:
+            from app import jobs, library_ops
+
+            def _scan():
+                # Guarded run: skips if a scheduled/other scan is already walking this library.
+                result = jobs.run_scan_sync(uid)
+                if result is None:
+                    return None
+                # Opportunistic trash purge (roadmap 01): expired trash folders are cleaned up
+                # here so no separate scheduler is needed. Best-effort — never fails the scan.
+                try:
+                    library_ops.purge_trash(uid)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("opportunistic trash purge failed: %s", exc)
+                return result
+
+            await run_library_task(_scan, running_key="settings.scan_running",
+                                   error_key="settings.scan_error", done=_scan_done)
 
         ui.button(t("settings.scan_button"), icon="cloud_sync", on_click=scan_server) \
             .props("outline").classes("text-white/90 self-start")
@@ -329,22 +338,21 @@ def settings_content() -> None:
         # next to every track that lacks one. Best-effort, WebDAV-only; runs off-thread.
         ui.label(t("settings.lyrics_backfill_desc")).classes("text-xs text-white/50 mt-2")
 
+        def _backfill_done(result) -> tuple[str, str]:
+            written, skipped, missing, errors = result
+            if errors:
+                return "warning", t("settings.lyrics_backfill_incomplete", written=written,
+                                    failed=len(errors))
+            return "positive", t("settings.lyrics_backfill_done", written=written,
+                                 skipped=skipped, missing=missing)
+
         async def backfill_lyrics_server() -> None:
             from app import library_index
 
-            ui.notify(t("settings.lyrics_backfill_running"), type="ongoing")
-            try:
-                written, skipped, missing, errors = await run.io_bound(
-                    library_index.backfill_lyrics, uid)
-            except Exception as exc:  # noqa: BLE001 - surface config/connection errors
-                ui.notify(t("settings.lyrics_backfill_error", error=exc), type="negative")
-                return
-            if errors:
-                ui.notify(t("settings.lyrics_backfill_incomplete", written=written,
-                            failed=len(errors)), type="warning")
-                return
-            ui.notify(t("settings.lyrics_backfill_done", written=written, skipped=skipped,
-                        missing=missing), type="positive")
+            await run_library_task(lambda: library_index.backfill_lyrics(uid),
+                                   running_key="settings.lyrics_backfill_running",
+                                   error_key="settings.lyrics_backfill_error",
+                                   done=_backfill_done)
 
         ui.button(t("settings.lyrics_backfill_button"), icon="lyrics",
                   on_click=backfill_lyrics_server) \
@@ -360,6 +368,20 @@ def settings_content() -> None:
         ui.label(t("settings.trash_retention_hint")).classes("text-xs text-white/50 mt-2")
         trash_retention_num = ui.number(t("settings.trash_retention"), min=0, step=1,
                                         value=snap["trash_retention"]) \
+            .props("outlined dense dark").classes("w-full")
+
+        # Scheduled library scan (roadmap 03): a background scan keeps the index fresh.
+        # 0 = off (manual scan only). Requires SYNC_ENABLED (the same scheduler thread).
+        ui.label(t("settings.scan_interval_hint")).classes("text-xs text-white/50 mt-2")
+        scan_interval_num = ui.number(t("settings.scan_interval"), min=0, step=1,
+                                      value=snap["scan_interval"]) \
+            .props("outlined dense dark").classes("w-full")
+
+        # Navidrome deep link (roadmap 03): when set, the library page links each album to a
+        # Navidrome search. Optional and API-free — just a base URL like https://music.host.
+        ui.label(t("settings.navidrome_hint")).classes("text-xs text-white/50 mt-2")
+        navidrome_url_in = ui.input(t("settings.navidrome_url"), value=snap["navidrome_url"],
+                                    placeholder="https://music.example.org") \
             .props("outlined dense dark").classes("w-full")
 
         # Optional: browse the trash, restore a file or empty it (features 03/04 bring the
@@ -439,6 +461,8 @@ def settings_content() -> None:
                 row.dedup_skip_existing = bool(dedup_sw.value)
                 row.fetch_synced_lyrics = bool(lyrics_sw.value)
                 row.trash_retention_days = max(int(trash_retention_num.value or 0), 0)
+                row.library_scan_interval_hours = max(int(scan_interval_num.value or 0), 0)
+                row.navidrome_base_url = (navidrome_url_in.value or "").strip()
                 if (wd_pass.value or "").strip():
                     row.webdav_password_enc = encrypt_secret(wd_pass.value.strip())
                 # YouTube cookie (issue #9): remove wins; else store new; else keep.

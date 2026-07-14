@@ -23,6 +23,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     "de": {
         # nav / app shell
         "nav.download": "Download",
+        "nav.library": "Bibliothek",
         "nav.history": "Verlauf",
         "nav.subscriptions": "Abos",
         "nav.settings": "Einstellungen",
@@ -202,6 +203,16 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
                                     "{count} Titel erfasst – veraltete Einträge wurden nicht "
                                     "entfernt. Bitte erneut versuchen.",
         "settings.scan_error": "Einlesen fehlgeschlagen: {error}",
+        "settings.scan_busy": "Ein Scan läuft für dich bereits – bitte kurz warten.",
+        # Geplanter Scan + Navidrome-Link (roadmap 03)
+        "settings.scan_interval": "Automatischer Scan (Stunden)",
+        "settings.scan_interval_hint": "Den WebDAV-Bestand regelmäßig im Hintergrund einlesen, "
+                                       "damit die Bibliothek aktuell bleibt. 0 = aus (nur "
+                                       "manueller Scan).",
+        "settings.navidrome_url": "Navidrome-Adresse",
+        "settings.navidrome_hint": "Optional: Basis-URL deiner Navidrome-Instanz (z. B. "
+                                   "https://music.example.org). Dann verlinkt die Bibliothek "
+                                   "jedes Album zur Navidrome-Suche.",
         # Lyrics-Backfill (issue #43)
         "settings.lyrics_backfill_desc": "Die gesamte Bibliothek durchgehen und für jeden Titel "
                                          "ohne Liedtext eine .lrc-Datei von LRCLIB nachladen. "
@@ -241,6 +252,34 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
                                 "LRCLIB und legt pro Titel eine .lrc-Datei daneben ab, die "
                                 "Navidrome anzeigt. Ohne Treffer wird der Titel übersprungen.",
         "index.lyrics_label": "Liedtext (.lrc) laden",
+        # Bibliothek (roadmap 03)
+        "library.heading": "Bibliothek",
+        "library.rescan": "Neu einlesen",
+        "library.search": "Suchen (Interpret, Album, Titel)",
+        "library.stats": "{tracks} Titel · {artists} Interpreten · {albums} Alben",
+        "library.scanned_never": "noch nicht eingelesen",
+        "library.scanned_recent": "gerade eingelesen",
+        "library.scanned_hours": "vor {hours} h eingelesen",
+        "library.scanned_days": "vor {days} Tagen eingelesen",
+        "library.artists": "Interpreten",
+        "library.playlists": "Playlists",
+        "library.albums": "Alben",
+        "library.tracks": "Titel",
+        "library.no_artists": "Keine Treffer.",
+        "library.pick_artist": "Wähle links einen Interpreten.",
+        "library.pick_album": "Wähle ein Album.",
+        "library.empty": "Deine Bibliothek ist noch leer.",
+        "library.empty_no_webdav": "Hinterlege zuerst ein WebDAV-Ziel in den Einstellungen.",
+        "library.empty_scan": "Server einlesen",
+        "library.delete_track": "Titel löschen",
+        "library.delete_album": "Album löschen",
+        "library.backfill_album": "Liedtexte nachladen",
+        "library.open_navidrome": "In Navidrome öffnen",
+        "library.confirm_delete_track": "Diesen Titel in den Papierkorb verschieben?",
+        "library.confirm_delete_album": "Dieses Album in den Papierkorb verschieben?",
+        "library.delete_yes": "Löschen",
+        "library.deleted": "In den Papierkorb verschoben",
+        "library.delete_error": "Löschen fehlgeschlagen: {error}",
         # Playlist-Abos (issue #21)
         "subs.heading_new": "Neues Playlist-Abo",
         "subs.desc": "Eine Playlist in einem Intervall automatisch synchronisieren. "
@@ -320,6 +359,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     "en": {
         # nav / app shell
         "nav.download": "Download",
+        "nav.library": "Library",
         "nav.history": "History",
         "nav.subscriptions": "Subscriptions",
         "nav.settings": "Settings",
@@ -497,6 +537,15 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
                                     "{count} tracks indexed — stale entries were not pruned. "
                                     "Please try again.",
         "settings.scan_error": "Scan failed: {error}",
+        "settings.scan_busy": "A scan is already running for you — please wait a moment.",
+        # Scheduled scan + Navidrome link (roadmap 03)
+        "settings.scan_interval": "Automatic scan (hours)",
+        "settings.scan_interval_hint": "Periodically scan the WebDAV library in the background "
+                                       "so the index stays fresh. 0 = off (manual scan only).",
+        "settings.navidrome_url": "Navidrome address",
+        "settings.navidrome_hint": "Optional: base URL of your Navidrome instance (e.g. "
+                                   "https://music.example.org). The library then links each "
+                                   "album to a Navidrome search.",
         # Lyrics backfill (issue #43)
         "settings.lyrics_backfill_desc": "Walk the whole library and fetch a .lrc from LRCLIB "
                                          "for every track that has no lyrics yet. Existing .lrc "
@@ -534,6 +583,34 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
                                 ".lrc file next to each track for Navidrome to display. Tracks "
                                 "with no match are simply skipped.",
         "index.lyrics_label": "Fetch lyrics (.lrc)",
+        # Library (roadmap 03)
+        "library.heading": "Library",
+        "library.rescan": "Rescan",
+        "library.search": "Search (artist, album, title)",
+        "library.stats": "{tracks} tracks · {artists} artists · {albums} albums",
+        "library.scanned_never": "not scanned yet",
+        "library.scanned_recent": "scanned just now",
+        "library.scanned_hours": "scanned {hours}h ago",
+        "library.scanned_days": "scanned {days}d ago",
+        "library.artists": "Artists",
+        "library.playlists": "Playlists",
+        "library.albums": "Albums",
+        "library.tracks": "Tracks",
+        "library.no_artists": "No matches.",
+        "library.pick_artist": "Pick an artist on the left.",
+        "library.pick_album": "Pick an album.",
+        "library.empty": "Your library is still empty.",
+        "library.empty_no_webdav": "Configure a WebDAV target in settings first.",
+        "library.empty_scan": "Scan server",
+        "library.delete_track": "Delete track",
+        "library.delete_album": "Delete album",
+        "library.backfill_album": "Backfill lyrics",
+        "library.open_navidrome": "Open in Navidrome",
+        "library.confirm_delete_track": "Move this track to the trash?",
+        "library.confirm_delete_album": "Move this album to the trash?",
+        "library.delete_yes": "Delete",
+        "library.deleted": "Moved to trash",
+        "library.delete_error": "Delete failed: {error}",
         # Playlist subscriptions (issue #21)
         "subs.heading_new": "New playlist subscription",
         "subs.desc": "Automatically sync a playlist on an interval. Each run downloads "
