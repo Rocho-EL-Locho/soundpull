@@ -181,12 +181,16 @@ def settings_content() -> None:
                     cfg = notifications.NotifyConfig.from_settings(row) if row else None
                 return notifications.send_test(cfg) if cfg is not None else []
 
-            ui.notify(t("notify.test_running"), type="ongoing")
+            # Persistent spinner we dismiss ourselves — an "ongoing" toast never auto-closes.
+            note = ui.notification(t("notify.test_running"), type="ongoing", spinner=True,
+                                   timeout=None)
             try:
                 sent = await run.io_bound(_load_and_send)
             except Exception as exc:  # noqa: BLE001 - surface a misconfigured channel/secret
                 ui.notify(t("notify.test_error", error=exc), type="negative")
                 return
+            finally:
+                note.dismiss()
             if sent:
                 ui.notify(t("notify.test_sent", channels=", ".join(sent)), type="positive")
             else:

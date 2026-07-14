@@ -37,12 +37,16 @@ async def run_library_task(
 
     Returns the task's result, or ``None`` if it raised (the error toast has already fired).
     """
-    ui.notify(t(running_key), type="ongoing")
+    # A persistent "ongoing" toast (timeout=None) that we dismiss ourselves when the task
+    # finishes — otherwise the spinner notification would hang on screen forever.
+    note = ui.notification(t(running_key), type="ongoing", spinner=True, timeout=None)
     try:
         result = await run.io_bound(fn)
     except Exception as exc:  # noqa: BLE001 - surface config/connection errors to the user
         ui.notify(t(error_key, error=exc), type="negative")
         return None
+    finally:
+        note.dismiss()
     notify_type, message = done(result)
     ui.notify(message, type=notify_type)
     return result
