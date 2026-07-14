@@ -28,6 +28,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "nav.settings": "Einstellungen",
         "nav.logout": "Abmelden",
         "nav.language": "Sprache",
+        "nav.menu": "Menü ein-/ausklappen",
+        "nav.selfhosted": "self-hosted",
+        # footer
+        "footer.tagline": "Soundpull · self-hosted · MIT-Lizenz",
+        "footer.github": "GitHub",
+        "footer.issues": "Issues",
+        "footer.license": "Lizenz",
         # shared values
         "common.album": "Album",
         "common.single": "Single",
@@ -35,7 +42,11 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "common.artist": "Künstler",
         "genre.none": "Kein Genre",
         "dest.browser": "Im Browser (ZIP)",
+        "dest.browser_title": "Browser-ZIP",
+        "dest.browser_sub": "Direkt herunterladen",
         "dest.webdav": "WebDAV",
+        "dest.webdav_sub": "Auf deinen Server",
+        "dest.webdav_sub_unconfigured": "Erst in Einstellungen einrichten",
         "dest.webdav_unconfigured": "WebDAV (nicht konfiguriert)",
         # audio quality/format select labels (keys = app.pipeline.AUDIO_FORMATS)
         "audio.mp3_320": "MP3 320 kbps · max. Kompatibilität (Standard)",
@@ -56,13 +67,15 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "phase.metadata": "Metadaten",
         "phase.download": "Download",
         "phase.tags": "Tags & Cover",
+        "phase.lyrics": "Liedtext",
         "phase.packaging": "ZIP packen",
         "phase.upload": "WebDAV-Upload",
         "phase.done": "Fertig",
         "phase.error": "Fehler",
         # download page
         "index.heading_new": "Neuer Download",
-        "index.url_label": "YouTube Music URL",
+        "index.subtitle": "Füge einen YouTube-Music-Link ein und lade ihn getaggt herunter.",
+        "index.url_label": "YouTube-Music-Link",
         "index.genre_label": "Genre",
         "index.mode_label": "Modus",
         "index.audio_label": "Qualität / Format",
@@ -78,6 +91,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "index.unknown_error": "Unbekannter Fehler",
         "index.completed": "Abgeschlossen ✓",
         "index.download_zip": "ZIP herunterladen",
+        # job warnings (issue #38) — set as keys by the worker, resolved at render time
+        "jobs.index_update_failed": "Upload erfolgreich, aber die Server-Index-Aktualisierung "
+                                    "ist fehlgeschlagen – diese Titel könnten beim nächsten "
+                                    "Sync erneut geladen werden.",
+        "jobs.seed_failed": "Der Playlist-Index konnte nicht initialisiert werden – der "
+                            "nächste Sync versucht es automatisch erneut.",
+        "jobs.partial_delivery": "Unvollständig: {failed} von {total} Titeln fehlen – von "
+                                 "YouTube gedrosselt oder geblockt. Bitte erneut herunterladen.",
         # history page
         "history.heading": "Verlauf",
         "history.empty": "Noch keine Downloads.",
@@ -86,6 +107,40 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "history.status_queued": "Warteschlange",
         "history.status_running": "Läuft",
         "history.status_unknown": "?",
+        # history page — filter / actions / detail (issue #44)
+        "history.filter_search": "Suche (Artist, Album, URL)",
+        "history.filter_all": "Alle",
+        "history.filter_status": "Status",
+        "history.filter_from": "Von",
+        "history.filter_to": "Bis",
+        "history.no_results": "Keine Treffer für diese Filter.",
+        "history.action_details": "Details",
+        "history.action_retry": "Erneut laden",
+        "history.action_delete": "Löschen",
+        "history.notify_retry_started": "Download erneut gestartet.",
+        "history.notify_retry_no_dest": "Kein WebDAV-Ziel im Profil hinterlegt.",
+        "history.notify_retry_failed": "Erneut laden fehlgeschlagen.",
+        "history.notify_deleted": "Eintrag gelöscht.",
+        "history.confirm_delete_heading": "Eintrag löschen?",
+        "history.confirm_delete_text": "Dieser Verlaufseintrag wird dauerhaft entfernt.",
+        "history.confirm_delete_yes": "Löschen",
+        "history.detail_heading": "Job-Details",
+        "history.detail_status": "Status",
+        "history.detail_url": "URL",
+        "history.detail_mode": "Modus",
+        "history.detail_dest": "Ziel",
+        "history.detail_audio": "Format",
+        "history.detail_genre": "Genre",
+        "history.detail_artist": "Artist",
+        "history.detail_album": "Album",
+        "history.detail_created": "Erstellt",
+        "history.detail_finished": "Beendet",
+        "history.detail_tracks": "Titel",
+        "history.detail_failed": "Fehlgeschlagen",
+        "history.detail_error": "Fehler",
+        "history.detail_warning": "Warnung",
+        "history.detail_log": "Verlauf / Log",
+        "history.detail_no_log": "Kein Log verfügbar.",
         # settings page
         "settings.profile_heading": "Profil & Standardwerte",
         "settings.default_genre": "Standard-Genre",
@@ -142,7 +197,22 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "settings.scan_button": "Server einlesen",
         "settings.scan_running": "Server wird eingelesen …",
         "settings.scan_done": "{count} neue Titel erfasst, {removed} veraltete entfernt",
+        "settings.scan_incomplete": "Einlesen unvollständig: {failed} Ordner nicht lesbar, "
+                                    "{count} Titel erfasst – veraltete Einträge wurden nicht "
+                                    "entfernt. Bitte erneut versuchen.",
         "settings.scan_error": "Einlesen fehlgeschlagen: {error}",
+        # Lyrics-Backfill (issue #43)
+        "settings.lyrics_backfill_desc": "Die gesamte Bibliothek durchgehen und für jeden Titel "
+                                         "ohne Liedtext eine .lrc-Datei von LRCLIB nachladen. "
+                                         "Vorhandene .lrc bleiben unangetastet. Nur bei WebDAV.",
+        "settings.lyrics_backfill_button": "Liedtexte nachladen",
+        "settings.lyrics_backfill_running": "Liedtexte werden nachgeladen …",
+        "settings.lyrics_backfill_done": "{written} Liedtexte geschrieben, {skipped} übersprungen, "
+                                         "{missing} ohne Treffer",
+        "settings.lyrics_backfill_incomplete": "Nachladen unvollständig: {failed} Ordner/Uploads "
+                                               "fehlgeschlagen, {written} Liedtexte geschrieben. "
+                                               "Bitte erneut versuchen.",
+        "settings.lyrics_backfill_error": "Nachladen fehlgeschlagen: {error}",
         # Dedup (issue #31)
         "settings.dedup_label": "Bereits vorhandene Titel überspringen",
         "settings.dedup_desc": "Titel, die schon in deinem Bestand liegen, nicht erneut "
@@ -150,6 +220,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
                                "vorhandene Datei verwiesen (kein Duplikat). Nur bei WebDAV.",
         "index.dedup_label": "Vorhandene Titel überspringen",
         "index.dedup_hint": "Nur bei Ziel „WebDAV“ verfügbar.",
+        # Synchronisierter Liedtext (issue #43)
+        "settings.lyrics_label": "Synchronisierten Liedtext (.lrc) laden",
+        "settings.lyrics_desc": "Lädt — soweit vorhanden — synchronisierten Liedtext von "
+                                "LRCLIB und legt pro Titel eine .lrc-Datei daneben ab, die "
+                                "Navidrome anzeigt. Ohne Treffer wird der Titel übersprungen.",
+        "index.lyrics_label": "Liedtext (.lrc) laden",
         # Playlist-Abos (issue #21)
         "subs.heading_new": "Neues Playlist-Abo",
         "subs.desc": "Eine Playlist in einem Intervall automatisch synchronisieren. "
@@ -183,6 +259,48 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "subs.notify_created": "Abo angelegt",
         "subs.notify_deleted": "Abo gelöscht",
         "subs.notify_sync_started": "Synchronisierung gestartet",
+        # Benachrichtigungen (issue #42) — Meldungsinhalte (off-request via translate())
+        "notify.new_tracks_title": "Soundpull",
+        "notify.new_tracks_body": "{playlist}: {count} neue Titel",
+        "notify.error_title": "Soundpull: Job fehlgeschlagen",
+        "notify.error_body": "{kind} fehlgeschlagen: {error}",
+        "notify.kind_sync": "Playlist-Sync",
+        "notify.kind_download": "Download",
+        "notify.test_title": "Soundpull: Test",
+        "notify.test_body": "Testbenachrichtigung — deine Einstellungen funktionieren. 🎵",
+        # Benachrichtigungen (issue #42) — Einstellungen
+        "notify.heading": "Benachrichtigungen",
+        "notify.desc": "Optional bei Hintergrund-Ereignissen benachrichtigen lassen. Wähle die "
+                       "Ereignisse und mindestens einen Kanal (ntfy, Webhook oder E-Mail). "
+                       "Keine Passwörter oder Tokens werden im Inhalt mitgesendet.",
+        "notify.event_new_tracks": "Neue Titel bei Playlist-Sync",
+        "notify.event_sync_error": "Fehlgeschlagener Playlist-Sync",
+        "notify.event_download_error": "Fehlgeschlagener Download",
+        "notify.ntfy_heading": "ntfy (Push)",
+        "notify.ntfy_url_label": "ntfy-Topic-URL (z. B. https://ntfy.sh/mein-topic)",
+        "notify.ntfy_token_label": "Zugriffstoken (optional)",
+        "notify.ntfy_token_placeholder_set": "•••••••• (gesetzt — leer lassen zum Behalten)",
+        "notify.ntfy_token_clear": "Gespeichertes Token entfernen",
+        "notify.webhook_heading": "Webhook",
+        "notify.webhook_url_label": "Webhook-URL (JSON-POST)",
+        "notify.email_heading": "E-Mail (SMTP)",
+        "notify.email_to_label": "Empfänger (An)",
+        "notify.email_from_label": "Absender (Von)",
+        "notify.smtp_host_label": "SMTP-Server",
+        "notify.smtp_port_label": "Port",
+        "notify.smtp_user_label": "SMTP-Benutzer",
+        "notify.smtp_password_label": "SMTP-Passwort",
+        "notify.smtp_password_placeholder_set": "•••••••• (gesetzt — leer lassen zum Behalten)",
+        "notify.smtp_password_clear": "Gespeichertes SMTP-Passwort entfernen",
+        "notify.security_label": "Verschlüsselung",
+        "notify.security_starttls": "STARTTLS",
+        "notify.security_ssl": "SSL/TLS",
+        "notify.security_none": "Keine",
+        "notify.test_button": "Test senden",
+        "notify.test_running": "Testbenachrichtigung wird gesendet …",
+        "notify.test_sent": "Testbenachrichtigung gesendet an: {channels}",
+        "notify.test_none": "Kein Kanal konfiguriert — bitte zuerst speichern.",
+        "notify.test_error": "Test fehlgeschlagen: {error}",
     },
     "en": {
         # nav / app shell
@@ -192,6 +310,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "nav.settings": "Settings",
         "nav.logout": "Log out",
         "nav.language": "Language",
+        "nav.menu": "Toggle menu",
+        "nav.selfhosted": "self-hosted",
+        # footer
+        "footer.tagline": "Soundpull · self-hosted · MIT license",
+        "footer.github": "GitHub",
+        "footer.issues": "Issues",
+        "footer.license": "License",
         # shared values
         "common.album": "Album",
         "common.single": "Single",
@@ -199,7 +324,11 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "common.artist": "Artist",
         "genre.none": "No genre",
         "dest.browser": "In browser (ZIP)",
+        "dest.browser_title": "Browser ZIP",
+        "dest.browser_sub": "Download directly",
         "dest.webdav": "WebDAV",
+        "dest.webdav_sub": "To your server",
+        "dest.webdav_sub_unconfigured": "Set up in Settings first",
         "dest.webdav_unconfigured": "WebDAV (not configured)",
         # audio quality/format select labels (keys = app.pipeline.AUDIO_FORMATS)
         "audio.mp3_320": "MP3 320 kbps · max. compatibility (default)",
@@ -220,13 +349,15 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "phase.metadata": "Metadata",
         "phase.download": "Download",
         "phase.tags": "Tags & cover",
+        "phase.lyrics": "Lyrics",
         "phase.packaging": "Packing ZIP",
         "phase.upload": "WebDAV upload",
         "phase.done": "Done",
         "phase.error": "Error",
         # download page
         "index.heading_new": "New download",
-        "index.url_label": "YouTube Music URL",
+        "index.subtitle": "Paste a YouTube Music link and download it fully tagged.",
+        "index.url_label": "YouTube Music link",
         "index.genre_label": "Genre",
         "index.mode_label": "Mode",
         "index.audio_label": "Quality / format",
@@ -242,6 +373,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "index.unknown_error": "Unknown error",
         "index.completed": "Completed ✓",
         "index.download_zip": "Download ZIP",
+        # job warnings (issue #38) — set as keys by the worker, resolved at render time
+        "jobs.index_update_failed": "Upload succeeded, but updating the server index failed — "
+                                    "these tracks may be downloaded again on the next sync.",
+        "jobs.partial_delivery": "Incomplete: {failed} of {total} tracks are missing — "
+                                 "throttled or blocked by YouTube. Please download again.",
+        "jobs.seed_failed": "The playlist index could not be initialised — the next sync will "
+                            "automatically try again.",
         # history page
         "history.heading": "History",
         "history.empty": "No downloads yet.",
@@ -250,6 +388,40 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "history.status_queued": "Queued",
         "history.status_running": "Running",
         "history.status_unknown": "?",
+        # history page — filter / actions / detail (issue #44)
+        "history.filter_search": "Search (artist, album, URL)",
+        "history.filter_all": "All",
+        "history.filter_status": "Status",
+        "history.filter_from": "From",
+        "history.filter_to": "To",
+        "history.no_results": "No matches for these filters.",
+        "history.action_details": "Details",
+        "history.action_retry": "Download again",
+        "history.action_delete": "Delete",
+        "history.notify_retry_started": "Download restarted.",
+        "history.notify_retry_no_dest": "No WebDAV target configured in your profile.",
+        "history.notify_retry_failed": "Retry failed.",
+        "history.notify_deleted": "Entry deleted.",
+        "history.confirm_delete_heading": "Delete entry?",
+        "history.confirm_delete_text": "This history entry will be permanently removed.",
+        "history.confirm_delete_yes": "Delete",
+        "history.detail_heading": "Job details",
+        "history.detail_status": "Status",
+        "history.detail_url": "URL",
+        "history.detail_mode": "Mode",
+        "history.detail_dest": "Destination",
+        "history.detail_audio": "Format",
+        "history.detail_genre": "Genre",
+        "history.detail_artist": "Artist",
+        "history.detail_album": "Album",
+        "history.detail_created": "Created",
+        "history.detail_finished": "Finished",
+        "history.detail_tracks": "Tracks",
+        "history.detail_failed": "Failed",
+        "history.detail_error": "Error",
+        "history.detail_warning": "Warning",
+        "history.detail_log": "Timeline / log",
+        "history.detail_no_log": "No log available.",
         # settings page
         "settings.profile_heading": "Profile & defaults",
         "settings.default_genre": "Default genre",
@@ -305,7 +477,21 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "settings.scan_button": "Scan server",
         "settings.scan_running": "Scanning server …",
         "settings.scan_done": "Indexed {count} new tracks, removed {removed} stale",
+        "settings.scan_incomplete": "Scan incomplete: {failed} folder(s) unreadable, "
+                                    "{count} tracks indexed — stale entries were not pruned. "
+                                    "Please try again.",
         "settings.scan_error": "Scan failed: {error}",
+        # Lyrics backfill (issue #43)
+        "settings.lyrics_backfill_desc": "Walk the whole library and fetch a .lrc from LRCLIB "
+                                         "for every track that has no lyrics yet. Existing .lrc "
+                                         "files are left untouched. WebDAV only.",
+        "settings.lyrics_backfill_button": "Backfill lyrics",
+        "settings.lyrics_backfill_running": "Backfilling lyrics …",
+        "settings.lyrics_backfill_done": "Wrote {written} lyrics, skipped {skipped}, "
+                                         "{missing} with no match",
+        "settings.lyrics_backfill_incomplete": "Backfill incomplete: {failed} folder(s)/uploads "
+                                               "failed, wrote {written} lyrics. Please try again.",
+        "settings.lyrics_backfill_error": "Backfill failed: {error}",
         # Dedup (issue #31)
         "settings.dedup_label": "Skip tracks already in my library",
         "settings.dedup_desc": "Don't re-download tracks already in your library. In "
@@ -313,6 +499,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
                                "duplicate). WebDAV only.",
         "index.dedup_label": "Skip tracks I already have",
         "index.dedup_hint": "Only available with the WebDAV destination.",
+        # Synced lyrics (issue #43)
+        "settings.lyrics_label": "Fetch synced lyrics (.lrc)",
+        "settings.lyrics_desc": "When available, fetch synced lyrics from LRCLIB and drop a "
+                                ".lrc file next to each track for Navidrome to display. Tracks "
+                                "with no match are simply skipped.",
+        "index.lyrics_label": "Fetch lyrics (.lrc)",
         # Playlist subscriptions (issue #21)
         "subs.heading_new": "New playlist subscription",
         "subs.desc": "Automatically sync a playlist on an interval. Each run downloads "
@@ -346,6 +538,48 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "subs.notify_created": "Subscription created",
         "subs.notify_deleted": "Subscription deleted",
         "subs.notify_sync_started": "Sync started",
+        # Notifications (issue #42) — message content (off-request via translate())
+        "notify.new_tracks_title": "Soundpull",
+        "notify.new_tracks_body": "{playlist}: {count} new tracks",
+        "notify.error_title": "Soundpull: job failed",
+        "notify.error_body": "{kind} failed: {error}",
+        "notify.kind_sync": "Playlist sync",
+        "notify.kind_download": "Download",
+        "notify.test_title": "Soundpull: test",
+        "notify.test_body": "Test notification — your settings work. 🎵",
+        # Notifications (issue #42) — settings
+        "notify.heading": "Notifications",
+        "notify.desc": "Optionally get notified about background events. Pick the events and at "
+                       "least one channel (ntfy, webhook or e-mail). No passwords or tokens are "
+                       "ever included in the payload.",
+        "notify.event_new_tracks": "New tracks on playlist sync",
+        "notify.event_sync_error": "Failed playlist sync",
+        "notify.event_download_error": "Failed download",
+        "notify.ntfy_heading": "ntfy (push)",
+        "notify.ntfy_url_label": "ntfy topic URL (e.g. https://ntfy.sh/my-topic)",
+        "notify.ntfy_token_label": "Access token (optional)",
+        "notify.ntfy_token_placeholder_set": "•••••••• (set — leave empty to keep)",
+        "notify.ntfy_token_clear": "Remove stored token",
+        "notify.webhook_heading": "Webhook",
+        "notify.webhook_url_label": "Webhook URL (JSON POST)",
+        "notify.email_heading": "E-mail (SMTP)",
+        "notify.email_to_label": "Recipient (To)",
+        "notify.email_from_label": "Sender (From)",
+        "notify.smtp_host_label": "SMTP server",
+        "notify.smtp_port_label": "Port",
+        "notify.smtp_user_label": "SMTP username",
+        "notify.smtp_password_label": "SMTP password",
+        "notify.smtp_password_placeholder_set": "•••••••• (set — leave empty to keep)",
+        "notify.smtp_password_clear": "Remove stored SMTP password",
+        "notify.security_label": "Encryption",
+        "notify.security_starttls": "STARTTLS",
+        "notify.security_ssl": "SSL/TLS",
+        "notify.security_none": "None",
+        "notify.test_button": "Send test",
+        "notify.test_running": "Sending test notification …",
+        "notify.test_sent": "Test notification sent to: {channels}",
+        "notify.test_none": "No channel configured — please save first.",
+        "notify.test_error": "Test failed: {error}",
     },
 }
 
@@ -363,6 +597,25 @@ def current_language() -> str:
     return lang if lang in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
 
 
+def translate(lang: str, key: str, /, **fmt: object) -> str:
+    """Translate `key` for an EXPLICIT language.
+
+    Same fallback/format behaviour as `t()`, but the language is passed in rather
+    than read from the session. Used off-request (e.g. the notification worker in
+    `app.notifications`, issue #42), where there is no session to read the active
+    language from — so notification strings still live in this catalog.
+    """
+    lang = lang if lang in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
+    table = TRANSLATIONS.get(lang) or {}
+    text = table.get(key) or TRANSLATIONS[DEFAULT_LANGUAGE].get(key) or key
+    if not fmt:
+        return text
+    try:
+        return text.format(**fmt)
+    except (KeyError, IndexError):
+        return text
+
+
 def t(key: str, /, **fmt: object) -> str:
     """Translate `key` for the active language.
 
@@ -371,14 +624,7 @@ def t(key: str, /, **fmt: object) -> str:
     A translation that references a slot the caller didn't supply degrades to
     the unformatted template rather than raising and crashing the page.
     """
-    table = TRANSLATIONS.get(current_language()) or {}
-    text = table.get(key) or TRANSLATIONS[DEFAULT_LANGUAGE].get(key) or key
-    if not fmt:
-        return text
-    try:
-        return text.format(**fmt)
-    except (KeyError, IndexError):
-        return text
+    return translate(current_language(), key, **fmt)
 
 
 def audio_format_labels() -> dict[str, str]:

@@ -13,18 +13,26 @@ import posixpath
 import re
 import shutil
 import subprocess
+import time
 import zipfile
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urlparse
 
 import httpx
 import yt_dlp
 
-from app import fix_music_tags
+from app import fix_music_tags, lyrics
 from app.config import settings
+from app.sources import (
+    EXTRACTOR_ARGS_YT as EXTRACTOR_ARGS,
+    SourceSpec,
+    YOUTUBE,
+    detect_source,
+    is_supported_url,
+)
 
 log = logging.getLogger("pipeline")
 
@@ -32,12 +40,6 @@ log = logging.getLogger("pipeline")
 # state does not survive a restart, so anything left here is orphaned — see
 # purge_work_root(), called once at startup.
 _WORK_ROOT = Path(settings.local_music_root) / ".work"
-
-# YouTube hosts we accept; everything else is rejected before yt-dlp runs.
-_YOUTUBE_HOSTS = {
-    "youtube.com", "www.youtube.com", "m.youtube.com",
-    "music.youtube.com", "youtu.be",
-}
 
 
 def purge_work_root() -> None:
@@ -66,25 +68,44 @@ def _write_cookie_file(job_id: str, cookies_txt: str | None) -> Path | None:
     return path
 
 
-def is_supported_url(raw: str) -> bool:
-    """True only for http(s) URLs on a known YouTube host."""
-    try:
-        parsed = urlparse((raw or "").strip())
-    except ValueError:
-        return False
-    if parsed.scheme not in ("http", "https"):
-        return False
-    host = (parsed.hostname or "").lower()
-    return host in _YOUTUBE_HOSTS or host.endswith(".youtube.com")
+# `is_supported_url` is re-exported from app.sources (imported above) so the UI call
+# sites in pages/index.py and pages/subscriptions.py keep importing it from here
+# unchanged, while the host-matching logic has a single home in the source registry.
+
+
+# Chars a Windows-backed / oCIS (OpenCloud) WebDAV server rejects in a path segment even when
+# percent-encoded — a raw "?" in an album folder made oCIS return 400 and skip the upload
+# (issue #56). Map them to yt-dlp's fullwidth look-alikes (yt-dlp already uses these for the
+# track *filenames*, so our folders and its files match); path separators stay "_" as before so
+# existing folder names are unchanged.
+_SEGMENT_MAP = str.maketrans({
+    "/": "_", "\\": "_", "\x00": "",
+    "?": "？", "*": "＊", ":": "：", '"': "＂", "<": "＜", ">": "＞", "|": "｜",
+})
 
 
 def _safe_segment(name: str) -> str:
-    """Make a metadata string safe as a single path segment (no traversal)."""
-    seg = name.replace("/", "_").replace("\\", "_").replace("\x00", "").strip()
+    """Make a metadata string safe as a single path segment (no traversal, server-safe chars)."""
+    seg = name.translate(_SEGMENT_MAP).strip()
     return "Unbekannt" if seg in ("", ".", "..") else seg
 
-# Verbatim from download_album.sh / download_single.sh.
-EXTRACTOR_ARGS = "youtube:player_client=ios,web,android;-android_sdkless"
+# YouTube player clients. Was `ios,web,android` (verbatim from download_album.sh),
+# but YouTube's GVS PO-token enforcement broke those: with a cookie only `web`
+# survives (needs a token → HTTP 403); without one `ios`/`android` audio formats
+# are skipped and it falls back to the 360p progressive stream (~96 kbps). Now:
+#   • android_vr — token-free, serves the real bestaudio (opus/m4a), no cookie.
+#     Listed first so it wins format selection for public content (reliable, no 403).
+#   • mweb — cookie-capable AND serves the real bestaudio when given a GVS PO token
+#     from the provider sidecar (see _apply_pot_provider). This is the client that
+#     downloads AGE-RESTRICTED tracks (which need a login cookie): with a cookie set,
+#     android_vr is skipped and mweb + cookie + token carries the whole run at full
+#     quality. (Plain `web`/`web_safari` were tried and rejected: web falls back to the
+#     360p progressive stream (~96 kbps), web_safari yields no format — only mweb gives
+#     251/140 with the token.)
+# Parity-safe: this only selects the extraction client, not the tag pipeline (the
+# frozen postprocessor chain is unchanged); metadata values are client-independent.
+# The string itself now lives in app.sources (as EXTRACTOR_ARGS_YT) and is imported
+# above under this name, so the frozen flag lists below reference it unchanged.
 
 # yt-dlp flags for the download step, identical to the bash scripts (genre and
 # -o output template are appended per-run). --ignore-config keeps it deterministic.
@@ -130,6 +151,11 @@ _SINGLE_FLAGS = [
 #                for a ~160 kbps source.
 # Deliberately omitted: mp3_256 (redundant between 320/192) and mp3_128 (below
 # the source bitrate → audibly worse for little gain — "original" covers small).
+# Fallback artist name when `enumerate_artist` can't resolve one from the channel.
+# Kept as a named sentinel so callers can tell "unknown" apart from a real name (issue #56:
+# the compilation filter must NOT run against an unresolved name — it would drop everything).
+_UNKNOWN_ARTIST = "Artist"
+
 DEFAULT_AUDIO_FORMAT = "mp3_320"
 AUDIO_FORMATS: dict[str, tuple[str | None, str | None]] = {
     "mp3_320": ("mp3", "320K"),
@@ -145,6 +171,20 @@ AUDIO_FORMATS: dict[str, tuple[str | None, str | None]] = {
 # collisions between same-titled tracks. yt-dlp sanitises `%(title)s` into a safe
 # segment (verified: '/' → '⧸'); the folder name is our own `_safe_segment(title)`.
 _PLAYLIST_TRACK_TMPL = "%(playlist_index)04d - %(title)s.%(ext)s"
+
+
+def _playlist_folder_name(title: str, playlist_id: str) -> str:
+    """Folder segment for a delivered playlist, disambiguated by its id (issue #39).
+
+    Two different playlists can share a title ("Chill"). Since the delivery folder AND
+    its `.m3u8` are named after the title, same-named playlists would land in the same
+    `<webdav>/Chill/` folder and the second delivery would overwrite the first's manifest
+    (and clobber tracks). Appending the stable playlist id (`… [PLxxxx]`) keeps each
+    playlist in its own folder. The id is stable per URL, so an interval-sync (issue #21)
+    keeps targeting the same folder. Falls back to the bare title when no id is known.
+    """
+    name = f"{title} [{playlist_id}]" if playlist_id else title
+    return _safe_segment(name)
 
 
 def normalize_audio_format(value: str | None) -> str:
@@ -236,6 +276,14 @@ class Result:
     # caller records it only for WebDAV.
     delivered: list = field(default_factory=list)
     new_track_count: int = 0      # tracks actually downloaded (relevant for sync)
+    # Partial-delivery accounting (throttle/403 hardening): `expected_count` is how many
+    # tracks SHOULD have downloaded (entries that passed the dedup/own-artist filter);
+    # `failed_count` is how many of those never completed after all retry passes;
+    # `upload_failed_count` is how many staged files the WebDAV server rejected. All three
+    # are 0 on a clean run. The worker surfaces a non-zero total as a job warning (#…).
+    expected_count: int = 0
+    failed_count: int = 0
+    upload_failed_count: int = 0
     # Updated ordered m3u manifest for a playlist SYNC (see `existing_tracks`); the
     # caller persists it on the subscription to rebuild the complete playlist next run.
     playlist_files: list = field(default_factory=list)
@@ -264,8 +312,34 @@ def _build_ydl_opts(flags: list[str]) -> dict:
     return yt_dlp.parse_options(flags).ydl_opts
 
 
-def _extractor_args() -> dict:
-    return _build_ydl_opts(["--extractor-args", EXTRACTOR_ARGS]).get("extractor_args", {})
+def _extractor_args(source: SourceSpec = YOUTUBE) -> dict:
+    """Extractor-args dict for a source's probes. YouTube → identical to before (parity)."""
+    if not source.extractor_args:
+        return {}
+    return _build_ydl_opts(["--extractor-args", source.extractor_args]).get("extractor_args", {})
+
+
+def _apply_source(flags: list[str], source: SourceSpec) -> list[str]:
+    """Return a copy of `flags` with the `--extractor-args` pair set for `source`.
+
+    For YouTube this is a **no-op** — the frozen flag lists already carry YouTube's
+    extractor-args, so the produced list (and thus tag output) is byte-identical. This
+    mirrors the `_apply_audio_format()` no-op-by-default precedent that guards parity.
+    A non-YouTube source replaces the `youtube:` extractor-args pair with its own (or
+    drops it when the source needs none).
+    """
+    if source.key == "youtube" or source.extractor_args == EXTRACTOR_ARGS:
+        return list(flags)  # identity — the parity baseline
+    out = list(flags)
+    try:
+        i = out.index("--extractor-args")
+    except ValueError:
+        i = -1
+    if i >= 0:
+        del out[i:i + 2]
+    if source.extractor_args:
+        out += ["--extractor-args", source.extractor_args]
+    return out
 
 
 def _apply_cookie_policy(opts: dict, cookiefile: str | None) -> None:
@@ -280,6 +354,44 @@ def _apply_cookie_policy(opts: dict, cookiefile: str | None) -> None:
     opts["cookiesfrombrowser"] = None    # never read a browser cookie store on the server
 
 
+def _apply_pot_provider(opts: dict, source: SourceSpec = YOUTUBE) -> None:
+    """Point the bundled bgutil PO-token plugin at the provider server, if configured.
+
+    YouTube now requires a GVS PO token for most audio formats (else HTTP 403 on the
+    format URLs). The yt-dlp plugin fetches one from a bgutil-ytdlp-pot-provider
+    server; when it runs as a separate container we must tell the plugin its
+    base_url (it otherwise probes http://127.0.0.1:4416, which isn't in our image).
+    No provider configured → no-op: the plugin stays idle and yt-dlp falls back to
+    token-free clients. Only affects the GVS/download step; a no-op for flat
+    enumeration and cover fetches (no formats are requested, so no token is asked
+    for), but applied uniformly next to the cookie policy for consistency."""
+    # The PO-token key is YouTube-GVS-specific, so it only applies to a source that
+    # declares supports_pot; a non-YouTube source is a no-op here (parity for YouTube).
+    if not source.supports_pot:
+        return
+    base_url = settings.pot_provider_base_url.strip()
+    if not base_url:
+        return
+    # extractor_args values are lists of strings (matches parse_options' output).
+    opts.setdefault("extractor_args", {})["youtubepot-bgutilhttp"] = {"base_url": [base_url]}
+
+
+def _apply_socket_timeout(opts: dict) -> None:
+    """Cap yt-dlp's per-socket wait so a stalled connection can't hang a worker forever (issue #40).
+
+    yt-dlp defaults `socket_timeout` to None → a half-open / stalled TCP read blocks the worker
+    thread indefinitely (with the default 2-worker pool, one stuck job halves throughput for
+    everyone). Setting it makes a stall raise a socket timeout, which yt-dlp's own
+    `retries`/`fragment_retries` recover from on a multi-track download (and `_download_with_retries`
+    re-attempts whatever is still missing). It is a per-socket-operation deadline, not a
+    whole-download one, so a slow-but-progressing large file keeps resetting it and isn't aborted.
+    Timing-only → never touches the frozen flag lists or tag chain (parity-safe). 0/negative leaves
+    yt-dlp's default (no timeout). Applied next to the cookie/PO-token policy at every yt-dlp call."""
+    timeout = settings.download_socket_timeout_seconds
+    if timeout and timeout > 0:
+        opts["socket_timeout"] = timeout
+
+
 def _primary_artist(raw: str | None) -> str:
     """Main artist = part before the first ', ' (mirrors `sed 's/, .*//'`)."""
     if not raw or raw == "NA":
@@ -287,16 +399,20 @@ def _primary_artist(raw: str | None) -> str:
     return raw.split(", ")[0].strip() or "Unbekannt"
 
 
-def _probe_meta(url: str, is_album: bool, cookiefile: str | None = None) -> tuple[str | None, str | None]:
+def _probe_meta(url: str, is_album: bool, cookiefile: str | None = None,
+                source: SourceSpec | None = None) -> tuple[str | None, str | None]:
     """Read artist/album from the first item (like `yt-dlp --simulate --print`)."""
+    src = source or detect_source(url) or YOUTUBE
     opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
-        "extractor_args": _extractor_args(),
+        "extractor_args": _extractor_args(src),
         "logger": _QuietLogger(),
     }
     _apply_cookie_policy(opts, cookiefile)
+    _apply_pot_provider(opts, src)
+    _apply_socket_timeout(opts)
     if is_album:
         opts["playlist_items"] = "1"
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -310,35 +426,43 @@ def _probe_meta(url: str, is_album: bool, cookiefile: str | None = None) -> tupl
     return artist, album
 
 
-def _probe_playlist(url: str, cookiefile: str | None = None) -> tuple[str, str, int]:
-    """Read a playlist's title, uploader and entry count (issue #11).
+def _probe_playlist(url: str, cookiefile: str | None = None,
+                    source: SourceSpec | None = None) -> tuple[str, str, int, str]:
+    """Read a playlist's title, uploader, entry count and id (issue #11 / #39).
 
     Uses `extract_flat` so we only touch the playlist envelope, not every video —
     fast, and enough to name the download and seed the progress total. A playlist
     spans many artists/albums, so (unlike `_probe_meta`) there is no single
     artist/album to collapse to; each track is tagged from its own metadata later.
-    Returns (title, uploader, count); count is 0 when unknown.
+    Returns (title, uploader, count, playlist_id); count is 0 when unknown and the
+    id is "" when the extractor exposes none. The id disambiguates the delivery
+    folder so two same-named playlists don't collide (issue #39).
     """
+    src = source or detect_source(url) or YOUTUBE
     opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "extract_flat": True,
-        "extractor_args": _extractor_args(),
+        "extractor_args": _extractor_args(src),
         "logger": _QuietLogger(),
     }
     _apply_cookie_policy(opts, cookiefile)
+    _apply_pot_provider(opts, src)
+    _apply_socket_timeout(opts)
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False) or {}
     title = info.get("title") or "Playlist"
     uploader = info.get("uploader") or info.get("channel") or "Playlist"
     entries = [e for e in (info.get("entries") or []) if e]
     count = info.get("playlist_count") or len(entries)
-    return title, uploader, int(count or 0)
+    playlist_id = info.get("id") or info.get("playlist_id") or ""
+    return title, uploader, int(count or 0), str(playlist_id)
 
 
 def enumerate_playlist_tracks(url: str, cookiefile: str | None = None,
-                              limit: int = 0) -> list[tuple[str, str]]:
+                              limit: int = 0,
+                              source: SourceSpec | None = None) -> list[tuple[str, str]]:
     """(artist, title) for each playlist entry, metadata only — NO download (issue #21).
 
     Seeds the server index for a "mark existing" subscription first run: a per-entry
@@ -346,6 +470,7 @@ def enumerate_playlist_tracks(url: str, cookiefile: str | None = None,
     fields. `limit` caps entries (0 = unlimited). Mirrors the artist/title fallbacks
     used by the sync match-filter so the seeded keys line up with later lookups.
     """
+    src = source or detect_source(url) or YOUTUBE
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -353,10 +478,12 @@ def enumerate_playlist_tracks(url: str, cookiefile: str | None = None,
         # A single unavailable/region-locked entry must not abort enumerating the whole
         # playlist — skip it (it appears as a None entry) and keep going (issue #21).
         "ignoreerrors": True,
-        "extractor_args": _extractor_args(),
+        "extractor_args": _extractor_args(src),
         "logger": _QuietLogger(),
     }
     _apply_cookie_policy(opts, cookiefile)
+    _apply_pot_provider(opts, src)
+    _apply_socket_timeout(opts)
     if limit and limit > 0:
         opts["playlistend"] = limit
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -375,7 +502,8 @@ def enumerate_playlist_tracks(url: str, cookiefile: str | None = None,
 
 
 def enumerate_artist(url: str, cookiefile: str | None = None,
-                     limit: int = 0) -> tuple[str, list[dict]]:
+                     limit: int = 0,
+                     source: SourceSpec | None = None) -> tuple[str, list[dict]]:
     """Artist name + every release for an artist/channel URL, metadata only (issue #32).
 
     A YouTube Music artist's whole catalogue (albums, EPs AND singles) surfaces via the
@@ -384,7 +512,15 @@ def enumerate_artist(url: str, cookiefile: str | None = None,
     release is downloaded through the normal album path, so a single lands as a 1-track album
     folder (faithful to how YT Music / Navidrome model it). `limit` caps the number of releases
     (0 = unlimited). Returns `(artist_name, [{"title", "url"}, …])`.
+
+    The `/releases`-tab resolution is YouTube-specific, so this is gated on the source's
+    `supports_artist` flag (YouTube declares it True); a source without artist support
+    returns an empty discography rather than probing a YouTube-shaped URL. Feature 06 adds
+    a per-source enumerator for the sources that need a different one.
     """
+    src = source or detect_source(url) or YOUTUBE
+    if not src.supports_artist:
+        return _UNKNOWN_ARTIST, []
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -392,10 +528,12 @@ def enumerate_artist(url: str, cookiefile: str | None = None,
         "extract_flat": True,
         # A dead/region-locked release must not abort enumerating the whole discography.
         "ignoreerrors": True,
-        "extractor_args": _extractor_args(),
+        "extractor_args": _extractor_args(src),
         "logger": _QuietLogger(),
     }
     _apply_cookie_policy(opts, cookiefile)
+    _apply_pot_provider(opts, src)
+    _apply_socket_timeout(opts)
 
     releases_url = url if url.rstrip("/").endswith("/releases") else None
     if releases_url is None:
@@ -408,7 +546,7 @@ def enumerate_artist(url: str, cookiefile: str | None = None,
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(releases_url, download=False) or {}
     artist = (info.get("channel") or info.get("uploader")
-              or (info.get("title") or "").removesuffix(" - Releases") or "Artist")
+              or (info.get("title") or "").removesuffix(" - Releases") or _UNKNOWN_ARTIST)
     releases: list[dict] = []
     for entry in (info.get("entries") or []):
         if entry and entry.get("url"):
@@ -475,10 +613,14 @@ def _square_crop_jpeg(src: Path) -> bytes | None:
         return None
 
 
-def _fetch_cover(url: str, is_album: bool, dest: Path, cookiefile: str | None = None) -> Path | None:
+def _fetch_cover(url: str, is_album: bool, dest: Path, cookiefile: str | None = None,
+                 source: SourceSpec | None = None) -> Path | None:
     """Download the square album cover into `dest` (cover.jpg). Returns path or None."""
+    src = source or detect_source(url) or YOUTUBE
     opts = {"quiet": True, "no_warnings": True, "skip_download": True, "logger": _QuietLogger()}
     _apply_cookie_policy(opts, cookiefile)
+    _apply_pot_provider(opts, src)
+    _apply_socket_timeout(opts)
     if is_album:
         opts["extract_flat"] = True  # playlist-level thumbnails (the album art)
     try:
@@ -618,19 +760,368 @@ def _build_playlist_manifest(existing: list[dict] | None, new_entries: list[dict
     return _merge_manifest(existing, combined) if is_sync else combined
 
 
-def _make_match_filter(on_server: Callable[[str, str], bool],
-                       on_skip: Callable[[int | None, str, str], None] | None = None):
-    """yt-dlp match_filter: reject a track already on the server (issue #21/#31).
+def _artist_credit_text(info_dict: dict) -> str:
+    """Lower-cased blob of a track's real *credit* tags (issue #56).
+
+    Uses ONLY the tag fields that name a performer — `artists`/`artist`/`creators`/`creator`/
+    `album_artist`. Deliberately EXCLUDES:
+    - `title`/`track`/`album` — a label upload whose *title* merely mentions the artist
+      ("<Artist> - <Song> - <Label>") must NOT count as crediting them; and
+    - `channel`/`uploader` — the *upload source*, not a credit. YouTube Music surfaces old,
+      broken self-uploads on the artist's OWN channel (channel="BCee") whose actual metadata is
+      empty (`artist=None`, performer only in the free-text title); those defeat dedup and land
+      mis-tagged exactly like a foreign label upload, so the crediting channel must not save them.
+
+    A cleanly-tagged own release always carries a real `artist`/`artists` tag, so this blob is
+    populated for the tracks we want and empty for the broken ones we don't.
+    """
+    parts: list[str] = []
+    for key in ("artists", "creators"):
+        val = info_dict.get(key)
+        if isinstance(val, list):
+            parts += [str(x) for x in val if x]
+    for key in ("artist", "creator", "album_artist"):
+        val = info_dict.get(key)
+        if val:
+            parts.append(str(val))
+    return re.sub(r"\s+", " ", " , ".join(parts)).casefold()
+
+
+def _norm_name(text: str) -> str:
+    """Casefold + collapse whitespace — the shared normal form for artist/title matching."""
+    return re.sub(r"\s+", " ", (text or "").strip()).casefold()
+
+
+def _credits_artist(info_dict: dict, artist: str) -> bool:
+    """True if `artist` is a credited performer of the track (issue #56).
+
+    Word-boundary match against `_artist_credit_text`, so "BCee" matches "BCee, Charlotte
+    Haining" but NOT "Spearhead Records" (label-as-artist) and NOT a longer word that merely
+    contains it. A track with NO real credit tag (`artist=None` etc. — the broken video-name
+    uploads the `/releases` tab mixes in) yields an empty blob and is therefore NOT credited →
+    skipped. A blank target never filters (returns True) so a run with no known artist is a no-op.
+    """
+    target = _norm_name(artist)
+    if not target:
+        return True
+    return re.search(rf"(?<!\w){re.escape(target)}(?!\w)", _artist_credit_text(info_dict)) is not None
+
+
+# Trailing non-title suffixes a label upload's video name carries (dropped when repairing).
+_VIDEO_NAME_SUFFIX = re.compile(
+    r"\s*[\(\[]\s*(?:official(?:\s+(?:music\s+)?(?:video|audio|visuali[sz]er))?|"
+    r"music\s+video|lyric(?:s)?(?:\s+video)?|visuali[sz]er|audio|hd|hq|4k|"
+    r"free\s+download|out\s+now|premiere)\s*[\)\]]\s*$", re.IGNORECASE)
+
+# Trailing producer credit a self-upload video name carries, e.g. "(prod. by a3)", "(prod. a3)",
+# "[produced by X]". Dropped when repairing so the recovered title equals the clean album-track
+# title — else the SAME recording arriving both as a single and inside an album fails to dedup
+# (`_dedup_staged_tracks`) on the mismatched titles and both land in the library (issue #56).
+_PRODUCER_SUFFIX = re.compile(
+    r"\s*[\(\[]\s*prod(?:\.|uced)?\b[^)\]]*[\)\]]\s*$", re.IGNORECASE)
+
+
+def _strip_title_noise(title: str) -> str:
+    """Drop trailing video-name and producer-credit suffixes from a recovered title (issue #56).
+
+    Looped so a title carrying more than one (``… (prod. a3) (Official Audio)``) is fully cleaned.
+    """
+    prev = None
+    out = (title or "").strip()
+    while out != prev:
+        prev = out
+        out = _PRODUCER_SUFFIX.sub("", _VIDEO_NAME_SUFFIX.sub("", out)).strip()
+    return out
+
+
+def _prefix_artists(prefix: str) -> list[str]:
+    """Individual artists in a ``<Artist> - `` video-name prefix (issue #56).
+
+    Normalises ``feat.``/``ft.`` AND an ``x``/``×`` collab separator (``HeXer x AzudemSK``) to the
+    ``&`` that `split_artists` splits on, so a collab prefix yields each name — letting `own_artist`
+    match one of them (and a repaired collab title lose the whole prefix). Done locally, NOT in the
+    frozen `split_artists`, so only artist-mode title repair sees the ``x`` rule.
+    """
+    norm = re.sub(r"\b(?:featuring|feat|ft)\b\.?", "&", prefix, flags=re.IGNORECASE)
+    norm = re.sub(r"\s+[x×]\s+", " & ", norm, flags=re.IGNORECASE)
+    return fix_music_tags.split_artists(norm)
+
+
+def _repair_broken_title(raw_title: str, own_artist: str) -> tuple[str, str] | None:
+    """Parse a label-upload video name back into ``(artist, title)`` — issue #56.
+
+    Many artist-mode `/releases` entries are third-party/label uploads tagged with NO artist
+    and the whole video name as the title: ``<Artist> - <Song>[ - <Label>]`` (e.g.
+    ``BCee & Lomax - Brazilian Wax - Spearhead Records``). Rather than drop these (they'd
+    otherwise be filtered as "not credited"), we recover clean tags — but ONLY when the artist
+    prefix (before the first `` - ``) credits the artist we're downloading (`own_artist`) as one
+    of its individual names. That both confirms the track is theirs and anchors the split, so a
+    foreign upload whose name merely CONTAINS the artist (``Wax Tailor - …`` for own_artist
+    "Wax") is left alone — `own_artist` must equal a whole prefix artist, not a substring.
+
+    Returns ``(artist, title)`` — the ``<Artist> - `` prefix and a trailing `` - <Label>``
+    segment removed, plus a trailing video-name suffix like ``(Official Video)``; a ``feat.``
+    clause is LEFT in the title for `fix_music_tags`. Returns None when it doesn't match (a
+    clean ``title="Colours"`` has no `` - ``; a name not crediting own_artist).
+
+    Label stripping: a trailing segment is dropped as the label UNLESS it starts with a bracket
+    (a version like ``(LSB remix)``; labels rarely start with one), which re-attaches to the
+    title — so ``So Right - (LSB remix) - Spearhead Records`` → ``So Right (LSB remix)`` and
+    ``So Right - (LSB remix)`` keeps the remix. Heuristic (a non-bracketed real trailing
+    segment — a co-artist, a subtitle — can be lost), but far better than a raw video name.
+    """
+    if not raw_title or " - " not in raw_title:
+        return None
+    target = _norm_name(own_artist)
+    if not target:
+        return None
+    prefix, _, rest = raw_title.partition(" - ")
+    # Split the prefix into individual credited artists (feat./ft. and an "x"/"×" collab →
+    # separator) and require own_artist to be EXACTLY one of them — so "Wax" doesn't match the
+    # artist "Wax Tailor".
+    prefix_artists = _prefix_artists(prefix)
+    if not any(_norm_name(a) == target for a in prefix_artists):
+        return None
+    segs = [s.strip() for s in rest.split(" - ") if s.strip()]
+    if not segs:
+        return None
+    # Drop a trailing label segment unless it's a bracketed version like "(LSB remix)"; then
+    # rejoin, attaching a bracketed segment with a space so it reads as part of the title.
+    if len(segs) >= 2 and segs[-1][:1] not in "([":
+        segs = segs[:-1]
+    title = segs[0]
+    for seg in segs[1:]:
+        title += (" " if seg[:1] in "([" else " - ") + seg
+    title = _strip_title_noise(title)
+    if not title:
+        return None
+    artist = " / ".join(prefix_artists) or prefix.strip()
+    return artist, title
+
+
+def _strip_own_artist_prefix(title: str, own_artist: str) -> str | None:
+    """Strip a leading ``<own_artist> - `` from a CREDITED track's title (issue #56).
+
+    A self-upload on the artist's own channel is often named ``<Artist> - <Song>`` yet carries
+    a real artist tag, so `_repair_broken_title` (which only touches uncredited uploads) leaves
+    it alone — but the artist name is redundant in the TITLE; only the song belongs there.
+    When `title` starts with EXACTLY `own_artist` (a whole credited prefix name — an "x"/"×"
+    collab counts, so "HeXer x AzudemSK - …" matches "HeXer"; but "Wax" won't strip
+    "Wax Tailor - …", the same anchor `_repair_broken_title` uses), return the song title with a
+    trailing video-name/producer suffix dropped (`_strip_title_noise`) so it equals the clean
+    album-track title and dedups; else None. No label-segment heuristic — a credited track's own
+    title beyond the artist prefix is otherwise trustworthy.
+    """
+    target = _norm_name(own_artist)
+    if not target or " - " not in title:
+        return None
+    prefix, _, rest = title.partition(" - ")
+    if not any(_norm_name(a) == target for a in _prefix_artists(prefix)):
+        return None
+    return _strip_title_noise(rest) or None
+
+
+def _save_easy_tags(mf) -> None:
+    """Save an ``easy=True`` mutagen file, keeping MP3 on ID3v2.3.
+
+    mutagen's ``EasyMP3.save()`` defaults to writing ID3v2.4, but `fix_music_tags` writes v2.3;
+    an artist-mode tag rewrite (`_repair_album_titles` / `_unify_album_year`) must stay on v2.3
+    so one album folder doesn't end up with mixed ID3 versions. Other formats save normally.
+    """
+    from mutagen.mp3 import EasyMP3
+
+    if isinstance(mf, EasyMP3):
+        mf.save(v2_version=3)
+    else:
+        mf.save()
+
+
+def _repair_album_titles(album_dir: Path, own_artist: str) -> None:
+    """Rewrite label-upload video-name tags in an artist-mode album folder (issue #56).
+
+    For a staged audio file that is NOT already credited to `own_artist` (a broken label upload)
+    and whose title `_repair_broken_title` can recover, rewrite its title/artist tags and rename
+    the file to the clean title, so `fix_music_tags` then normalises it like any clean track
+    (feat cleanup, forced album_artist) and the delivered/indexed name is clean too. A track
+    already crediting `own_artist` keeps its authoritative ARTIST tag, but a redundant
+    `<Artist> - ` prefix in its TITLE (a self-upload named `<Artist> - <Song>`) is stripped via
+    `_strip_own_artist_prefix` so the title holds only the song (the match_filter dedups the same
+    stripped key, so a sync doesn't re-download it). Every original name is reserved
+    up front so a rename can never overwrite another file. Tag-write and rename are coupled and
+    best-effort: if the tag write fails the file is NOT renamed (name and tags stay consistent —
+    never a clean filename over a still-raw title tag). Runs BEFORE `process_directory`.
+    """
+    from mutagen import File as MutagenFile
+
+    audio = [p for p in sorted(album_dir.iterdir())
+             if p.is_file() and p.suffix.lower() in fix_music_tags._SUPPORTED_EXTS]
+    # Seed with EVERY original name so a rename can never clobber another file (a clean track,
+    # or a broken one not yet processed) — Path.rename overwrites silently on POSIX.
+    taken: set[str] = {p.name.casefold() for p in audio}
+    for path in audio:
+        try:
+            mf = MutagenFile(str(path), easy=True)
+        except Exception:  # noqa: BLE001 - unreadable file: leave it as-is
+            mf = None
+        if mf is None:
+            continue
+        cur_title = (mf.get("title") or [None])[0]
+        cur_artist = (mf.get("artist") or [None])[0]
+        # A track already credited to own_artist keeps its authoritative ARTIST tag — but a
+        # redundant "<Artist> - " prefix in the TITLE (a self-upload named "<Artist> - <Song>")
+        # is still stripped, so the title holds only the song. An uncredited upload is fully
+        # repaired (title + artist) from its video name instead.
+        if _credits_artist({"artist": cur_artist or ""}, own_artist):
+            stripped = _strip_own_artist_prefix(cur_title or "", own_artist)
+            if stripped is None:
+                continue
+            new_artist, new_title = cur_artist, stripped
+        else:
+            repaired = _repair_broken_title(cur_title or path.stem, own_artist)
+            if repaired is None:
+                continue
+            new_artist, new_title = repaired
+        try:
+            if mf.tags is None:
+                mf.add_tags()
+            mf["title"] = [new_title]
+            if new_artist:
+                mf["artist"] = [new_artist]
+            _save_easy_tags(mf)
+        except Exception:  # noqa: BLE001 - tag write failed → skip rename too, so name and
+            continue        # tags stay consistent (never a clean name over a raw title tag)
+        # Rename to the clean title (collision-safe); the file's own name frees up first.
+        taken.discard(path.name.casefold())
+        base = _safe_segment(new_title) or path.stem
+        candidate = f"{base}{path.suffix}"
+        n = 2
+        while candidate.casefold() in taken:
+            candidate = f"{base} ({n}){path.suffix}"
+            n += 1
+        taken.add(candidate.casefold())
+        if candidate != path.name:
+            try:
+                path.rename(path.with_name(candidate))
+            except Exception:  # noqa: BLE001 - rename best-effort (tags already clean)
+                taken.discard(candidate.casefold())
+                taken.add(path.name.casefold())
+
+
+def _unify_album_year(album_dir: Path) -> None:
+    """Give every track in an artist-mode album folder the same (earliest) date (issue #56).
+
+    Navidrome groups albums by (albumartist, album, date), so a label sampler whose tracks each
+    carry their OWN original release year splits one folder into a separate album per year
+    ("Volume Two" ×5). Forcing one date collapses it back to a single album. No-op for a real
+    album (dates already uniform) or when fewer than two tracks carry a date. Best-effort per
+    file; only runs in artist mode, so a plain album/single download is untouched (parity).
+    """
+    from mutagen import File as MutagenFile
+
+    loaded = []
+    dates: list[str] = []
+    for p in sorted(album_dir.iterdir()):
+        if not p.is_file() or p.suffix.lower() not in fix_music_tags._SUPPORTED_EXTS:
+            continue
+        try:
+            mf = MutagenFile(str(p), easy=True)
+        except Exception:  # noqa: BLE001 - unreadable file: leave it as-is
+            mf = None
+        if mf is None:
+            continue
+        loaded.append(mf)
+        d = (mf.get("date") or [None])[0]
+        if d:
+            dates.append(str(d))
+    if len(dates) < 2 or len(set(dates)) < 2:
+        return  # already uniform (a real album) or nothing to unify
+    earliest = min(dates)  # YYYYMMDD / YYYY-MM-DD / YYYY all sort chronologically as strings
+    for mf in loaded:
+        if (mf.get("date") or [None])[0] != earliest:
+            try:
+                mf["date"] = [earliest]
+                _save_easy_tags(mf)
+            except Exception:  # noqa: BLE001 - best-effort
+                pass
+
+
+def _dedup_staged_tracks(work_base: Path) -> int:
+    """Drop a redundant SINGLE staged for a track already in a real album (issue #56).
+
+    The same recording often arrives both inside a multi-track album AND as a standalone single.
+    For each ``(artist, title)`` that appears in more than one folder, if the biggest folder is a
+    real album (>1 track) we delete only the copies that sit ALONE in a 1-track folder (a single),
+    plus each removed track's sibling `.lrc`, and remove the emptied folder.
+
+    Deliberately conservative: a copy that is itself in a multi-track album is NEVER deleted, so
+    two different tracks that merely share a title across albums (an "Intro"/"Interlude"/"Outro"
+    on each, live-vs-studio) are kept — `track_key` normalises away artist detail and ignores the
+    album, so treating those as duplicates would silently delete distinct recordings. When every
+    copy is a single (biggest folder is 1 track) none is deleted — we can't tell which is
+    canonical. Runs once, single-threaded, after the parallel fan-out. Returns files removed.
+    """
+    from collections import defaultdict
+
+    from app.library_index import track_key
+
+    audio = [p for p in work_base.rglob("*")
+             if p.is_file() and p.suffix.lower() in fix_music_tags._SUPPORTED_EXTS]
+    folder_size: dict[Path, int] = defaultdict(int)
+    for p in audio:
+        folder_size[p.parent] += 1
+    by_key: dict[tuple[str, str], list[Path]] = defaultdict(list)
+    for p in audio:
+        title, art, _ = _track_meta(p)
+        by_key[track_key(title, art)].append(p)
+
+    removed = 0
+    emptied: set[Path] = set()
+    for key, paths in by_key.items():
+        if not key[0] or not key[1] or len(paths) <= 1:  # need a real artist+title, and a dup
+            continue
+        if max(folder_size[p.parent] for p in paths) <= 1:
+            continue  # every copy is a 1-track single → can't tell which is canonical; keep all
+        for dup in paths:
+            if folder_size[dup.parent] == 1:   # a lone single, and a bigger album has this track
+                dup.unlink(missing_ok=True)
+                dup.with_suffix(".lrc").unlink(missing_ok=True)
+                emptied.add(dup.parent)
+                removed += 1
+    # A dropped single leaves its 1-track folder without audio → remove it (+ leftover cover).
+    for d in emptied:
+        if d.is_dir() and not any(f.suffix.lower() in fix_music_tags._SUPPORTED_EXTS
+                                  for f in d.iterdir() if f.is_file()):
+            shutil.rmtree(d, ignore_errors=True)
+    return removed
+
+
+def _make_match_filter(on_server: Callable[[str, str], bool] | None = None,
+                       on_skip: Callable[[int | None, str, str], None] | None = None,
+                       own_artist: str | None = None,
+                       on_seen: Callable[[str], None] | None = None):
+    """yt-dlp match_filter: skip tracks we don't want to download (issue #21/#31/#56).
 
     yt-dlp extracts each entry's full metadata (artist/track) BEFORE downloading the
     media, then calls this; returning a string skips the entry. `incomplete` is True
     during playlist enumeration when tags aren't final — we defer (return None) so the
     real check runs on the complete info_dict.
 
-    `on_skip(playlist_index, artist, title)` (issue #31) is invoked once, on the
-    effective (non-incomplete) call, for every track we skip — so the pipeline can
-    reference the already-present copy in a playlist's .m3u8. yt-dlp has merged a stable
-    1-based `playlist_index` into the info_dict by this point, even for skipped entries.
+    Two independent skip reasons compose:
+
+    - `own_artist` (issue #56, artist mode): reject a track whose credited artist does not
+      include this name. A YouTube-Music artist's `/releases` tab mixes in compilations and
+      third-party "appears-on" / label uploads whose artist tag is the LABEL (or is absent —
+      the performer lives only in the video title). Those can never dedup against a cleanly
+      tagged library and would land as mis-tagged duplicates, so a track that isn't credited
+      to the artist we're downloading is dropped up front (checked before `on_server`).
+      Exception: a broken upload whose video NAME still starts with the artist
+      (`_repair_broken_title`) is KEPT — the pipeline repairs its tags after download instead
+      of losing a genuine (if mis-tagged) release track.
+    - `on_server` (issue #21/#31): reject a track already in the user's library. `on_skip`
+      (issue #31) is then invoked once, on the effective (non-incomplete) call, for every
+      such skip — so the pipeline can reference the already-present copy in a playlist's
+      .m3u8. yt-dlp has merged a stable 1-based `playlist_index` into the info_dict by this
+      point, even for skipped entries.
     """
     def _filter(info_dict: dict, incomplete: bool = False) -> str | None:
         if incomplete or info_dict.get("_type") in ("playlist", "multi_video"):
@@ -639,10 +1130,37 @@ def _make_match_filter(on_server: Callable[[str, str], bool],
         artists = info_dict.get("artists")
         first = artists[0] if isinstance(artists, list) and artists else ""
         artist = info_dict.get("artist") or first or info_dict.get("uploader") or ""
-        if title and on_server(artist, title):
+        # A broken upload (not credited) is repaired iff its video name still starts with the
+        # artist; if not even repairable, it's foreign → drop. `repaired` stays None for a
+        # credited (clean) track, so its authoritative tags aren't second-guessed here.
+        repaired = None
+        if own_artist and not _credits_artist(info_dict, own_artist):
+            repaired = _repair_broken_title(title, own_artist)
+            if repaired is None:
+                return f"nicht vom Künstler {own_artist}: {artist or '?'} - {title}".strip()
+        # Dedup on the key the track will actually be INDEXED under: a repaired upload is filed
+        # under own_artist + its recovered title (so a clean copy already on the server skips,
+        # and the pre/post-download keys agree — issue #56); a normal track uses its raw meta.
+        if repaired:
+            d_artist, d_title = own_artist, repaired[1]
+        else:
+            d_artist, d_title = artist, title
+            # A credited self-upload titled "<Artist> - <Song>" is re-titled to the bare song
+            # after download (`_repair_album_titles`), so dedup on that stripped key too — else
+            # the pre/post-download keys diverge and every sync re-downloads it (issue #56).
+            if own_artist:
+                d_title = _strip_own_artist_prefix(title, own_artist) or d_title
+        if on_server is not None and d_title and on_server(d_artist, d_title):
             if on_skip is not None:
-                on_skip(info_dict.get("playlist_index"), artist, title)
-            return f"schon auf dem Server: {artist} - {title}".strip()
+                on_skip(info_dict.get("playlist_index"), d_artist, d_title)
+            return f"schon auf dem Server: {d_artist} - {d_title}".strip()
+        # This entry passed every skip check → yt-dlp will (attempt to) download it. Record
+        # its id as EXPECTED so the caller can detect tracks that later fail at the download
+        # stage (silently skipped by ignoreerrors='only_download') and retry / surface them.
+        if on_seen is not None:
+            vid = info_dict.get("id")
+            if vid:
+                on_seen(str(vid))
         return None
     return _filter
 
@@ -671,20 +1189,110 @@ def _zip_dir(src_dir: Path, zip_path: Path, root_name: str) -> None:
                 zf.write(path, f"{root_name}/{path.relative_to(src_dir).as_posix()}")
 
 
-def _upload_tree(dest: Destination, local_root: Path) -> None:
+_UPLOAD_ATTEMPTS = 4
+_UPLOAD_BACKOFF_BASE = 2.0  # seconds; exponential waits between attempts: 2, 4, 8
+
+
+def _upload_with_retry(client, local: str, remote: str) -> None:
+    """Upload one file, retrying TRANSIENT network failures (timeout / transport error).
+
+    A single slow or dropped PUT during a big artist upload must not abort the whole job (which
+    would discard every already-downloaded album); retry a few times with bounded EXPONENTIAL
+    backoff (issue #40) so a longer server hiccup gets progressively more time to clear. A
+    non-transient error (bad path, auth, 4xx) is not retried — it re-raises immediately.
+    """
+    for attempt in range(1, _UPLOAD_ATTEMPTS + 1):
+        try:
+            client.upload_file(local, remote, overwrite=True)
+            return
+        except httpx.TransportError as exc:  # timeout / connect / read / write / network
+            if attempt == _UPLOAD_ATTEMPTS:
+                raise
+            delay = _UPLOAD_BACKOFF_BASE * 2 ** (attempt - 1)  # exponential: 2, 4, 8 …
+            log.warning("WebDAV upload %r failed (attempt %d/%d): %s — retrying in %.0fs",
+                        remote, attempt, _UPLOAD_ATTEMPTS, exc, delay)
+            time.sleep(delay)
+
+
+def _upload_tree(dest: Destination, local_root: Path) -> list[str]:
+    """Upload the staged tree to WebDAV; return the list of files that could NOT be uploaded.
+
+    A single file the server rejects (e.g. HTTP 400 on a name it dislikes, after transient
+    retries are exhausted) must not discard a whole discography upload — it's logged WITH its
+    full remote path (so the offending name is diagnosable) and skipped, and the rest proceed.
+    If NOT ONE file uploads, the failure is systemic (auth, bad base URL, unreachable) → raise so
+    the job surfaces as an error rather than a silent empty upload.
+    """
     from app.webdav_util import make_client
 
     client = make_client(dest.webdav_url, dest.webdav_username, dest.webdav_password)
     prefix = (dest.webdav_folder or "").strip("/")
-    for path in sorted(local_root.rglob("*")):
-        if not path.is_file():
-            continue
+    files = [p for p in sorted(local_root.rglob("*")) if p.is_file()]
+    uploaded = 0
+    failed: list[str] = []
+    for path in files:
         rel = path.relative_to(local_root).as_posix()
         remote = f"{prefix}/{rel}" if prefix else rel
         parent = "/".join(remote.split("/")[:-1])
-        if parent:
-            _ensure_remote_dir(client, parent)
-        client.upload_file(str(path), remote, overwrite=True)
+        try:
+            if parent:
+                _ensure_remote_dir(client, parent)
+            _upload_with_retry(client, str(path), remote)
+            uploaded += 1
+        except Exception as exc:  # noqa: BLE001 - one rejected path must not lose the whole upload
+            log.warning("WebDAV upload skipped %r: %s", remote, exc)
+            failed.append(rel)
+    if failed and uploaded == 0:
+        raise RuntimeError(f"WebDAV-Upload fehlgeschlagen (0/{len(files)}): "
+                           f"{failed[0]} — {'; '.join(failed[1:3])}".rstrip(" —"))
+    if failed:
+        log.warning("WebDAV: %d von %d Dateien übersprungen (Server lehnte den Pfad ab): %s",
+                    len(failed), len(files), ", ".join(repr(f) for f in failed[:5]))
+    return failed
+
+
+def _download_with_retries(opts: dict, url: str, *, is_multi: bool, job_id: str,
+                           expected_ids: set[str], finished_ids: set[str]) -> None:
+    """Run yt-dlp's download, recovering from transient YouTube throttling.
+
+    yt-dlp's default `ignoreerrors='only_download'` silently SKIPS a track that fails at the
+    media-download stage (e.g. a 403 from YouTube throttling the IP after a marathon of
+    downloads), so a big album/playlist can come out partial while the job still ends "done".
+    For a multi-track run we make that recoverable: a per-job **download-archive** records the
+    tracks that completed, so a re-run only re-attempts the still-missing ones (playlist_index
+    and tags stay intact); we optionally pace requests to avoid tripping the throttle at all;
+    and we re-run up to `download_retry_passes` more times — waiting `retry_backoff` between
+    passes so a throttle can clear — until every EXPECTED track has finished. `expected_ids` /
+    `finished_ids` are updated live by the match_filter / progress hook, so the loop stops as
+    soon as nothing is missing. A single-track run keeps the original one-shot behaviour. This
+    only affects timing / which tracks are retried — never the tag pipeline (parity-safe)."""
+    if not is_multi:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+        return
+
+    sleep_req = max(0.0, settings.download_sleep_requests_seconds)
+    if sleep_req:
+        opts["sleep_interval_requests"] = sleep_req  # pace HTTP requests → avoid throttling
+    archive = _WORK_ROOT / f"{job_id}.archive"        # per-job: a retry skips completed tracks
+    opts["download_archive"] = str(archive)
+    passes = max(0, settings.download_retry_passes)
+    backoff = max(0.0, settings.download_retry_backoff_seconds)
+    try:
+        for attempt in range(passes + 1):
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+            missing = expected_ids - finished_ids
+            if not missing:
+                break  # every expected track completed
+            if attempt < passes:
+                log.warning("download %s: %d track(s) still missing after pass %d/%d — "
+                            "retrying in %.0fs", job_id, len(missing), attempt + 1,
+                            passes + 1, backoff)
+                if backoff:
+                    time.sleep(backoff)
+    finally:
+        archive.unlink(missing_ok=True)
 
 
 def run_download(*, job_id: str, url: str, genre: str, mode: str,
@@ -696,7 +1304,10 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
                  existing_ref: Callable[[str, str], str | None] | None = None,
                  existing_tracks: list[dict] | None = None,
                  stage_dir: Path | None = None, deliver: bool = True,
-                 album_name: str | None = None) -> Result:
+                 album_name: str | None = None,
+                 own_artist: str | None = None,
+                 fetch_lyrics: bool = False,
+                 source: SourceSpec | None = None) -> Result:
     """Execute one download end-to-end and return a Result.
 
     Both destinations stage into a temp work dir; then either a ZIP is packaged
@@ -736,6 +1347,15 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
     Result carries `delivered` so the caller can deliver the combined tree once. The download +
     tag steps in between are unchanged, so metadata parity is unaffected.
 
+    `own_artist` (artist mode, issue #56) is the known performer of the run and does two things:
+    (1) installs a match_filter that skips any track NOT credited to this artist — YouTube Music's
+    `/releases` tab mixes an artist's own albums with third-party compilation / label uploads whose
+    artist tag is the label (or absent), which would otherwise never dedup and land as mis-tagged
+    duplicates; and (2) forces it as the album's primary artist (folder / `album_artist` tag /
+    server-index key) so a release probed on a label channel isn't filed under the label. Only the
+    artist orchestrator passes it (album/single/playlist name their source directly); None keeps
+    the probed artist, so a plain download is unchanged (metadata parity).
+
     `album_name` (album mode, issue #32) forces the album folder + tag to a known release title
     instead of trusting each track's `%(album)s`. The artist orchestrator passes the release
     title from the `/releases` tab so a single (which carries no album tag) lands in its own
@@ -748,6 +1368,9 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
     is_album = not is_playlist and not is_single  # unknown/legacy modes → album
     is_sync = is_playlist and on_server is not None  # issue #21: playlist-with-dedup
     dedup = on_server is not None  # issue #21/#31: skip-if-present active for this run
+    # Detected once and threaded through the probe/download/cover steps (roadmap feature 02).
+    # Only YouTube is registered, so this resolves to YOUTUBE and behaviour is unchanged.
+    source_spec = source or detect_source(url) or YOUTUBE
 
     # Cross-folder m3u references only make sense for a WebDAV library; a browser ZIP has
     # no library and its tracks are packaged under a single root, so a `../` reference would
@@ -774,22 +1397,31 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
         work_base.mkdir(parents=True, exist_ok=True)
         pl_title = ""
         if is_playlist:
-            pl_title, pl_uploader, pl_count = _probe_playlist(url, cookiefile=cookiefile)
+            pl_title, pl_uploader, pl_count, pl_id = _probe_playlist(
+                url, cookiefile=cookiefile, source=source_spec)
             if settings.max_playlist_items > 0 and pl_count:
                 pl_count = min(pl_count, settings.max_playlist_items)
             reporter.on_meta(pl_uploader, pl_title)
             if pl_count:
                 reporter.on_track(0, pl_count)
-            # A real playlist: ALL tracks in one folder (the playlist name), plus an
-            # .m3u8 written after tagging. `pl_title` is interpolated literally, so
-            # sanitise it into one safe path segment; the track filename is a yt-dlp
-            # template (its fields are sanitised by yt-dlp).
-            playlist_dir = work_base / _safe_segment(pl_title)
+            # A real playlist: ALL tracks in one folder, plus an .m3u8 written after
+            # tagging. The folder is named after the playlist but disambiguated by its
+            # id so two same-named playlists don't collide (issue #39); the name is
+            # interpolated literally, so `_playlist_folder_name` sanitises it into one
+            # safe path segment (the track filename is a yt-dlp template, sanitised by
+            # yt-dlp). The `.m3u8` inside keeps the plain `pl_title` for display.
+            playlist_dir = work_base / _playlist_folder_name(pl_title, pl_id)
             out_tmpl = str(playlist_dir / _PLAYLIST_TRACK_TMPL)
             base_flags = _SINGLE_FLAGS  # per-track tags, no album track-number remap
         else:
-            artist_raw, album_raw = _probe_meta(url, is_album, cookiefile=cookiefile)
-            primary_artist = _primary_artist(artist_raw)
+            artist_raw, album_raw = _probe_meta(url, is_album, cookiefile=cookiefile, source=source_spec)
+            # In artist mode (`own_artist` set) force the known performer as the album's primary
+            # artist (issue #56): releases on a label channel probe as artist=<label> (e.g.
+            # "Drum&BassArena"), which would fold the whole album under the label in Navidrome and
+            # split the discography by upload-source casing ("Bcee" vs "BCee"). We already know the
+            # real artist for the run, so use it for the folder / album_artist / server-index key.
+            # None for a plain album/single download → falls back to the probed artist (parity).
+            primary_artist = own_artist or _primary_artist(artist_raw)
             album = (album_name or album_raw or "Unbekannt Album") if is_album else "Singles"
             reporter.on_meta(primary_artist, album)
             # `primary_artist` is interpolated literally (not a yt-dlp `%(...)s`
@@ -806,6 +1438,9 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
 
         # 2) Download (parity-safe opts from parse_options + our hooks).
         flags = _apply_audio_format(base_flags, audio_format)
+        # Source-specific extractor-args (feature 02). No-op for YouTube (the frozen flag
+        # lists already carry YouTube's args), so the produced list stays byte-identical.
+        flags = _apply_source(flags, source_spec)
         flags = _apply_tag_options(flags, tag_options)
         if tag_options.genre:
             flags += _genre_flags(genre)
@@ -819,41 +1454,69 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
         opts = _build_ydl_opts(flags)
         opts.update({"quiet": True, "no_warnings": True, "noprogress": True, "logger": _QuietLogger()})
         _apply_cookie_policy(opts, cookiefile)
+        _apply_pot_provider(opts, source_spec)
+        _apply_socket_timeout(opts)
         if is_playlist and settings.max_playlist_items > 0:
             opts["playlistend"] = settings.max_playlist_items  # cap runaway playlists
-        if is_playlist:
-            # A playlist spans many videos; a dead/region-locked one must not abort the
-            # whole run — skip it and download the rest (issue #21). Set on the opts dict
-            # (not the frozen flag lists) so album/single stay strict and tag parity holds.
+        if is_playlist or own_artist:
+            # A playlist — or any album in an artist run (own_artist set) — spans many
+            # tracks; a dead / region-locked / 403 one must not abort the rest of the
+            # release (issue #21/#56). Skip it and keep the others. Set on the opts dict
+            # (not the frozen flag lists) so a STANDALONE album/single stays strict (a
+            # user pasting one album URL still fails loudly), and tag parity holds either way.
             opts["ignoreerrors"] = True
         # Dedup: skip tracks already on the server, capturing each skip so a playlist can
-        # reference the existing copy afterwards (issue #21/#31).
+        # reference the existing copy afterwards (issue #21/#31). A multi-track run also
+        # installs the filter purely to RECORD each entry that will download (`on_seen` →
+        # `expected_ids`), so a track that later fails at the download stage — silently
+        # skipped by yt-dlp's `ignoreerrors='only_download'` — is detectable and retryable.
         skipped: list[tuple[int | None, str, str]] = []  # (playlist_index, artist, title)
-        if on_server is not None:
+        _skip_seen: set[tuple] = set()  # dedupe: a retry pass re-runs the filter (idempotent)
+
+        def _on_skip(idx: int | None, a: str, t: str) -> None:
+            key = (idx, a, t)
+            if key not in _skip_seen:
+                _skip_seen.add(key)
+                skipped.append((idx, a, t))
+
+        is_multi = not is_single  # album / playlist / artist span many tracks; single is one
+        expected_ids: set[str] = set()   # entries that passed the filter → should download
+        finished_ids: set[str] = set()   # entries whose media download actually completed
+        if is_multi or on_server is not None or own_artist:
             opts["match_filter"] = _make_match_filter(
-                on_server, on_skip=lambda idx, a, t: skipped.append((idx, a, t)))
+                on_server, on_skip=_on_skip, own_artist=own_artist, on_seen=expected_ids.add)
 
         finished_dirs: Counter[str] = Counter()
 
         def progress_hook(d: dict) -> None:
             status = d.get("status")
+            info = d.get("info_dict") or {}
             if status == "downloading":
-                info = d.get("info_dict") or {}
                 idx = info.get("playlist_index")
                 total = info.get("n_entries") or info.get("playlist_count") or 0
                 reporter.on_phase("download")
                 if idx:
                     reporter.on_track(int(idx), int(total or 0))
             elif status == "finished":
-                name = d.get("filename") or (d.get("info_dict") or {}).get("filepath")
+                vid = info.get("id")
+                if vid:
+                    finished_ids.add(str(vid))
+                name = d.get("filename") or info.get("filepath")
                 if name:
                     finished_dirs[str(Path(name).parent)] += 1
 
         opts["progress_hooks"] = [progress_hook]
 
         reporter.on_phase("download")
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
+        _download_with_retries(opts, url, is_multi=is_multi, job_id=job_id,
+                               expected_ids=expected_ids, finished_ids=finished_ids)
+        # Tracks that passed the filter but never completed, even after retries (throttle/403).
+        failed_ids = expected_ids - finished_ids
+        expected_count, failed_count = len(expected_ids), len(failed_ids)
+        if failed_count:
+            log.warning("download %s: %d/%d track(s) failed after retries: %s",
+                        job_id, failed_count, expected_count,
+                        ", ".join(sorted(failed_ids)[:8]))
 
         # Resolve dedup-skipped playlist tracks into cross-folder .m3u8 references
         # (issue #31): a skipped track whose existing library path is known is listed at a
@@ -871,9 +1534,10 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
                                     "title": title, "artist": artist, "dur": -1})
 
         if not finished_dirs:
-            if not dedup:
+            if not dedup and not own_artist:
                 raise RuntimeError("Download lieferte keine Dateien (siehe Logs).")
-            # Dedup active and nothing NEW downloaded — a normal outcome (issue #21/#31).
+            # Dedup active (issue #21/#31) or a whole release filtered out as compilations /
+            # label uploads (issue #56) — nothing NEW downloaded is a normal outcome.
             if is_playlist:
                 manifest = _build_playlist_manifest(existing_tracks, [], ref_entries, is_sync)
                 if ref_entries:
@@ -885,8 +1549,10 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
                         reporter.on_phase("upload")
                         _upload_tree(destination, work_base)
                 return Result(summary="Keine neuen Titel", new_track_count=0,
-                              playlist_files=manifest, playlist_name=pl_title)
-            return Result(summary="Keine neuen Titel", new_track_count=0)
+                              playlist_files=manifest, playlist_name=pl_title,
+                              expected_count=expected_count, failed_count=failed_count)
+            return Result(summary="Keine neuen Titel", new_track_count=0,
+                          expected_count=expected_count, failed_count=failed_count)
 
         # 3) Navidrome tag correction (frozen fix_music_tags logic), gated per
         #    tag_options — all-on keeps the original behaviour. A playlist tags
@@ -907,13 +1573,17 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
             def cover_for(fp: str) -> bytes | None:
                 if not tag_options.cover:
                     return None  # cover disabled → thumbnail already stripped
-                src = thumb_by_stem.get(Path(fp).stem)
-                return _square_crop_jpeg(src) if src else None  # else keep embedded
+                thumb = thumb_by_stem.get(Path(fp).stem)
+                # Crop 16:9 thumbnails to a square and re-encode to JPEG; an already-square
+                # source is unchanged by the crop, so this is correct for every source and
+                # always yields the JPEG Navidrome wants (source.cover_square_crop stays a
+                # declared capability for feature 06's per-source cover strategy).
+                return _square_crop_jpeg(thumb) if thumb else None
 
             tracks = [Path(p) for p in fix_music_tags.process_tree(
                 str(playlist_dir), tag_options, cover_for=cover_for)]
-            for src in thumb_by_stem.values():
-                src.unlink(missing_ok=True)  # don't ship the standalone thumbnails
+            for thumb in thumb_by_stem.values():
+                thumb.unlink(missing_ok=True)  # don't ship the standalone thumbnails
             # Record what we're delivering (issue #21/#31): (artist, title, rel_path) per
             # track, read from the FINAL tags so the server index matches later lookups;
             # rel_path (relative to the WebDAV base) lets a future playlist reference it.
@@ -937,7 +1607,13 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
             if not album_dir.is_dir():
                 # Defensive: keeps fix_music_tags' sys.exit path (BaseException) unreachable.
                 raise RuntimeError(f"Album-Verzeichnis fehlt: {album_dir}")
-            cover_path = (_fetch_cover(url, is_album, album_dir / "cover.jpg", cookiefile=cookiefile)
+            # Artist mode (issue #56): recover clean title/artist tags for label-upload video
+            # names ("<Artist> - <Song> - <Label>") BEFORE tagging, so fix_music_tags normalises
+            # them like any clean track instead of them shipping as mis-tagged duplicates.
+            if own_artist:
+                _repair_album_titles(album_dir, own_artist)
+            cover_path = (_fetch_cover(url, is_album, album_dir / "cover.jpg",
+                                       cookiefile=cookiefile, source=source_spec)
                           if tag_options.cover else None)
             fix_music_tags.process_directory(
                 str(album_dir),
@@ -946,6 +1622,10 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
                 primary_artist,
                 tag_options,
             )
+            # Artist mode (issue #56): a label sampler's tracks each carry their own release
+            # year, which Navidrome would split into one album per year — force a single date.
+            if own_artist:
+                _unify_album_year(album_dir)
             # Record delivered tracks for the server index (issue #21/#31). Album/single
             # force one primary artist, so pair each track's title with it; rel_path
             # (relative to the WebDAV base) lets a future playlist reference it.
@@ -958,29 +1638,46 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
             root_name = f"{primary_artist} - {album}"
             webdav_label = f"{primary_artist}/{album}"
 
+        # Synced lyrics (issue #43): best-effort `.lrc` sidecars next to each track. Additive
+        # and non-fatal — a miss/error just skips (never fails the job) and never touches the
+        # frozen tag output. All modes; `.lrc` is neither an image nor audio ext, so it
+        # survives every cleanup glob and is excluded from the m3u/server index (audio-only).
+        # Runs before the `deliver` check so artist sub-runs stage sidecars into the shared
+        # tree for the orchestrator to deliver too; both delivery paths ship whatever is staged.
+        # Fetched concurrently (bounded pool) with a `lyrics` progress phase so a big playlist
+        # doesn't serialise N blocking HTTP round-trips (the artist reporter swallows the phase).
+        if fetch_lyrics:
+            lyric_targets = sorted(p for p in stage_root.rglob("*")
+                                   if p.suffix.lower() in fix_music_tags._SUPPORTED_EXTS)
+            if lyric_targets:
+                reporter.on_phase("lyrics")
+                lyrics.write_lrc_sidecars(lyric_targets, progress=reporter.on_track)
+
         # Artist run (issue #32): the staged, tagged tree stays in the shared dir; the
         # orchestrator delivers the whole tree once. Hand back what we produced so it can
         # accumulate the delivered tracks and combine the delivery.
         if not deliver:
             return Result(summary="", delivered=delivered, new_track_count=len(delivered),
-                          playlist_files=manifest, playlist_name=pl_title)
+                          playlist_files=manifest, playlist_name=pl_title,
+                          expected_count=expected_count, failed_count=failed_count)
 
         # 4) Deliver. WebDAV mirrors the whole work tree into the library (for a
         #    playlist that's the `<name>/` folder with its tracks + .m3u8); browser
         #    ZIPs the staged folder under a single top-level name.
         if destination.type == "webdav":
             reporter.on_phase("upload")
-            _upload_tree(destination, work_base)
+            upload_failed = _upload_tree(destination, work_base) or []
             return Result(summary=f"WebDAV: {webdav_label}", delivered=delivered,
                           new_track_count=len(delivered), playlist_files=manifest,
-                          playlist_name=pl_title)
+                          playlist_name=pl_title, expected_count=expected_count,
+                          failed_count=failed_count, upload_failed_count=len(upload_failed))
 
         reporter.on_phase("packaging")
         zip_path = _WORK_ROOT / f"{job_id}.zip"
         _zip_dir(stage_root, zip_path, root_name)
         return Result(summary=f"{root_name}.zip", zip_path=str(zip_path), zip_name=f"{root_name}.zip",
                       delivered=delivered, new_track_count=len(delivered), playlist_files=manifest,
-                      playlist_name=pl_title)
+                      playlist_name=pl_title, expected_count=expected_count, failed_count=failed_count)
     finally:
         # Only remove the work dir we created; a shared `stage_dir` is the caller's to clean.
         if stage_dir is None:
@@ -994,7 +1691,9 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
                         tag_options: fix_music_tags.TagOptions = fix_music_tags.TagOptions(),
                         cookies_txt: str | None = None,
                         on_server: Callable[[str, str], bool] | None = None,
-                        max_items: int = 0) -> Result:
+                        max_items: int = 0,
+                        album_concurrency: int = 1,
+                        fetch_lyrics: bool = False) -> Result:
     """Download an artist's whole discography (issue #32).
 
     Enumerates the artist's releases (`enumerate_artist`) and stages each through the ordinary
@@ -1003,54 +1702,123 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
     tree ONCE: a WebDAV upload mirrors `<Artist>/<Album>/…` into the library; a browser run ZIPs
     it under the artist name. `on_server` (dedup, issue #31) is passed through to every release so
     a re-run skips already-present tracks; `max_items` caps the number of releases (0 = unlimited).
-    One failing release is logged and skipped — it does not abort the whole run.
+    `album_concurrency` (>=2) downloads that many releases in parallel — each release is an
+    independent yt-dlp run into its own `Artist/<album>/` folder, so parity is unaffected; results
+    are aggregated in the calling thread. One failing release is logged and skipped — it does not
+    abort the whole run.
+
+    Every release is downloaded with `own_artist=<artist>` (issue #56), so tracks not credited to
+    the artist — the compilation / "appears-on" / label uploads the `/releases` tab mixes in, whose
+    broken metadata (label-as-artist) both defeats dedup and pollutes the library — are skipped up
+    front. A release that is entirely such uploads simply contributes nothing (not an error).
     """
     work_base = _WORK_ROOT / job_id
     cookie_path = _write_cookie_file(job_id, cookies_txt)
+    source_spec = detect_source(url) or YOUTUBE  # feature 02; only YouTube registered → unchanged
     try:
         work_base.mkdir(parents=True, exist_ok=True)
         reporter.on_phase("metadata")
         artist, releases = enumerate_artist(
-            url, cookiefile=str(cookie_path) if cookie_path else None, limit=max_items)
+            url, cookiefile=str(cookie_path) if cookie_path else None, limit=max_items,
+            source=source_spec)
         if not releases:
-            raise RuntimeError("Keine Releases gefunden — ist das eine YouTube-Music-Künstlerseite?")
+            # No `/releases` tab / no album playlists. The usual cause is an auto-generated
+            # "… - Topic" channel (or a plain uploads channel), which only exposes a flat list
+            # of tracks — there are no albums to enumerate. Point the user at a URL that works.
+            raise RuntimeError(
+                "Keine Alben gefunden. Diese Seite hat keine Album-Releases zum Herunterladen "
+                "— meist ein automatisch erzeugter „… - Topic\"-Kanal ohne Releases-Tab. "
+                "Bitte die offizielle Künstlerseite (mit Alben) verwenden, oder direkt eine "
+                "Album- bzw. Playlist-URL einfügen.")
         reporter.on_meta(artist, "")
 
+        # Skip third-party compilation / "appears-on" / label uploads (issue #56): the
+        # `/releases` tab mixes them in with the artist's OWN albums, but their artist tag is
+        # the label (or absent — the performer only in the video title), so they never dedup
+        # and would pollute the library with mis-tagged duplicates. Filter per-track by
+        # crediting, always on for an artist run — but only with a CONFIDENT name (an
+        # unresolved `_UNKNOWN_ARTIST` would drop everything). A "- Topic" channel suffix is
+        # stripped so the match targets the bare performer name.
+        own_artist = artist.removesuffix(" - Topic").strip() if artist else ""
+        own_artist = own_artist if own_artist and own_artist != _UNKNOWN_ARTIST else None
+
         # Per-release reporter: forward track/meta to the outer reporter, but swallow phase
-        # changes — the orchestrator owns the macro phase (so sub-albums don't flip it).
+        # changes — the orchestrator owns the macro phase (so sub-albums don't flip it). With a
+        # concurrent album pool the shared within-album track bar would flicker between releases,
+        # so forward per-track progress only when albums run one at a time.
+        forward_tracks = album_concurrency <= 1
         album_reporter = Reporter(on_phase=lambda phase: None,
-                                  on_meta=reporter.on_meta, on_track=reporter.on_track)
+                                  on_meta=reporter.on_meta,
+                                  on_track=reporter.on_track if forward_tracks
+                                  else (lambda cur, tot: None))
 
         total = len(releases)
-        delivered_all: list = []
-        new_count = 0
-        failed: list[str] = []
+        # Disambiguate release titles up front, single-threaded, so folder naming is deterministic
+        # and independent of completion order: two releases can share a title (a reissue, a
+        # re-released single) and would otherwise stage into the SAME `Artist/<title>/` folder,
+        # clobbering each other's cover / re-tagging each other's tracks.
         used_titles: dict[str, int] = {}
-        reporter.on_phase("download")
+        planned: list[tuple[int, dict, str]] = []
         for i, rel in enumerate(releases, 1):
-            # Two releases can share a title (a reissue, a re-released single). They would
-            # otherwise stage into the SAME `Artist/<title>/` folder and clobber each other's
-            # cover / re-tag each other's tracks — so disambiguate the album name per run.
             base = rel["title"]
             used_titles[base] = used_titles.get(base, 0) + 1
             album_name = base if used_titles[base] == 1 else f"{base} ({used_titles[base]})"
-            reporter.on_album(i, total, album_name)
-            try:
-                sub = run_download(job_id=f"{job_id}.{i}", url=rel["url"], genre=genre,
-                                   mode="album", destination=destination, reporter=album_reporter,
-                                   audio_format=audio_format, tag_options=tag_options,
-                                   cookies_txt=cookies_txt, on_server=on_server,
-                                   stage_dir=work_base, deliver=False, album_name=album_name)
-                delivered_all += sub.delivered
-                new_count += sub.new_track_count
-            except Exception:  # noqa: BLE001 - one bad release must not abort the whole artist run
-                log.exception("artist release failed: %s", album_name)
-                failed.append(album_name)
+            planned.append((i, rel, album_name))
+
+        delivered_all: list = []
+        new_count = 0
+        expected_all = 0   # tracks that should have downloaded across all releases
+        failed_all = 0     # tracks that never completed after retries (throttle/403)
+        failed: list[str] = []
+        done = 0
+        reporter.on_phase("download")
+        reporter.on_album(0, total, "")   # publish the album total before fan-out
+
+        def _stage_release(i: int, rel: dict, album_name: str) -> Result:
+            return run_download(job_id=f"{job_id}.{i}", url=rel["url"], genre=genre,
+                                mode="album", destination=destination, reporter=album_reporter,
+                                audio_format=audio_format, tag_options=tag_options,
+                                cookies_txt=cookies_txt, on_server=on_server,
+                                stage_dir=work_base, deliver=False, album_name=album_name,
+                                own_artist=own_artist, fetch_lyrics=fetch_lyrics,
+                                source=source_spec)
+
+        # Fan out into up to `album_concurrency` parallel album downloads; results are aggregated
+        # here in the calling thread (as_completed yields in this thread), so no locking is needed.
+        workers = max(1, min(album_concurrency, total))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_stage_release, i, rel, name): name
+                       for (i, rel, name) in planned}
+            for fut in as_completed(futures):
+                album_name = futures[fut]
+                done += 1
+                try:
+                    sub = fut.result()
+                    delivered_all += sub.delivered
+                    new_count += sub.new_track_count
+                    expected_all += sub.expected_count
+                    failed_all += sub.failed_count
+                except Exception:  # noqa: BLE001 - one bad release must not abort the whole run
+                    log.exception("artist release failed: %s", album_name)
+                    failed.append(album_name)
+                reporter.on_album(done, total, album_name)
 
         # A failed release may have left incomplete-download artifacts behind (the shared
         # work dir is not cleaned per-release); never ship those partials.
         for tmp in (*work_base.rglob("*.part"), *work_base.rglob("*.ytdl")):
             tmp.unlink(missing_ok=True)
+
+        # Cross-album track dedup (issue #56): drop a standalone single whose recording is also
+        # inside a real (multi-track) album; two multi-track albums that share a title are left
+        # alone (distinct recordings). Then drop the delivered entries whose file was removed so
+        # the server index and the summary count match what actually ships.
+        if own_artist:
+            n_removed = _dedup_staged_tracks(work_base)
+            if n_removed:
+                delivered_all = [(a, t, rel) for (a, t, rel) in delivered_all
+                                 if (work_base / rel).exists()]
+                new_count = len(delivered_all)
+                log.info("artist dedup: removed %d duplicate track(s) across albums", n_removed)
 
         # Nothing staged: dedup found everything already present, or every release failed.
         if not any(p.is_file() for p in work_base.rglob("*")):
@@ -1061,9 +1829,11 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
         note = f" ({len(failed)} übersprungen)" if failed else ""
         if destination.type == "webdav":
             reporter.on_phase("upload")
-            _upload_tree(destination, work_base)
+            upload_failed = _upload_tree(destination, work_base) or []
             return Result(summary=f"WebDAV: {artist} — {new_count} Titel / {total} Releases{note}",
-                          delivered=delivered_all, new_track_count=new_count)
+                          delivered=delivered_all, new_track_count=new_count,
+                          expected_count=expected_all, failed_count=failed_all,
+                          upload_failed_count=len(upload_failed))
 
         reporter.on_phase("packaging")
         # Releases stage under a single `<Artist>/` dir; zip that so the archive root is the
@@ -1073,7 +1843,8 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
         zip_path = _WORK_ROOT / f"{job_id}.zip"
         _zip_dir(stage_root, zip_path, artist)
         return Result(summary=f"{artist}.zip{note}", zip_path=str(zip_path),
-                      zip_name=f"{artist}.zip", delivered=delivered_all, new_track_count=new_count)
+                      zip_name=f"{artist}.zip", delivered=delivered_all, new_track_count=new_count,
+                      expected_count=expected_all, failed_count=failed_all)
     finally:
         shutil.rmtree(work_base, ignore_errors=True)
         if cookie_path:

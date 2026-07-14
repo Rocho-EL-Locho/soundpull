@@ -12,7 +12,8 @@ from app.genres import DEFAULT_GENRE
 from app.i18n import audio_format_labels, genre_options, t
 from app.jobs import JobState, get_user_jobs, start_job, tag_options_from_settings
 from app.pipeline import is_supported_url, normalize_audio_format
-from app.theme import frame, tag_option_switches
+from app.sources import suggest_mode
+from app.theme import tag_option_switches
 
 
 def _phase_order(js: JobState) -> list[str]:
@@ -75,6 +76,11 @@ def _job_card(js: JobState, delivered: set[str]) -> None:
                         .props("unelevated dense").classes("accent-grad text-white")
                 elif js.destination_type == "webdav" and js.summary:
                     ui.label(js.summary).classes("text-xs text-white/50")
+            if js.warning:  # index update failed (#38), or a partial delivery (throttle/403)
+                # warning is an i18n key; the partial note carries counts ("N von M") that
+                # `t()` fills in (and ignores for the count-less index warning).
+                ui.label(t(js.warning, failed=js.failed_tracks, total=js.total_tracks)).classes(
+                    "text-amber-400 text-xs")
             # Auto-start the browser download once, only for a just-finished job.
             if js.result_path and js.id not in delivered and js.finished_at:
                 age = (datetime.now(timezone.utc) - js.finished_at).total_seconds()
@@ -83,95 +89,181 @@ def _job_card(js: JobState, delivered: set[str]) -> None:
                     ui.download.file(js.result_path, js.result_name)
 
 
-@ui.page("/")
-def index_page(url: str = "") -> None:
-    with frame("download"):
-        with session_scope() as session:
-            user = get_current_user(session)
-            if user is None:
-                ui.navigate.to("/login")
-                return
-            uid = user.id
-            us = user.settings
-            d_genre = us.default_genre if us else DEFAULT_GENRE
-            d_mode = us.default_mode if us else "album"
-            d_audio = normalize_audio_format(us.default_audio_format if us else None)
-            d_tags = tag_options_from_settings(us)
-            d_dest = us.destination_type if us else "browser"
-            if d_dest not in ("browser", "webdav"):
-                d_dest = "browser"
-            has_webdav = bool(us and us.webdav_url)
-            d_dedup = bool(us and us.dedup_skip_existing)
+def _field_label(text: str):
+    return ui.label(text).classes("text-xs text-white/50")
 
-        delivered: set[str] = set()  # browser downloads already auto-started
 
-        @ui.refreshable
-        def render_jobs() -> None:
-            jobs = get_user_jobs(uid)
-            if not jobs:
-                ui.label(t("index.no_active")).classes("text-white/40 text-sm")
-                return
-            for js in jobs:
-                _job_card(js, delivered)
+def index_content(url: str = "") -> None:
+    """Sub-page builder (mounted by the app-shell ``ui.sub_pages`` router)."""
+    with session_scope() as session:
+        user = get_current_user(session)
+        if user is None:
+            ui.navigate.to("/login")
+            return
+        uid = user.id
+        us = user.settings
+        d_genre = us.default_genre if us else DEFAULT_GENRE
+        d_mode = us.default_mode if us else "album"
+        d_audio = normalize_audio_format(us.default_audio_format if us else None)
+        d_tags = tag_options_from_settings(us)
+        d_dest = us.destination_type if us else "browser"
+        if d_dest not in ("browser", "webdav"):
+            d_dest = "browser"
+        has_webdav = bool(us and us.webdav_url)
+        d_dedup = bool(us and us.dedup_skip_existing)
+        d_lyrics = bool(us and us.fetch_synced_lyrics)
 
-        with ui.card().classes("glass w-full rounded-2xl p-6 gap-4"):
-            ui.label(t("index.heading_new")).classes("text-xl font-semibold accent-text")
-            url_in = ui.input(t("index.url_label"), value=url,
-                              placeholder="https://music.youtube.com/...") \
+    delivered: set[str] = set()  # browser downloads already auto-started
+
+    @ui.refreshable
+    def render_jobs() -> None:
+        jobs = get_user_jobs(uid)
+        if not jobs:
+            ui.label(t("index.no_active")).classes("text-white/40 text-sm")
+            return
+        for js in jobs:
+            _job_card(js, delivered)
+
+    # Page heading: icon + title + subtitle, sitting above the form card (per design).
+    with ui.row().classes("items-center gap-3"):
+        ui.icon("download", size="30px").classes("accent-text")
+        ui.label(t("nav.download")).classes("text-3xl font-bold text-white")
+    ui.label(t("index.subtitle")).classes("text-white/50 text-sm")
+
+    with ui.card().classes("glass w-full rounded-2xl p-7 gap-5"):
+        # URL — external label + link-prefixed input (no floating label).
+        with ui.column().classes("w-full gap-1.5"):
+            _field_label(t("index.url_label"))
+            url_in = ui.input(value=url, placeholder="https://music.youtube.com/...") \
                 .props("outlined dense dark").classes("w-full")
-            with ui.row().classes("w-full gap-3 items-end"):
-                genre_sel = ui.select(genre_options(), value=d_genre, label=t("index.genre_label")) \
-                    .props("outlined dense dark").classes("flex-1 min-w-32")
-                with ui.column().classes("gap-1"):
-                    ui.label(t("index.mode_label")).classes("text-xs text-white/50")
-                    mode_tgl = ui.toggle({"album": t("common.album"), "single": t("common.single"),
-                                          "playlist": t("common.playlist"),
-                                          "artist": t("common.artist")}, value=d_mode) \
-                        .props("toggle-color=primary unelevated no-caps").classes("glass rounded-lg")
-            audio_sel = ui.select(audio_format_labels(), value=d_audio, label=t("index.audio_label")) \
-                .props("outlined dense dark").classes("w-full")
-            dest_label = t("dest.webdav") if has_webdav else t("dest.webdav_unconfigured")
-            dest_sel = ui.select({"browser": t("dest.browser"), "webdav": dest_label}, value=d_dest,
-                                 label=t("index.dest_label")).props("outlined dense dark").classes("w-full")
+            with url_in.add_slot("prepend"):
+                ui.icon("link").classes("text-white/40")
 
-            # Dedup (issue #31): only meaningful for WebDAV — a browser ZIP has no library
-            # to skip against / reference into. Enable the switch only when WebDAV is chosen.
-            with ui.row().classes("w-full items-center gap-2"):
-                dedup_sw = ui.switch(t("index.dedup_label"), value=d_dedup) \
-                    .props("dense color=primary").classes("text-sm") \
-                    .bind_enabled_from(dest_sel, "value", backward=lambda v: v == "webdav")
-                ui.label(t("index.dedup_hint")).classes("text-xs text-white/40") \
-                    .bind_visibility_from(dest_sel, "value", backward=lambda v: v != "webdav")
+        # Genre + audio format, side by side.
+        with ui.row().classes("w-full gap-4 items-start"):
+            with ui.column().classes("gap-1.5 flex-1 min-w-32"):
+                _field_label(t("index.genre_label"))
+                genre_sel = ui.select(genre_options(), value=d_genre) \
+                    .props("outlined dense dark").classes("w-full")
+            with ui.column().classes("gap-1.5 flex-1 min-w-32"):
+                _field_label(t("index.audio_label"))
+                audio_sel = ui.select(audio_format_labels(), value=d_audio) \
+                    .props("outlined dense dark").classes("w-full")
 
-            with ui.expansion(t("meta.heading"), icon="tune").classes("w-full glass rounded-lg") \
-                    .props("dense"):
-                with ui.column().classes("w-full gap-1 p-2"):
-                    tag_switches = tag_option_switches(d_tags)
+        # Mode.
+        with ui.column().classes("w-full gap-1.5"):
+            _field_label(t("index.mode_label"))
+            mode_tgl = ui.toggle({"album": t("common.album"), "single": t("common.single"),
+                                  "playlist": t("common.playlist"),
+                                  "artist": t("common.artist")}, value=d_mode) \
+                .props("toggle-color=primary unelevated no-caps spread") \
+                .classes("glass rounded-lg w-full")
 
-            def start() -> None:
-                target = (url_in.value or "").strip()
-                if not target:
-                    ui.notify(t("index.notify_need_url"), type="warning")
-                    return
-                if not is_supported_url(target):
-                    ui.notify(t("index.notify_bad_url"), type="warning")
-                    return
-                try:
-                    chosen_tags = TagOptions(**{f: bool(sw.value) for f, sw in tag_switches.items()})
-                    # Dedup only applies to WebDAV (browser ZIP has no library).
-                    dedup = bool(dedup_sw.value) and dest_sel.value == "webdav"
-                    start_job(user_id=uid, url=target, genre=genre_sel.value,
-                              mode=mode_tgl.value, destination_type=dest_sel.value,
-                              audio_format=audio_sel.value, tag_options=chosen_tags, dedup=dedup)
-                    ui.notify(t("index.notify_started"), type="positive")
-                    url_in.value = ""
-                    render_jobs.refresh()
-                except Exception as exc:  # noqa: BLE001 - show config/validation errors
-                    ui.notify(str(exc), type="negative")
+        # Destination as two selectable cards (issue #31 dedup UI folds in below).
+        dest_state = {"value": d_dest}
+        dest_cards: dict[str, object] = {}
 
-            ui.button(t("index.start_button"), icon="download", on_click=start) \
-                .props("unelevated").classes("accent-grad text-white hover-glow self-end px-6")
+        def _select_dest(value: str) -> None:
+            dest_state["value"] = value
+            for v, card in dest_cards.items():
+                (card.classes(add="sp-dest-card-active") if v == value
+                 else card.classes(remove="sp-dest-card-active"))
+            dedup_row.set_visibility(value == "webdav")
 
-        ui.label(t("index.active_heading")).classes("text-xs uppercase tracking-widest text-white/50 mt-2")
-        render_jobs()
-        ui.timer(1.0, render_jobs.refresh)
+        def _dest_card(value: str, icon: str, title: str, sub: str) -> None:
+            card = ui.element("div").classes("sp-dest-card") \
+                .on("click", lambda v=value: _select_dest(v))
+            with card:
+                ui.icon(icon, size="26px").classes("text-white/70")
+                with ui.column().classes("gap-0 min-w-0"):
+                    ui.label(title).classes("sp-dest-title truncate")
+                    ui.label(sub).classes("text-xs text-white/50 truncate")
+            dest_cards[value] = card
+
+        with ui.column().classes("w-full gap-1.5"):
+            _field_label(t("index.dest_label"))
+            with ui.row().classes("w-full gap-4"):
+                _dest_card("browser", "folder", t("dest.browser_title"), t("dest.browser_sub"))
+                _dest_card("webdav", "cloud_upload", t("dest.webdav"),
+                           t("dest.webdav_sub") if has_webdav else t("dest.webdav_sub_unconfigured"))
+
+        # Dedup (issue #31): only meaningful for WebDAV — shown only when WebDAV is chosen.
+        with ui.row().classes("w-full items-center gap-2") as dedup_row:
+            dedup_sw = ui.switch(t("index.dedup_label"), value=d_dedup) \
+                .props("dense color=primary").classes("text-sm")
+
+        def _apply_artist_dedup_default() -> None:
+            # Artist runs default to skipping existing tracks — a whole-discography re-download
+            # shouldn't re-pull everything — but the toggle stays editable, so you CAN turn
+            # skipping off to force a full re-download.
+            if mode_tgl.value == "artist":
+                dedup_sw.set_value(True)
+
+        # URL intelligence (roadmap feature 02): pasting a URL pre-selects the most likely
+        # mode. We must not fight a manual choice — once the user picks a mode themselves,
+        # `mode_state["manual"]` latches and auto-suggestion stops for the rest of the
+        # session, so a later URL edit never clobbers their pick. `suppress` distinguishes
+        # our own programmatic `set_value` (which also fires on_value_change) from a real click.
+        mode_state = {"manual": False}
+        suppress = {"on": False}
+
+        def _on_mode_change() -> None:
+            if not suppress["on"]:
+                mode_state["manual"] = True  # a genuine user pick — stop auto-suggesting
+            _apply_artist_dedup_default()
+
+        def _suggest_mode_from_url() -> None:
+            if mode_state["manual"]:
+                return  # respect the user's explicit choice — never override it
+            guess = suggest_mode(url_in.value or "")
+            if not guess:
+                return
+            suppress["on"] = True
+            try:
+                mode_tgl.set_value(guess)
+            finally:
+                suppress["on"] = False
+
+        mode_tgl.on_value_change(lambda: _on_mode_change())
+        url_in.on_value_change(lambda: _suggest_mode_from_url())
+        _select_dest(d_dest)  # sets initial card highlight + dedup visibility
+        if (url or "").strip():
+            _suggest_mode_from_url()  # a prefilled ?url= gets its mode suggested once
+        _apply_artist_dedup_default()  # default artist mode to skip-existing on
+
+        with ui.expansion(t("meta.heading"), icon="tune").classes("w-full glass rounded-lg") \
+                .props("dense"):
+            with ui.column().classes("w-full gap-1 p-2"):
+                tag_switches = tag_option_switches(d_tags)
+                # Synced lyrics (issue #43): fetch `.lrc` sidecars from LRCLIB; both dests.
+                lyrics_sw = ui.switch(t("index.lyrics_label"), value=d_lyrics) \
+                    .props("dense color=primary").classes("text-sm")
+
+        def start() -> None:
+            target = (url_in.value or "").strip()
+            if not target:
+                ui.notify(t("index.notify_need_url"), type="warning")
+                return
+            if not is_supported_url(target):
+                ui.notify(t("index.notify_bad_url"), type="warning")
+                return
+            try:
+                chosen_tags = TagOptions(**{f: bool(sw.value) for f, sw in tag_switches.items()})
+                # Dedup only applies to WebDAV (browser ZIP has no library).
+                dedup = bool(dedup_sw.value) and dest_state["value"] == "webdav"
+                start_job(user_id=uid, url=target, genre=genre_sel.value,
+                          mode=mode_tgl.value, destination_type=dest_state["value"],
+                          audio_format=audio_sel.value, tag_options=chosen_tags, dedup=dedup,
+                          fetch_lyrics=bool(lyrics_sw.value))
+                ui.notify(t("index.notify_started"), type="positive")
+                url_in.value = ""
+                render_jobs.refresh()
+            except Exception as exc:  # noqa: BLE001 - show config/validation errors
+                ui.notify(str(exc), type="negative")
+
+        ui.button(t("index.start_button"), icon="download", on_click=start) \
+            .props("unelevated").classes("accent-grad text-white hover-glow self-end px-6")
+
+    ui.label(t("index.active_heading")).classes("text-xs uppercase tracking-widest text-white/50 mt-2")
+    render_jobs()
+    ui.timer(1.0, render_jobs.refresh)

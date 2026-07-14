@@ -5,6 +5,7 @@ import shutil
 import stat
 import subprocess
 
+import httpx
 import pytest
 import yt_dlp
 
@@ -21,16 +22,28 @@ from app.pipeline import (
     run_artist_download,
     _apply_audio_format,
     _apply_cookie_policy,
+    _apply_pot_provider,
+    _apply_socket_timeout,
+    _apply_source,
     _apply_tag_options,
     _build_playlist_manifest,
     _build_ydl_opts,
+    _credits_artist,
+    _dedup_staged_tracks,
     _genre_flags,
     _index_from_name,
     _make_match_filter,
     _merge_manifest,
+    _playlist_folder_name,
     _primary_artist,
+    _repair_album_titles,
+    _repair_broken_title,
     _safe_segment,
     _square_crop_jpeg,
+    _strip_own_artist_prefix,
+    _strip_title_noise,
+    _unify_album_year,
+    _upload_with_retry,
     _write_cookie_file,
     _write_m3u,
     _write_m3u_entries,
@@ -39,6 +52,7 @@ from app.pipeline import (
     normalize_audio_format,
     pick_square_cover,
 )
+from app.sources import YOUTUBE
 
 
 def _jpeg_dimensions(data: bytes) -> tuple[int, int] | None:
@@ -73,7 +87,10 @@ def test_album_opts_parity():
     assert extract["preferredcodec"] == "mp3"
     assert extract["preferredquality"] == "320"
     clients = opts["extractor_args"]["youtube"]["player_client"]
-    assert {"ios", "web", "android"}.issubset(set(clients))
+    # android_vr (token-free bestaudio) first so it wins selection for public content;
+    # mweb (cookie-capable + PO token) covers age-restricted content at full quality.
+    # See EXTRACTOR_ARGS.
+    assert clients == ["android_vr", "mweb"]
 
 
 def test_single_has_no_playlist_track_remap():
@@ -84,11 +101,54 @@ def test_single_has_no_playlist_track_remap():
     assert "EmbedThumbnail" in keys
 
 
+# Frozen postprocessor chains for the pinned yt-dlp (== in pyproject, issue #37).
+# The full ORDERED key list — not just presence — so a yt-dlp bump that reorders,
+# drops, adds or reworks a postprocessor fails CI instead of silently shipping a
+# changed extraction/tagging path. Re-verify against real tag output, then update
+# these lists deliberately, when bumping the pin.
+_ALBUM_PP_CHAIN = [
+    "MetadataParser",
+    "FFmpegThumbnailsConvertor",
+    "FFmpegExtractAudio",
+    "FFmpegMetadata",
+    "EmbedThumbnail",
+    "FFmpegConcat",
+]
+_SINGLE_PP_CHAIN = [
+    "FFmpegThumbnailsConvertor",
+    "FFmpegExtractAudio",
+    "FFmpegMetadata",
+    "EmbedThumbnail",
+    "FFmpegConcat",
+]
+
+
+def test_postprocessor_chain_snapshot_parity():
+    # Snapshot guard for the metadata-parity invariant: the pinned yt-dlp must
+    # produce exactly this postprocessor chain (mp3 / 320 extraction included). A
+    # bump that changes the chain must break this test — that's the whole point.
+    for flags, expected in ((_ALBUM_FLAGS, _ALBUM_PP_CHAIN), (_SINGLE_FLAGS, _SINGLE_PP_CHAIN)):
+        opts = _build_ydl_opts(flags + _OUT)
+        assert _pp_keys(opts) == expected
+        extract = next(pp for pp in opts["postprocessors"] if pp["key"] == "FFmpegExtractAudio")
+        assert extract["preferredcodec"] == "mp3"
+        assert extract["preferredquality"] == "320"
+
+
 def test_default_audio_format_is_noop_parity():
     # The default (mp3_320) must not alter the original flag lists at all —
     # byte-identical flags → byte-identical tags (the parity invariant).
     assert _apply_audio_format(_ALBUM_FLAGS, DEFAULT_AUDIO_FORMAT) == _ALBUM_FLAGS
     assert _apply_audio_format(_SINGLE_FLAGS, DEFAULT_AUDIO_FORMAT) == _SINGLE_FLAGS
+
+
+def test_apply_source_youtube_is_noop_parity():
+    # feature 02: the YouTube source must leave the frozen flag lists byte-identical
+    # (they already carry YouTube's --extractor-args), so tag output is unchanged.
+    assert _apply_source(_ALBUM_FLAGS, YOUTUBE) == _ALBUM_FLAGS
+    assert _apply_source(_SINGLE_FLAGS, YOUTUBE) == _SINGLE_FLAGS
+    # returns a copy, never the same list object (so a caller can't mutate the frozen list)
+    assert _apply_source(_ALBUM_FLAGS, YOUTUBE) is not _ALBUM_FLAGS
 
 
 def test_mp3_192_changes_only_the_bitrate():
@@ -240,6 +300,38 @@ def test_safe_segment_blocks_traversal():
     assert _safe_segment("Drake") == "Drake"          # legitimate names untouched
 
 
+def test_safe_segment_replaces_server_unsafe_chars():
+    # issue #56: oCIS/OpenCloud rejects "?" (and other Windows-reserved chars) in a path
+    # segment even percent-encoded → 400 on upload. Map them to fullwidth look-alikes yt-dlp
+    # also uses for filenames, so folders match. Path separators stay "_".
+    assert _safe_segment("Is Anybody out There? / Nothing to Declare") == (
+        "Is Anybody out There？ _ Nothing to Declare")
+    assert _safe_segment('A:B*C"D<E>F|G') == "A：B＊C＂D＜E＞F｜G"
+    assert _safe_segment("Normal Album (2024)") == "Normal Album (2024)"   # ordinary names intact
+
+
+def test_playlist_folder_name_disambiguates_by_id():
+    # Two different playlists that share a title must NOT map to the same folder,
+    # or the second delivery overwrites the first's .m3u8 / clobbers tracks (issue #39).
+    a = _playlist_folder_name("Chill", "PLaaaa")
+    b = _playlist_folder_name("Chill", "PLbbbb")
+    assert a != b
+    assert a == "Chill [PLaaaa]"
+    # The id is stable per URL, so a re-sync of the SAME playlist lands in the SAME folder.
+    assert _playlist_folder_name("Chill", "PLaaaa") == a
+
+
+def test_playlist_folder_name_without_id_falls_back_to_title():
+    # No id exposed by the extractor → keep the bare (sanitised) title.
+    assert _playlist_folder_name("Chill", "") == "Chill"
+
+
+def test_playlist_folder_name_is_traversal_safe():
+    # The disambiguated name is still one safe path segment (no escaping the work dir).
+    assert _playlist_folder_name("../../etc", "PLx") == ".._.._etc [PLx]"
+    assert "/" not in _playlist_folder_name("A/B", "PLx")
+
+
 def test_default_download_opts_use_no_cookies():
     # Without a user cookie, yt-dlp must use NO cookies — neither a server file nor
     # a browser store on the server (issue #9).
@@ -261,6 +353,46 @@ def test_apply_cookie_policy_pins_user_cookie_and_forbids_browser():
     _apply_cookie_policy(opts, "/work/job.cookies.txt")
     assert opts["cookiefile"] == "/work/job.cookies.txt"
     assert opts["cookiesfrombrowser"] is None
+
+
+def test_apply_pot_provider_injects_base_url_only_when_configured(monkeypatch):
+    from app import pipeline
+
+    # Not configured (empty) → no-op: no bgutil provider args added.
+    monkeypatch.setattr(pipeline.settings, "pot_provider_base_url", "")
+    opts = {"extractor_args": {"youtube": {"player_client": ["ios"]}}}
+    _apply_pot_provider(opts)
+    assert "youtubepot-bgutilhttp" not in opts["extractor_args"]
+
+    # Configured → base_url is injected as a list value, existing args preserved.
+    monkeypatch.setattr(pipeline.settings, "pot_provider_base_url", "http://bgutil-provider:4416")
+    _apply_pot_provider(opts)
+    assert opts["extractor_args"]["youtubepot-bgutilhttp"] == {"base_url": ["http://bgutil-provider:4416"]}
+    assert opts["extractor_args"]["youtube"] == {"player_client": ["ios"]}
+
+    # Surrounding whitespace is trimmed; missing extractor_args is created.
+    monkeypatch.setattr(pipeline.settings, "pot_provider_base_url", "  http://host:9\n")
+    opts = {}
+    _apply_pot_provider(opts)
+    assert opts["extractor_args"]["youtubepot-bgutilhttp"] == {"base_url": ["http://host:9"]}
+
+
+def test_apply_socket_timeout_sets_option_when_configured(monkeypatch):
+    # issue #40: a per-socket deadline stops a stalled connection hanging a worker forever.
+    from app import pipeline
+
+    # Configured (>0) → the yt-dlp socket_timeout option is set to that value.
+    monkeypatch.setattr(pipeline.settings, "download_socket_timeout_seconds", 45.0)
+    opts = {}
+    _apply_socket_timeout(opts)
+    assert opts["socket_timeout"] == 45.0
+
+    # 0 / negative → no-op: leave yt-dlp's default (no timeout), key stays absent.
+    for disabled in (0, -1):
+        monkeypatch.setattr(pipeline.settings, "download_socket_timeout_seconds", disabled)
+        opts = {}
+        _apply_socket_timeout(opts)
+        assert "socket_timeout" not in opts
 
 
 def test_genre_flags_forces_real_genre_but_skips_empty():
@@ -320,6 +452,516 @@ def test_match_filter_captures_skipped_for_reference():
     captured.clear()
     assert mf({"title": "hotline bling", "artist": "drake"}, incomplete=True) is None
     assert captured == []                                     # incomplete call never captures
+
+
+def test_credits_artist_distinguishes_own_release_from_label_upload():
+    # issue #56: a track counts as the artist's own only when they're a CREDITED performer,
+    # not when a compilation/label upload merely names them in the video title.
+    own = {"artist": "BCee, Charlotte Haining", "artists": ["BCee", "Charlotte Haining"],
+           "channel": "BCee"}
+    assert _credits_artist(own, "BCee")
+    # label-as-artist (issue's example): artist tag is the label → not credited
+    assert not _credits_artist(
+        {"artist": "Spearhead Records",
+         "title": "BCee & Charlotte Haining - Almost There - Spearhead Records"}, "BCee")
+    # third-party reupload: no artist tag, performer only in the title, channel = label
+    assert not _credits_artist(
+        {"artist": None, "artists": None, "channel": "4U Chill",
+         "title": "BCee Featuring Charlotte Haining - Almost There (HD)"}, "BCee")
+    # broken SELF-upload on the artist's OWN channel: no artist tag, performer only in the
+    # title, channel = the artist → still skipped (channel/uploader are the source, not a credit)
+    assert not _credits_artist(
+        {"artist": None, "artists": None, "channel": "BCee", "uploader": "BCee",
+         "title": "BCee & Lomax - Brazilian Wax - Spearhead Records"}, "BCee")
+    # word-boundary, not substring: "Nas" must not match "Nasty"
+    assert not _credits_artist({"artist": "Nasty"}, "Nas")
+    # multi-word target inside a collab credit still matches
+    assert _credits_artist({"artist": "Sub Focus & Wilkinson"}, "Sub Focus")
+    # a track with NO real credit tag (only a title) is NOT credited → skipped
+    assert not _credits_artist({"title": "mystery"}, "BCee")
+    # a blank target never filters
+    assert _credits_artist({"artist": "Anyone"}, "")
+
+
+def test_match_filter_own_artist_skips_foreign_uploads():
+    # issue #56: own_artist filter rejects tracks not credited to the artist, keeps their
+    # own, defers while incomplete, ignores the playlist envelope, and — unlike a dedup skip —
+    # is NOT captured as a reference (it's dropped, not "already on the server").
+    captured: list = []
+    mf = _make_match_filter(own_artist="BCee",
+                            on_skip=lambda idx, a, t: captured.append((idx, a, t)))
+
+    assert mf({"_type": "video", "artist": "BCee, Logistics", "title": "Northpoint"}) is None
+    assert mf({"_type": "video", "artist": "Spearhead Records",
+               "title": "Almost There - Spearhead Records"}) is not None
+    assert mf({"artist": "Spearhead Records", "title": "x"}, incomplete=True) is None
+    assert mf({"_type": "playlist", "title": "BCee - Releases"}) is None
+    assert captured == []                                   # own_artist drops are never captured
+
+
+def test_match_filter_own_artist_and_dedup_compose():
+    # issue #56 + #31: both filters active. A foreign upload is dropped by own_artist (before
+    # the dedup check, so it's not captured); a track credited to the artist that is already on
+    # the server is skipped by dedup and captured for a possible m3u reference.
+    known = {("bcee", "hurt each other")}
+    captured: list = []
+    mf = _make_match_filter(
+        on_server=lambda a, t: (a.split(",")[0].strip().casefold(), t.casefold()) in known,
+        on_skip=lambda idx, a, t: captured.append((idx, a, t)),
+        own_artist="BCee")
+
+    # foreign label upload — not credited AND name doesn't start with the artist → own_artist
+    # reject (before the dedup check, so it's not captured)
+    assert mf({"_type": "video", "artist": "UKF Drum & Bass",
+               "title": "Drum & Bass Arena Mix 2019", "playlist_index": 1}) is not None
+    assert captured == []
+    # credited to BCee AND already on server → dedup skip, captured
+    assert mf({"_type": "video", "artist": "BCee", "title": "Hurt Each Other",
+               "playlist_index": 2}) is not None
+    assert captured == [(2, "BCee", "Hurt Each Other")]
+    # credited to BCee and NOT on server → downloads
+    assert mf({"_type": "video", "artist": "BCee", "title": "Northpoint"}) is None
+
+
+def test_repair_broken_title_parses_label_uploads():
+    # issue #56: recover (artist, title) from a label-upload video name, anchored on own_artist.
+    R = _repair_broken_title
+    assert R("BCee - Little Bird - Spearhead Records", "BCee") == ("BCee", "Little Bird")
+    assert R("BCee & Lomax - Brazilian Wax - Spearhead Records", "BCee") == (
+        "BCee / Lomax", "Brazilian Wax")
+    # feat in the PREFIX moves into the artist; a trailing " - <label>" is dropped
+    assert R("BCee feat. Shaz Sparks - Looking Glass (Metrik Remix) - Spearhead Records",
+             "BCee") == ("BCee / Shaz Sparks", "Looking Glass (Metrik Remix)")
+    # feat in the TITLE is left for fix_music_tags to normalise
+    assert R("BCee - Surfacing feat. Lucy Kitchen - Spearhead Records", "BCee") == (
+        "BCee", "Surfacing feat. Lucy Kitchen")
+    # a common video-name suffix is stripped
+    assert R("BCee - Come And Join Us (Official Video)", "BCee") == ("BCee", "Come And Join Us")
+    # no label segment → title kept whole (a bracketed feat stays for the tagger)
+    assert R("BCee - Northpoint (ft. Riya)", "BCee") == ("BCee", "Northpoint (ft. Riya)")
+    # version-aware label strip: a " - (remix)" segment is kept and re-attached, not dropped
+    assert R("BCee & Darrison - So Right - (LSB remix) - Spearhead Records", "BCee") == (
+        "BCee / Darrison", "So Right (LSB remix)")
+    assert R("BCee - So Right - (LSB remix)", "BCee") == ("BCee", "So Right (LSB remix)")
+    assert R("Colours", "BCee") is None                       # clean track (no " - ")
+    assert R("Some Other Artist - Song - Label", "BCee") is None   # not ours
+    assert R("BCee - X - Label", "") is None                  # blank artist never repairs
+    # exact-artist anchor: own_artist "Wax" must NOT hijack the foreign artist "Wax Tailor"
+    assert R("Wax Tailor - Que Sera - Label", "Wax") is None
+    # own_artist need not be FIRST in the prefix, but must be a whole credited artist
+    assert R("Lomax & BCee - Brazilian Wax - Spearhead Records", "BCee") == (
+        "Lomax / BCee", "Brazilian Wax")
+    # a label is stripped even when it contains a version keyword ("Dub") …
+    assert R("BCee - Forsaken - Dub Recordings", "BCee") == ("BCee", "Forsaken")
+    # … or a parenthetical (only a segment STARTING with a bracket counts as a version)
+    assert R("BCee - Just One Second - Hospital Records (UK)", "BCee") == (
+        "BCee", "Just One Second")
+    # a trailing producer credit is dropped so the recovered title equals the clean album track
+    # (else the single dupes the album track — issue #56)
+    assert R("HeXer - Es wird kälter (prod. by a3)", "HeXer") == ("HeXer", "Es wird kälter")
+    assert R("HeXer - Hextech (prod. a3)", "HeXer") == ("HeXer", "Hextech")
+    # an "x"/"×" collab prefix credits own_artist and is split like "&"
+    assert R("HeXer x AzudemSK - 341 (prod. a3)", "HeXer") == ("HeXer / AzudemSK", "341")
+    assert R("HeXer × Ronnie78 - Bierball Remix", "HeXer") == ("HeXer / Ronnie78", "Bierball Remix")
+
+
+def test_strip_title_noise():
+    # issue #56: trailing producer/video-name suffixes dropped so a single's title matches the album
+    N = _strip_title_noise
+    assert N("Es wird kälter (prod. by a3)") == "Es wird kälter"
+    assert N("Hextech (prod. a3)") == "Hextech"
+    assert N("Track [prod. X]") == "Track"
+    assert N("Song (produced by Y)") == "Song"
+    assert N("Beat (prod. a3) (Official Audio)") == "Beat"     # looped: strips both
+    assert N("Song (Live)") == "Song (Live)"                   # not a producer/video suffix
+    assert N("Northpoint (ft. Riya)") == "Northpoint (ft. Riya)"  # feat left for fix_music_tags
+    assert N("Reproduction") == "Reproduction"                 # "prod" mid-word, no bracket
+
+
+def test_strip_own_artist_prefix():
+    # issue #56: a credited self-upload titled "<Artist> - <Song>" loses the artist prefix and any
+    # trailing producer/video-name suffix (so it matches the clean album track and dedups).
+    S = _strip_own_artist_prefix
+    assert S("HeXer - Es wird kälter", "HeXer") == "Es wird kälter"
+    assert S("HeXer - Es wird kälter (prod. by a3)", "HeXer") == "Es wird kälter"  # prod dropped
+    assert S("HeXer x AzudemSK - 341 (prod. a3)", "HeXer") == "341"                # collab prefix
+    # a real internal " - " in the song title is kept (only trailing noise is stripped)
+    assert S("BCee - Live at XOYO - Part 1", "BCee") == "Live at XOYO - Part 1"
+    assert S("BCee & Lomax - Brazilian Wax", "BCee") == "Brazilian Wax"  # feat/co in prefix
+    assert S("Colours", "BCee") is None                       # no " - " → nothing to strip
+    assert S("Es wird kälter", "HeXer") is None               # prefix isn't the artist
+    assert S("HeXer - ", "HeXer") is None                     # empty remainder
+    assert S("X", "") is None                                 # blank artist never strips
+    # exact-artist anchor: "Wax" must NOT strip the foreign "Wax Tailor - …"
+    assert S("Wax Tailor - Que Sera", "Wax") is None
+
+
+def test_match_filter_keeps_repairable_broken_upload():
+    # issue #56: a broken upload with no artist tag but a name STARTING with the artist is KEPT
+    # (repaired after download), while one that neither credits nor starts with it is dropped.
+    mf = _make_match_filter(own_artist="BCee")
+    assert mf({"_type": "video", "artist": None,
+               "title": "BCee - Little Bird - Spearhead Records"}) is None
+    assert mf({"_type": "video", "artist": None,
+               "title": "Some DJ - Other Song - Label"}) is not None
+
+
+def test_match_filter_dedups_repairable_upload_on_recovered_key():
+    # issue #56: a broken upload whose CLEAN version is already on the server must be skipped by
+    # dedup — matched on the recovered (artist, title), not its raw video-name key.
+    known = {("bcee", "little bird")}
+    mf = _make_match_filter(
+        on_server=lambda a, t: (a.split("/")[0].strip().casefold(), t.casefold()) in known,
+        own_artist="BCee")
+    # raw key ("", "BCee - Little Bird - Spearhead Records") wouldn't match; recovered one does
+    assert mf({"_type": "video", "artist": None,
+               "title": "BCee - Little Bird - Spearhead Records"}) is not None
+    # a repairable upload NOT on the server still downloads (to be repaired after)
+    assert mf({"_type": "video", "artist": None,
+               "title": "BCee - Brand New Tune - Spearhead Records"}) is None
+
+
+def test_match_filter_repaired_dedups_under_own_artist():
+    # issue #56: a repaired upload dedups under own_artist (the key it will be INDEXED under),
+    # even when the recovered prefix lists another artist first — else the pre-download key
+    # ("lomax", …) and the post-download index key ("bcee", …) diverge and it re-downloads.
+    known = {("bcee", "brazilian wax")}
+    mf = _make_match_filter(
+        on_server=lambda a, t: (a.split("/")[0].strip().casefold(), t.casefold()) in known,
+        own_artist="BCee")
+    assert mf({"_type": "video", "artist": None,
+               "title": "Lomax & BCee - Brazilian Wax - Spearhead Records"}) is not None
+    # a credited track with NO artist prefix is deduped on its raw title
+    assert mf({"_type": "video", "artist": "BCee", "title": "Brazilian Wax"}) is not None
+
+
+def test_match_filter_dedups_credited_prefixed_title_on_stripped_key():
+    # issue #56: a credited self-upload titled "<Artist> - <Song>" is re-titled to the bare song
+    # after download, so dedup must match on that STRIPPED key — else the pre-download key
+    # ("hexer", "hexer - es wird kälter") and the indexed key ("hexer", "es wird kälter") diverge
+    # and every sync re-downloads it.
+    known = {("hexer", "es wird kälter")}
+    mf = _make_match_filter(
+        on_server=lambda a, t: (a.split("/")[0].strip().casefold(), t.casefold()) in known,
+        own_artist="HeXer")
+    assert mf({"_type": "video", "artist": "HeXer",
+               "title": "HeXer - Es wird kälter"}) is not None   # skipped: already on server
+    # a credited prefixed track NOT on the server still downloads (to be re-titled after)
+    assert mf({"_type": "video", "artist": "HeXer",
+               "title": "HeXer - Brandneuer Song"}) is None
+
+
+def test_repair_album_titles_rewrites_tags_and_renames(tmp_path):
+    # issue #56: broken video-name files get clean title/artist tags and are renamed to the
+    # clean title; a clean track (real artist tag) is left untouched and keeps its name.
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("ffmpeg not on PATH")
+    from mutagen import File as MutagenFile
+
+    def mk(title):
+        p = tmp_path / f"{title}.m4a"
+        subprocess.run([ffmpeg, "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                        "-t", "0.1", "-metadata", f"title={title}", "-c:a", "aac", str(p)],
+                       capture_output=True, check=True)
+        return p
+
+    mk("BCee - Little Bird - Spearhead Records")
+    mk("BCee & Lomax - Brazilian Wax - Spearhead Records")
+    clean = mk("Colours")
+    c = MutagenFile(str(clean), easy=True); c["artist"] = ["BCee"]; c.save()
+    # a credited self-upload titled "<Artist> - <Song>" keeps its artist tag but the redundant
+    # "BCee - " prefix is stripped from the TITLE (only the song belongs there)
+    weird = mk("BCee - Live at XOYO - Part 1")
+    w = MutagenFile(str(weird), easy=True); w["artist"] = ["BCee"]; w.save()
+
+    _repair_album_titles(tmp_path, "BCee")
+
+    assert {p.name for p in tmp_path.iterdir()} == {
+        "Little Bird.m4a", "Brazilian Wax.m4a", "Colours.m4a",
+        "Live at XOYO - Part 1.m4a"}
+    tags = {p.name: MutagenFile(str(p), easy=True) for p in tmp_path.iterdir()}
+    assert tags["Little Bird.m4a"]["title"] == ["Little Bird"]
+    assert tags["Little Bird.m4a"]["artist"] == ["BCee"]
+    assert tags["Brazilian Wax.m4a"]["artist"] == ["BCee / Lomax"]
+    assert tags["Colours.m4a"]["title"] == ["Colours"]        # clean track (no prefix) untouched
+    # credited track with an "<Artist> - " title: prefix stripped from title, artist tag kept
+    assert tags["Live at XOYO - Part 1.m4a"]["title"] == ["Live at XOYO - Part 1"]
+    assert tags["Live at XOYO - Part 1.m4a"]["artist"] == ["BCee"]
+
+
+def test_repair_album_titles_never_clobbers_another_file(tmp_path):
+    # issue #56: two broken uploads that would repair to the SAME clean name must both survive
+    # (the second gets a " (2)" suffix) — a rename must never overwrite another staged file.
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("ffmpeg not on PATH")
+    from mutagen import File as MutagenFile
+
+    def mk(name):
+        p = tmp_path / f"{name}.m4a"
+        subprocess.run([ffmpeg, "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                        "-t", "0.1", "-metadata", f"title={name}", "-c:a", "aac", str(p)],
+                       capture_output=True, check=True)
+        return p
+
+    # both video names recover to title "Skyline" (e.g. an album cut + a single upload)
+    mk("BCee - Skyline - Spearhead Records")
+    mk("BCee - Skyline - UKF Drum & Bass")
+
+    _repair_album_titles(tmp_path, "BCee")
+
+    names = {p.name for p in tmp_path.iterdir()}
+    assert len(names) == 2                                    # nothing overwritten
+    assert names == {"Skyline.m4a", "Skyline (2).m4a"}
+
+
+def test_unify_album_year_collapses_compilation_dates(tmp_path):
+    # issue #56 (B): a sampler's tracks each carry their own year → Navidrome splits the folder
+    # into one album per year. Force the earliest date onto all so it's one album.
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("ffmpeg not on PATH")
+    from mutagen import File as MutagenFile
+
+    def mk(name, date):
+        p = tmp_path / f"{name}.m4a"
+        subprocess.run([ffmpeg, "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t",
+                        "0.1", "-metadata", f"title={name}", "-metadata", f"date={date}",
+                        "-c:a", "aac", str(p)], capture_output=True, check=True)
+
+    mk("A", "20120308"); mk("B", "20110902"); mk("C", "20111008")
+    _unify_album_year(tmp_path)
+    dates = {(MutagenFile(str(p), easy=True).get("date") or [None])[0]
+             for p in tmp_path.glob("*.m4a")}
+    assert dates == {"20110902"}                              # all → earliest → one album
+
+    # a real album (uniform dates) is left untouched
+    d2 = tmp_path / "real"
+    d2.mkdir()
+    for n in ("X", "Y"):
+        subprocess.run([ffmpeg, "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t",
+                        "0.1", "-metadata", f"title={n}", "-metadata", "date=2020",
+                        "-c:a", "aac", str(d2 / f"{n}.m4a")], capture_output=True, check=True)
+    _unify_album_year(d2)
+    assert {(MutagenFile(str(p), easy=True).get("date") or [None])[0]
+            for p in d2.glob("*.m4a")} == {"2020"}
+
+
+def test_dedup_staged_tracks_keeps_biggest_album(tmp_path):
+    # issue #56 (C): the same track staged in a real album AND as a single → keep the album copy,
+    # drop the single (and its emptied folder + cover).
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("ffmpeg not on PATH")
+
+    def mk(folder, title):
+        d = tmp_path / folder
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / f"{title}.m4a"
+        subprocess.run([ffmpeg, "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t",
+                        "0.1", "-metadata", f"title={title}", "-metadata", "artist=BCee",
+                        "-c:a", "aac", str(p)], capture_output=True, check=True)
+        return p
+
+    mk("BCee/These Are The Days", "Colours")
+    mk("BCee/These Are The Days", "Imposter")
+    mk("BCee/These Are The Days", "Lies")
+    single = mk("BCee/Colours", "Colours")                   # same track also as a single
+    (tmp_path / "BCee" / "Colours" / "cover.jpg").write_bytes(b"x")
+
+    removed = _dedup_staged_tracks(tmp_path)
+
+    assert removed == 1
+    assert {str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*.m4a")} == {
+        "BCee/These Are The Days/Colours.m4a",
+        "BCee/These Are The Days/Imposter.m4a",
+        "BCee/These Are The Days/Lies.m4a"}
+    assert not single.exists()                               # single copy removed
+    assert not (tmp_path / "BCee" / "Colours").exists()      # emptied folder + cover removed
+
+
+def test_repaired_single_dedups_against_album_track(tmp_path):
+    # issue #56 (the reported bug): a raw self-upload single ("<Artist> - <Song> (prod. …)") is
+    # repaired to the clean song title, so it then dedups against the SAME recording already in a
+    # real album — instead of landing as a duplicate because the producer suffix broke the match.
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("ffmpeg not on PATH")
+    from mutagen import File as MutagenFile
+
+    def mk(folder, filename, title):
+        d = tmp_path / folder
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / filename
+        subprocess.run([ffmpeg, "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t",
+                        "0.1", "-metadata", f"title={title}", "-metadata", "artist=HeXer",
+                        "-c:a", "aac", str(p)], capture_output=True, check=True)
+        return p
+
+    # clean topic-channel album (2 tracks) + the raw self-upload single of the same recording
+    # (artist tag backfilled from the channel, so it looks credited)
+    mk("HeXer/Singlegrind", "Es wird kälter.m4a", "Es wird kälter")
+    mk("HeXer/Singlegrind", "Chorgesang.m4a", "Chorgesang")
+    mk("HeXer/single", "HeXer - Es wird kälter (prod. by a3).m4a",
+       "HeXer - Es wird kälter (prod. by a3)")
+
+    _repair_album_titles(tmp_path / "HeXer" / "single", "HeXer")
+    repaired = next((tmp_path / "HeXer" / "single").glob("*.m4a"))
+    assert MutagenFile(str(repaired), easy=True)["title"] == ["Es wird kälter"]  # now matches album
+
+    removed = _dedup_staged_tracks(tmp_path)
+
+    assert removed == 1                                          # the redundant single is dropped
+    assert not (tmp_path / "HeXer" / "single").exists()          # emptied folder removed
+    assert {str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*.m4a")} == {
+        "HeXer/Singlegrind/Es wird kälter.m4a",
+        "HeXer/Singlegrind/Chorgesang.m4a"}
+
+
+def test_dedup_staged_tracks_keeps_distinct_same_title_album_tracks(tmp_path):
+    # issue #56 regression: two DIFFERENT recordings sharing a title across albums (an "Intro"
+    # on each) are NOT duplicates — track_key ignores the album, so dedup must keep both. Only a
+    # lone single is dropped, never a copy that sits in its own multi-track album.
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("ffmpeg not on PATH")
+
+    def mk(folder, title):
+        d = tmp_path / folder
+        d.mkdir(parents=True, exist_ok=True)
+        subprocess.run([ffmpeg, "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t",
+                        "0.1", "-metadata", f"title={title}", "-metadata", "artist=BCee",
+                        "-c:a", "aac", str(d / f"{title}.m4a")], capture_output=True, check=True)
+
+    mk("BCee/Album A", "Intro"); mk("BCee/Album A", "S1"); mk("BCee/Album A", "S2")
+    mk("BCee/Album B", "Intro"); mk("BCee/Album B", "S3")     # a DIFFERENT "Intro"
+
+    removed = _dedup_staged_tracks(tmp_path)
+
+    assert removed == 0                                       # nothing deleted
+    assert len(list(tmp_path.rglob("Intro.m4a"))) == 2        # both "Intro"s survive
+
+
+def test_dedup_staged_tracks_keeps_all_when_only_singles(tmp_path):
+    # When every copy of a track is a lone single (no album), none is deleted — we can't tell
+    # which is canonical, and deleting would be arbitrary data loss.
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("ffmpeg not on PATH")
+
+    def mk(folder):
+        d = tmp_path / folder
+        d.mkdir(parents=True, exist_ok=True)
+        subprocess.run([ffmpeg, "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t",
+                        "0.1", "-metadata", "title=Solo", "-metadata", "artist=BCee",
+                        "-c:a", "aac", str(d / "Solo.m4a")], capture_output=True, check=True)
+
+    mk("BCee/Solo"); mk("BCee/Solo (2)")
+    assert _dedup_staged_tracks(tmp_path) == 0
+    assert len(list(tmp_path.rglob("Solo.m4a"))) == 2
+
+
+def test_upload_with_retry_succeeds_after_transient_timeout(monkeypatch):
+    # A slow/dropped PUT is transient — retry rather than abort the whole artist upload.
+    import app.pipeline as pipeline
+    monkeypatch.setattr(pipeline.time, "sleep", lambda s: None)
+    calls = {"n": 0}
+
+    class _C:
+        def upload_file(self, local, remote, overwrite=True):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise httpx.ReadTimeout("The read operation timed out")
+
+    _upload_with_retry(_C(), "/tmp/a.mp3", "Artist/Album/a.mp3")
+    assert calls["n"] == 3                        # two timeouts, third attempt succeeds
+
+
+def test_upload_with_retry_reraises_after_exhausting(monkeypatch):
+    import app.pipeline as pipeline
+    monkeypatch.setattr(pipeline.time, "sleep", lambda s: None)
+
+    class _C:
+        def upload_file(self, *a, **k):
+            raise httpx.ConnectError("boom")
+
+    with pytest.raises(httpx.ConnectError):
+        _upload_with_retry(_C(), "/tmp/a.mp3", "r/a.mp3")
+
+
+def test_upload_with_retry_does_not_retry_non_transient(monkeypatch):
+    # A non-network error (bad path, auth, 4xx) is not transient → fail fast, no retry.
+    import app.pipeline as pipeline
+    monkeypatch.setattr(pipeline.time, "sleep", lambda s: None)
+    calls = {"n": 0}
+
+    class _C:
+        def upload_file(self, *a, **k):
+            calls["n"] += 1
+            raise ValueError("bad path")
+
+    with pytest.raises(ValueError):
+        _upload_with_retry(_C(), "/tmp/a.mp3", "r/a.mp3")
+    assert calls["n"] == 1
+
+
+def test_upload_with_retry_backoff_is_exponential(monkeypatch):
+    # issue #40: waits between transient retries grow exponentially (2, 4, 8), bounded by attempts.
+    import app.pipeline as pipeline
+    delays: list[float] = []
+    monkeypatch.setattr(pipeline.time, "sleep", lambda s: delays.append(s))
+
+    class _C:
+        def upload_file(self, *a, **k):
+            raise httpx.ReadTimeout("The read operation timed out")
+
+    with pytest.raises(httpx.ReadTimeout):
+        _upload_with_retry(_C(), "/tmp/a.mp3", "r/a.mp3")
+    # 4 attempts → 3 waits before the final re-raise, doubling each time.
+    assert delays == [2.0, 4.0, 8.0]
+
+
+def test_upload_tree_skips_rejected_path_but_uploads_rest(monkeypatch, tmp_path):
+    # issue #56 follow-up: a single path the server rejects (400) must be skipped + reported,
+    # not abort the whole discography upload — the other files still go up.
+    import app.pipeline as pipeline
+    d = tmp_path / "BCee" / "Album"
+    d.mkdir(parents=True)
+    for n in ["Good One.m4a", "BAD Track.m4a", "Good Two.m4a"]:
+        (d / n).write_bytes(b"x")
+
+    class _FakeClient:
+        def __init__(self): self.uploaded = []
+        def exists(self, p): return True
+        def mkdir(self, p): pass
+        def upload_file(self, local, remote, overwrite=True):
+            if "BAD" in remote:
+                raise RuntimeError("received 400 (Bad Request)")
+            self.uploaded.append(remote)
+
+    fake = _FakeClient()
+    monkeypatch.setattr("app.webdav_util.make_client", lambda *a, **k: fake)
+
+    failed = pipeline._upload_tree(Destination(type="webdav", webdav_folder="Music"), tmp_path)
+
+    assert len(fake.uploaded) == 2                              # both good files uploaded
+    assert failed == ["BCee/Album/BAD Track.m4a"]              # bad one reported, non-fatal
+
+
+def test_upload_tree_raises_when_all_uploads_fail(monkeypatch, tmp_path):
+    # systemic failure (nothing uploads) must surface as an error, not a silent empty upload.
+    import app.pipeline as pipeline
+    (tmp_path / "a.m4a").write_bytes(b"x")
+
+    class _FakeClient:
+        def exists(self, p): return True
+        def mkdir(self, p): pass
+        def upload_file(self, *a, **k): raise RuntimeError("received 400 (Bad Request)")
+
+    monkeypatch.setattr("app.webdav_util.make_client", lambda *a, **k: _FakeClient())
+    with pytest.raises(RuntimeError):
+        pipeline._upload_tree(Destination(type="webdav"), tmp_path)
 
 
 def test_build_playlist_manifest_keeps_fresh_reference():
@@ -504,6 +1146,57 @@ def test_enumerate_artist_direct_releases_url_and_limit(monkeypatch):
     assert rec.seen == ["https://www.youtube.com/channel/UCabc/releases"]  # no extra probe
 
 
+def test_run_download_artist_mode_forces_own_artist_over_probed_label(monkeypatch, tmp_path):
+    # issue #56: a release hosted on a label channel probes as artist=<label>. With own_artist
+    # set (artist mode) the known performer wins everywhere — folder, the album_artist tag
+    # (process_directory's primary_artist arg) and the server-index key — so it isn't filed
+    # under the label. A plain download (own_artist=None) keeps the probed artist (parity).
+    from pathlib import Path
+    import app.pipeline as pipeline
+    monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
+    monkeypatch.setattr(pipeline, "_probe_meta",
+                        lambda *a, **k: ("Drum&BassArena", "This Time Next Year"))
+    monkeypatch.setattr(pipeline, "_fetch_cover", lambda *a, **k: None)
+    tagged = {}
+    monkeypatch.setattr(pipeline.fix_music_tags, "process_directory",
+                        lambda d, cover, album, artist, opts: tagged.update(
+                            dir=d, album=album, artist=artist))
+
+    class _FakeYDL:
+        # `_build_ydl_opts` runs parse_options, which calls YoutubeDL.validate_outtmpl — keep
+        # the real staticmethod so opts still build; only the actual download is faked.
+        validate_outtmpl = staticmethod(pipeline.yt_dlp.YoutubeDL.validate_outtmpl)
+
+        def __init__(self, opts): self.opts = opts
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def download(self, urls):
+            outtmpl = self.opts["outtmpl"]
+            tmpl = outtmpl["default"] if isinstance(outtmpl, dict) else outtmpl
+            out_dir = Path(tmpl).parent
+            out_dir.mkdir(parents=True, exist_ok=True)
+            f = out_dir / "track.mp3"
+            f.write_bytes(b"x")
+            for hook in self.opts.get("progress_hooks", []):
+                hook({"status": "finished", "filename": str(f), "info_dict": {}})
+
+    monkeypatch.setattr(pipeline.yt_dlp, "YoutubeDL", _FakeYDL)
+    zipped = {}
+    monkeypatch.setattr(pipeline, "_zip_dir", lambda src, zp, name: zipped.update(name=name))
+
+    res = pipeline.run_download(
+        job_id="ja1", url="uAlbum", genre="DnB", mode="album",
+        destination=Destination(type="browser"), reporter=Reporter(),
+        album_name="This Time Next Year", own_artist="BCee")
+
+    assert tagged["artist"] == "BCee"                             # album_artist forced to performer
+    assert tagged["album"] == "This Time Next Year"
+    assert tagged["dir"].replace("\\", "/").endswith("/BCee/This Time Next Year")
+    assert res.delivered[0][0] == "BCee"                         # server-index key = performer
+    assert res.delivered[0][2].startswith("BCee/This Time Next Year/")
+    assert zipped["name"] == "BCee - This Time Next Year"        # zip root name = performer
+
+
 def test_run_artist_download_browser_stages_and_zips_once(monkeypatch, tmp_path):
     # An artist run stages every release through the album path (deliver=False into ONE
     # shared dir, dedup passed through), tolerates a failed release, reports album i/N,
@@ -511,7 +1204,7 @@ def test_run_artist_download_browser_stages_and_zips_once(monkeypatch, tmp_path)
     import app.pipeline as pipeline
     monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
     monkeypatch.setattr(pipeline, "enumerate_artist",
-                        lambda url, cookiefile=None, limit=0: ("Artist", [
+                        lambda url, cookiefile=None, limit=0, source=None: ("Artist", [
                             {"title": "A", "url": "uA"},
                             {"title": "B", "url": "uB"},
                             {"title": "C", "url": "uC"}]))
@@ -548,7 +1241,8 @@ def test_run_artist_download_browser_stages_and_zips_once(monkeypatch, tmp_path)
     assert res.new_track_count == 2 and len(res.delivered) == 2   # A + C; B skipped
     assert res.zip_name == "Artist.zip"
     assert "übersprungen" in res.summary                    # failure surfaced, run continued
-    assert albums == [(1, 3, "A"), (2, 3, "B"), (3, 3, "C")]
+    # album progress: total published up front (0/3), then a monotonic completion count 1..3
+    assert albums == [(0, 3, ""), (1, 3, "A"), (2, 3, "B"), (3, 3, "C")]
     assert zipped["name"] == "Artist"
     assert zipped["src"] == tmp_path / ".work" / "job1" / "Artist"   # single artist level
 
@@ -557,7 +1251,7 @@ def test_run_artist_download_webdav_uploads_whole_tree_once(monkeypatch, tmp_pat
     import app.pipeline as pipeline
     monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
     monkeypatch.setattr(pipeline, "enumerate_artist",
-                        lambda url, cookiefile=None, limit=0: ("Artist", [{"title": "A", "url": "uA"}]))
+                        lambda url, cookiefile=None, limit=0, source=None: ("Artist", [{"title": "A", "url": "uA"}]))
 
     def fake_run_download(**kw):
         d = kw["stage_dir"] / "Artist" / "A"
@@ -584,7 +1278,7 @@ def test_run_artist_download_disambiguates_duplicate_release_titles(monkeypatch,
     import app.pipeline as pipeline
     monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
     monkeypatch.setattr(pipeline, "enumerate_artist",
-                        lambda url, cookiefile=None, limit=0: ("Artist", [
+                        lambda url, cookiefile=None, limit=0, source=None: ("Artist", [
                             {"title": "Live", "url": "u1"},
                             {"title": "Live", "url": "u2"}]))
     seen = []
@@ -605,11 +1299,196 @@ def test_run_artist_download_disambiguates_duplicate_release_titles(monkeypatch,
     assert seen == ["Live", "Live (2)"]                     # second release disambiguated
 
 
+def test_run_artist_download_passes_own_artist_filter(monkeypatch, tmp_path):
+    # issue #56: an artist run forwards own_artist=<resolved name> to every release so
+    # compilation/label uploads are filtered per-track — but only with a CONFIDENT name; an
+    # unresolved "Artist" fallback (and a "- Topic" suffix) is handled so nothing is over-dropped.
+    import app.pipeline as pipeline
+    monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
+
+    def fake_run_download(**kw):
+        d = kw["stage_dir"] / "X" / kw["album_name"]
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "t.mp3").write_bytes(b"x")
+        return Result(delivered=[], new_track_count=1)
+
+    monkeypatch.setattr(pipeline, "run_download", fake_run_download)
+    monkeypatch.setattr(pipeline, "_zip_dir", lambda src, zp, name: None)
+
+    # A resolved artist (with a "- Topic" channel suffix) → filter on with the bare name.
+    calls = []
+    monkeypatch.setattr(pipeline, "run_download",
+                        lambda **kw: (calls.append(kw), fake_run_download(**kw))[1])
+    monkeypatch.setattr(pipeline, "enumerate_artist",
+                        lambda url, cookiefile=None, limit=0, source=None: ("BCee - Topic",
+                                                               [{"title": "A", "url": "uA"}]))
+    run_artist_download(job_id="ja", url="u", genre="Rap",
+                        destination=Destination(type="browser"), reporter=Reporter())
+    assert [c["own_artist"] for c in calls] == ["BCee"]
+
+    # An unresolved fallback name must NOT be used as a filter (would drop everything).
+    calls.clear()
+    monkeypatch.setattr(pipeline, "enumerate_artist",
+                        lambda url, cookiefile=None, limit=0, source=None: (pipeline._UNKNOWN_ARTIST,
+                                                               [{"title": "A", "url": "uA"}]))
+    run_artist_download(job_id="jb", url="u", genre="Rap",
+                        destination=Destination(type="browser"), reporter=Reporter())
+    assert [c["own_artist"] for c in calls] == [None]
+
+
 def test_run_artist_download_raises_when_no_releases(monkeypatch, tmp_path):
     import app.pipeline as pipeline
     monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
     monkeypatch.setattr(pipeline, "enumerate_artist",
-                        lambda url, cookiefile=None, limit=0: ("Artist", []))
-    with pytest.raises(RuntimeError):
+                        lambda url, cookiefile=None, limit=0, source=None: ("Artist", []))
+    # The message must explain WHY (no album releases), not just "not an artist page".
+    with pytest.raises(RuntimeError, match="Album"):
         run_artist_download(job_id="j3", url="u", genre="Rap",
                             destination=Destination(type="browser"), reporter=Reporter())
+
+
+def test_run_artist_download_stages_albums_in_parallel(monkeypatch, tmp_path):
+    # With album_concurrency > 1 the releases stage concurrently (not strictly one-after-another),
+    # results are still fully aggregated, and album progress counts completions up to N — even
+    # though releases finish out of order.
+    import threading
+    import time
+
+    import app.pipeline as pipeline
+    monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
+    monkeypatch.setattr(pipeline, "enumerate_artist",
+                        lambda url, cookiefile=None, limit=0, source=None: ("Artist", [
+                            {"title": "A", "url": "uA"},
+                            {"title": "B", "url": "uB"},
+                            {"title": "C", "url": "uC"}]))
+    lock = threading.Lock()
+    live = {"now": 0, "max": 0}
+
+    def fake_run_download(**kw):
+        with lock:
+            live["now"] += 1
+            live["max"] = max(live["max"], live["now"])
+        time.sleep(0.05)                                   # hold the slot so overlap is observable
+        with lock:
+            live["now"] -= 1
+        d = kw["stage_dir"] / "Artist" / kw["album_name"]
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "t.mp3").write_bytes(b"x")
+        return Result(delivered=[("Artist", kw["album_name"], f"Artist/{kw['album_name']}/t.mp3")],
+                      new_track_count=1)
+
+    monkeypatch.setattr(pipeline, "run_download", fake_run_download)
+    monkeypatch.setattr(pipeline, "_upload_tree", lambda dest, root: None)
+    albums = []
+    reporter = Reporter(on_album=lambda c, t, n: albums.append((c, t, n)))
+
+    res = run_artist_download(job_id="jp", url="u", genre="Rap",
+                              destination=Destination(type="webdav"), reporter=reporter,
+                              album_concurrency=3)
+
+    assert live["max"] >= 2                                # at least two releases downloaded at once
+    assert res.new_track_count == 3 and len(res.delivered) == 3
+    assert albums[0] == (0, 3, "")                         # total published before fan-out
+    assert (albums[-1][0], albums[-1][1]) == (3, 3)        # progress reached all-done
+    assert {n for _, _, n in albums if n} == {"A", "B", "C"}
+
+
+# --- Throttle hardening: retry + partial-delivery surfacing --------------------
+
+def test_download_with_retries_recovers_missing_tracks(monkeypatch, tmp_path):
+    # A multi-track run re-runs until every EXPECTED track has finished, waiting `backoff`
+    # between passes, and cleans up its per-job download-archive. Simulates a throttle that
+    # lets one more track through on each pass.
+    import app.pipeline as pipeline
+    monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
+    (tmp_path / ".work").mkdir()
+    monkeypatch.setattr(pipeline.settings, "download_retry_passes", 3)
+    monkeypatch.setattr(pipeline.settings, "download_retry_backoff_seconds", 5)
+    monkeypatch.setattr(pipeline.settings, "download_sleep_requests_seconds", 0)
+    sleeps: list = []
+    monkeypatch.setattr(pipeline.time, "sleep", lambda s: sleeps.append(s))
+
+    expected = {"a", "b", "c"}
+    finished: set[str] = set()
+
+    class _FakeYDL:
+        def __init__(self, opts): self.opts = opts
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def download(self, urls):
+            finished.add(sorted(expected - finished)[0])   # one more track completes each pass
+    monkeypatch.setattr(pipeline.yt_dlp, "YoutubeDL", _FakeYDL)
+
+    opts: dict = {}
+    pipeline._download_with_retries(opts, "u", is_multi=True, job_id="jx",
+                                    expected_ids=expected, finished_ids=finished)
+
+    assert finished == expected                            # all three recovered
+    assert sleeps == [5, 5]                                # waited before the 2 needed retries
+    assert opts["download_archive"].endswith("jx.archive")
+    assert not (tmp_path / ".work" / "jx.archive").exists()  # cleaned up
+
+
+def test_download_with_retries_single_is_one_shot(monkeypatch, tmp_path):
+    # A single-track run keeps the original one-shot behaviour: no archive, no retry loop.
+    import app.pipeline as pipeline
+    monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
+    calls = {"n": 0}
+
+    class _FakeYDL:
+        def __init__(self, opts): self.opts = opts
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def download(self, urls): calls["n"] += 1
+    monkeypatch.setattr(pipeline.yt_dlp, "YoutubeDL", _FakeYDL)
+
+    opts: dict = {}
+    pipeline._download_with_retries(opts, "u", is_multi=False, job_id="j",
+                                    expected_ids=set(), finished_ids=set())
+    assert calls["n"] == 1
+    assert "download_archive" not in opts                  # single track → no archive/retry
+
+
+def test_run_download_reports_partial_when_a_track_fails(monkeypatch, tmp_path):
+    # An album where yt-dlp silently drops a throttled track (ignoreerrors='only_download')
+    # must come back with expected_count/failed_count set, so the worker can surface it
+    # instead of the album looking like a clean success.
+    from pathlib import Path
+    import app.pipeline as pipeline
+    monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
+    monkeypatch.setattr(pipeline, "_probe_meta", lambda *a, **k: ("HeXer", "Singlegrind"))
+    monkeypatch.setattr(pipeline, "_fetch_cover", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline.fix_music_tags, "process_directory", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "_zip_dir", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline.settings, "download_retry_passes", 0)  # deterministic: no retry
+
+    class _FakeYDL:
+        validate_outtmpl = staticmethod(pipeline.yt_dlp.YoutubeDL.validate_outtmpl)
+
+        def __init__(self, opts): self.opts = opts
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+        def download(self, urls):
+            outtmpl = self.opts["outtmpl"]
+            tmpl = outtmpl["default"] if isinstance(outtmpl, dict) else outtmpl
+            out_dir = Path(tmpl).parent
+            out_dir.mkdir(parents=True, exist_ok=True)
+            mf = self.opts.get("match_filter")
+            hooks = self.opts.get("progress_hooks", [])
+            for i, vid in enumerate(("v1", "v2", "v3")):
+                info = {"id": vid, "title": f"T{i}", "artist": "HeXer"}
+                if mf:
+                    mf(info, incomplete=False)             # entry passes the filter → EXPECTED
+                if vid != "v3":                            # v3 is the throttled/skipped track
+                    f = out_dir / f"{vid}.mp3"
+                    f.write_bytes(b"x")
+                    for h in hooks:
+                        h({"status": "finished", "filename": str(f), "info_dict": info})
+    monkeypatch.setattr(pipeline.yt_dlp, "YoutubeDL", _FakeYDL)
+
+    res = pipeline.run_download(job_id="jp", url="uAlb", genre="Rap", mode="album",
+                                destination=Destination(type="browser"), reporter=Reporter())
+
+    assert res.expected_count == 3
+    assert res.failed_count == 1                           # v3 never finished → surfaced

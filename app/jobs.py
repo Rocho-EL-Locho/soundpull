@@ -17,9 +17,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
-from app import library_index, pipeline
+from app import library_index, notifications, pipeline
 from app.config import settings
 from app.db import session_scope
 from app.fix_music_tags import TAG_OPTION_FIELDS, TagOptions
@@ -55,6 +56,29 @@ def _clean_error(exc: object) -> str:
     return _ANSI_RE.sub("", str(exc)).strip()
 
 
+# Non-fatal warnings surfaced on a completed job when the server-index write failed (#38).
+# These are i18n KEYS, not text — the worker runs off the request thread where `t()` can't
+# resolve the active language, so the page resolves them via `t()` at render time. `t()`
+# returns an unknown string unchanged, so storing a key stays backward-safe.
+_INDEX_WARNING_KEY = "jobs.index_update_failed"  # delivery OK, but the index wasn't updated
+_SEED_FAILED_KEY = "jobs.seed_failed"            # mark_existing seed couldn't be persisted
+_PARTIAL_KEY = "jobs.partial_delivery"           # some tracks failed (throttle/403) → partial
+
+
+def _delivery_warning(result, index_ok: bool = True) -> tuple[str | None, int, int]:
+    """Pick the job's non-fatal warning from a delivery Result: (key, total, failed).
+
+    A partial delivery (tracks silently dropped by YouTube throttling/403, or files the
+    WebDAV server rejected) is the most important thing to surface — it makes an album that
+    reports "done" but is missing tracks visible instead of a silent success. It outranks the
+    stale-index note (#38). `total`/`failed` are carried so the page can render "N von M"."""
+    failed = result.failed_count + result.upload_failed_count
+    if failed > 0:
+        total = result.expected_count or (result.new_track_count + failed)
+        return _PARTIAL_KEY, total, failed
+    return (None if index_ok else _INDEX_WARNING_KEY), 0, 0
+
+
 @dataclass
 class JobState:
     id: str
@@ -71,10 +95,13 @@ class JobState:
     album: str | None = None
     current_track: int = 0
     total_tracks: int = 0
+    failed_tracks: int = 0   # tracks/files that failed (throttle/403/upload) → partial delivery
     # Album-level progress for an artist run (issue #32); 0 for other modes.
     current_album: int = 0
     total_albums: int = 0
     error: str | None = None
+    warning: str | None = None   # non-fatal note on a done job (e.g. index update failed, #38)
+    log_lines: list[str] = field(default_factory=list)  # event timeline (issue #44)
     created_at: datetime = field(default_factory=_utcnow)
     finished_at: datetime | None = None
     result_path: str | None = None   # ZIP path for browser destination
@@ -101,31 +128,98 @@ def _persist(job_id: str, **fields) -> None:
         session.add(row)
 
 
-def _record_delivered_safe(job_id: str, user_id: int, delivered: list) -> None:
-    """Record delivered tracks into the server index, isolated as a side effect.
+def _log_event(js: JobState, message: str) -> None:
+    """Append a timestamped line to the job's event timeline and persist it (issue #44).
 
-    Indexing must never fail an already-completed download/sync — a unique-constraint
-    race (two concurrent deliveries of the same track) or a locked DB is logged and
-    swallowed rather than propagated (issue #21).
+    Best-effort: the timeline is a non-essential diagnostic, so a failed write is logged and
+    swallowed — it must never fail or flip a job (mirroring the notification/cover/lyrics side
+    effects; a raise here inside a terminal block would otherwise turn a delivered job into an
+    "error", skip its notification, or orphan a queued job). `_lock` guards the append + join
+    because an artist run forwards `on_meta` from several parallel album threads, so `log_lines`
+    can be touched concurrently; the DB write happens outside the lock. The joined text lands in
+    `DownloadHistory.log` for the detail dialog, surviving after the JobState is pruned.
     """
     try:
-        with session_scope() as session:
-            library_index.record_tracks(session, user_id, delivered)
-    except Exception:  # noqa: BLE001 - best-effort; a completed upload stays successful
-        log.exception("server-index update failed for %s", job_id)
+        entry = f"[{_utcnow().strftime('%H:%M:%S')}] {message}"
+        with _lock:
+            js.log_lines.append(entry)
+            blob = "\n".join(js.log_lines)
+        _persist(js.id, log=blob)
+    except Exception:  # noqa: BLE001 - a diagnostic log must never affect the job
+        log.exception("log-event persist failed for %s", js.id)
+
+
+def _record_delivered_safe(job_id: str, user_id: int, delivered: list) -> bool:
+    """Record delivered tracks into the server index, isolated as a side effect.
+
+    Indexing must never *fail* an already-completed download/sync — a locked DB or a
+    unique-constraint race is logged and swallowed rather than propagated (issue #21).
+    Returns ``True`` when the index reflects the tracks, ``False`` when the write genuinely
+    failed — the caller keeps the job ``done`` but surfaces a warning so the stale-index
+    risk is visible (issue #38).
+
+    A `UniqueConstraint` race (a concurrent delivery inserted an overlapping
+    ``(user, artist, title)`` key, rolling back our whole batch) is **benign**: we retry
+    once, and on the retry `record_tracks` sees the now-committed rows, skips them, and
+    still inserts our genuinely-new ones. So a benign race resolves to ``True`` (no false
+    warning) instead of dropping the rest of the batch — only a persistent conflict warns.
+    """
+    for attempt in (1, 2):
+        try:
+            with session_scope() as session:
+                library_index.record_tracks(session, user_id, delivered)
+            return True
+        except IntegrityError:
+            if attempt == 1:
+                continue  # a concurrent insert won the race → re-record the remainder
+            log.exception("server-index update kept conflicting for %s", job_id)
+            return False
+        except Exception:  # noqa: BLE001 - best-effort; a completed upload stays successful
+            log.exception("server-index update failed for %s", job_id)
+            return False
+    return False  # unreachable (the loop always returns), kept for a total function
+
+
+def _notify_safe(user_id: int, dispatch) -> None:
+    """Fire a notification for a background event (issue #42). Best-effort, off-thread.
+
+    Loads the user's current notification config fresh from the DB, then hands it to
+    `dispatch(cfg)` (a small closure that calls a `notifications.notify_*` function). Runs
+    on its OWN daemon thread — never the download pool — so a slow/unreachable channel can't
+    delay the job or hold a worker; any error (config load, decrypt, network) is swallowed.
+    """
+    def _run() -> None:
+        try:
+            with session_scope() as session:
+                us = session.exec(
+                    select(UserSettings).where(UserSettings.user_id == user_id)).first()
+                cfg = notifications.NotifyConfig.from_settings(us) if us else None
+            if cfg is not None:
+                dispatch(cfg)
+        except Exception:  # noqa: BLE001 - a notification must never affect the job
+            log.exception("notification dispatch failed for user %s", user_id)
+
+    threading.Thread(target=_run, name="notify", daemon=True).start()
 
 
 def _make_reporter(job_id: str, js: JobState) -> Reporter:
     """Wire pipeline callbacks to live JobState + durable DB row (shared by run/sync)."""
     def on_phase(phase: str) -> None:
+        # on_phase fires on EVERY yt-dlp progress tick (pipeline progress_hook), so persist and
+        # log only on an actual transition — otherwise the timeline floods with thousands of
+        # identical "download" lines and the row is rewritten per tick (issue #44).
         with _lock:
+            changed = js.phase != phase
             js.phase = phase
-        _persist(job_id, phase=phase)
+        if changed:
+            _persist(job_id, phase=phase)
+            _log_event(js, phase)
 
     def on_meta(artist: str, album: str) -> None:
         with _lock:
             js.artist, js.album = artist, album
         _persist(job_id, artist=artist, album=album)
+        _log_event(js, f"{artist or '?'} — {album or '?'}")
 
     def on_track(cur: int, tot: int) -> None:
         with _lock:
@@ -141,9 +235,16 @@ def _make_artist_reporter(job_id: str, js: JobState) -> Reporter:
     base = _make_reporter(job_id, js)
 
     def on_album(current: int, total: int, name: str) -> None:
+        # `name` is "" only for the initial total-publish before fan-out; don't blank the album
+        # label (or hit the DB) for it. With a concurrent album pool `current` is a completion
+        # count, so the bar stays monotonic even though releases finish out of order.
         with _lock:
-            js.current_album, js.total_albums, js.album = current, total, name
-        _persist(job_id, album=name)
+            js.current_album, js.total_albums = current, total
+            if name:
+                js.album = name
+        if name:
+            _persist(job_id, album=name)
+            _log_event(js, f"album {current}/{total}: {name}")
 
     return Reporter(on_phase=base.on_phase, on_meta=base.on_meta,
                     on_track=base.on_track, on_album=on_album)
@@ -151,46 +252,63 @@ def _make_artist_reporter(job_id: str, js: JobState) -> Reporter:
 
 def _run_artist(job_id: str, url: str, genre: str, destination: Destination,
                 audio_format: str, tag_options: TagOptions, cookies_txt: str | None,
-                dedup: bool = False) -> None:
+                dedup: bool = True, fetch_lyrics: bool = False) -> None:
     js = _registry[job_id]
     reporter = _make_artist_reporter(job_id, js)
 
     try:
-        # Dedup (issue #31): skip tracks already in the user's library so an artist re-run is
-        # cheap. WebDAV-only — a browser ZIP has no library to dedup against. `existing_ref` is
-        # playlist-only (m3u cross-refs), so it is unused here (albums write no m3u).
+        # Artist runs default to reconciling against the server on WebDAV (auto-dedup, issue
+        # #31): a re-download of a big discography then only pulls tracks not already in the
+        # library, instead of re-processing all N releases. The per-download `dedup` toggle can
+        # turn this off to force a full re-download. A browser ZIP has no library to dedup
+        # against, so it stays a plain full download regardless. `existing_ref` is playlist-only
+        # (m3u cross-refs), so it is unused here (albums write no m3u).
         on_server = None
         if dedup and destination.type == "webdav":
             with session_scope() as session:
                 paths = library_index.load_index_paths(session, js.user_id)
             on_server = lambda a, t: library_index.track_key(t, a) in paths  # noqa: E731
 
+        # Cap the parallel album pool to a sane 1–4 regardless of how the env var is set.
+        album_concurrency = max(1, min(4, settings.max_artist_album_concurrency))
         result = run_artist_download(job_id=job_id, url=url, genre=genre,
                                      destination=destination, reporter=reporter,
                                      audio_format=audio_format, tag_options=tag_options,
                                      cookies_txt=cookies_txt, on_server=on_server,
-                                     max_items=settings.max_artist_items)
+                                     max_items=settings.max_artist_items,
+                                     album_concurrency=album_concurrency,
+                                     fetch_lyrics=fetch_lyrics)
+        indexed = True
         if destination.type == "webdav" and result.delivered:
-            _record_delivered_safe(job_id, js.user_id, result.delivered)
+            indexed = _record_delivered_safe(job_id, js.user_id, result.delivered)
+        warning, total, failed = _delivery_warning(result, indexed)
         with _lock:
             js.phase, js.finished_at = "done", _utcnow()
             js.result_path = result.zip_path
             js.result_name = result.zip_name
             js.summary = result.summary
-        _persist(job_id, phase="done", finished_at=js.finished_at,
-                 artist=js.artist, album=js.album,
+            js.warning = warning
+            js.failed_tracks = failed
+            if total:
+                js.total_tracks = total
+        _persist(job_id, phase="done", finished_at=js.finished_at, warning=warning,
+                 artist=js.artist, album=js.album, failed_tracks=failed,
                  current_track=js.current_track, total_tracks=js.total_tracks)
+        _log_event(js, f"done, {failed}/{total} missing" if failed else "done")
     except Exception as exc:  # noqa: BLE001 - surface any failure to the user
         log.exception("artist download %s failed", job_id)
         err = _clean_error(exc)
         with _lock:
             js.phase, js.error, js.finished_at = "error", err, _utcnow()
         _persist(job_id, phase="error", error=err, finished_at=js.finished_at)
+        _log_event(js, f"error: {err}")
+        _notify_safe(js.user_id, lambda c: notifications.notify_error(
+            c, kind="download", url=url, error=err))
 
 
 def _run(job_id: str, url: str, genre: str, mode: str, destination: Destination,
          audio_format: str, tag_options: TagOptions, cookies_txt: str | None,
-         dedup: bool = False) -> None:
+         dedup: bool = False, fetch_lyrics: bool = False) -> None:
     js = _registry[job_id]
     reporter = _make_reporter(job_id, js)
 
@@ -209,38 +327,50 @@ def _run(job_id: str, url: str, genre: str, mode: str, destination: Destination,
                               destination=destination, reporter=reporter,
                               audio_format=audio_format, tag_options=tag_options,
                               cookies_txt=cookies_txt, on_server=on_server,
-                              existing_ref=existing_ref)
+                              existing_ref=existing_ref, fetch_lyrics=fetch_lyrics)
         # A WebDAV upload actually puts tracks "on the server" → index them so a later
         # playlist sync recognises them (issue #21). Browser ZIPs are not on the server.
         # Best-effort: a failed index write (e.g. a unique-constraint race between two
         # concurrent downloads) must NOT flip a completed upload to "error".
+        indexed = True
         if destination.type == "webdav" and result.delivered:
-            _record_delivered_safe(job_id, js.user_id, result.delivered)
+            indexed = _record_delivered_safe(job_id, js.user_id, result.delivered)
+        warning, total, failed = _delivery_warning(result, indexed)
         with _lock:
             js.phase, js.finished_at = "done", _utcnow()
             js.result_path = result.zip_path
             js.result_name = result.zip_name
             js.summary = result.summary
-        _persist(job_id, phase="done", finished_at=js.finished_at,
-                 artist=js.artist, album=js.album,
+            js.warning = warning
+            js.failed_tracks = failed
+            if total:
+                js.total_tracks = total
+        _persist(job_id, phase="done", finished_at=js.finished_at, warning=warning,
+                 artist=js.artist, album=js.album, failed_tracks=failed,
                  current_track=js.current_track, total_tracks=js.total_tracks)
+        _log_event(js, f"done, {failed}/{total} missing" if failed else "done")
     except Exception as exc:  # noqa: BLE001 - surface any failure to the user
         log.exception("download %s failed", job_id)
         err = _clean_error(exc)
         with _lock:
             js.phase, js.error, js.finished_at = "error", err, _utcnow()
         _persist(job_id, phase="error", error=err, finished_at=js.finished_at)
+        _log_event(js, f"error: {err}")
+        _notify_safe(js.user_id, lambda c: notifications.notify_error(
+            c, kind="download", url=url, error=err))
 
 
 def start_job(*, user_id: int, url: str, genre: str, mode: str, destination_type: str,
               audio_format: str = DEFAULT_AUDIO_FORMAT,
-              tag_options: TagOptions | None = None, dedup: bool = False) -> str:
+              tag_options: TagOptions | None = None, dedup: bool = False,
+              fetch_lyrics: bool = False) -> str:
     """Queue a download for a user. Returns the job id. Raises on bad config.
 
     `tag_options` is the per-download field selection; when omitted it falls back
     to the user's saved defaults (issue #7). `dedup` skips tracks already in the
     user's library and references them in a playlist m3u (issue #31); it only takes
-    effect for the WebDAV destination.
+    effect for the WebDAV destination. `fetch_lyrics` writes a best-effort `.lrc`
+    synced-lyrics sidecar next to each track (issue #43); applies to both destinations.
     """
     job_id = uuid.uuid4().hex
     audio_format = normalize_audio_format(audio_format)
@@ -273,13 +403,16 @@ def start_job(*, user_id: int, url: str, genre: str, mode: str, destination_type
                   tag_options=tag_options)
     with _lock:
         _registry[job_id] = js
+    _log_event(js, "queued")
     if mode == "artist":
-        # An artist run (issue #32) fans out into N album downloads under one job.
+        # An artist run (issue #32) fans out into N album downloads under one job. It defaults
+        # to auto-dedup on WebDAV (skip tracks already in the library) but honours the
+        # per-download `dedup` toggle, so the user can force a full re-download.
         _executor.submit(_run_artist, job_id, url, genre, destination, audio_format,
-                         tag_options, cookies_txt, dedup)
+                         tag_options, cookies_txt, dedup, fetch_lyrics)
     else:
         _executor.submit(_run, job_id, url, genre, mode, destination, audio_format,
-                         tag_options, cookies_txt, dedup)
+                         tag_options, cookies_txt, dedup, fetch_lyrics)
     return job_id
 
 
@@ -315,6 +448,7 @@ class _SyncConfig:
     initial_mode: str
     first_run: bool
     existing_tracks: list
+    fetch_lyrics: bool = False
 
 
 def start_sync(subscription_id: int) -> str | None:
@@ -351,6 +485,7 @@ def start_sync(subscription_id: int) -> str | None:
             initial_mode=sub.initial_mode,
             first_run=sub.last_synced_at is None,
             existing_tracks=json.loads(sub.playlist_files) if sub.playlist_files else [],
+            fetch_lyrics=bool(us.fetch_synced_lyrics),
         )
         session.add(sub)
 
@@ -365,6 +500,7 @@ def start_sync(subscription_id: int) -> str | None:
                   tag_options=cfg.tag_options, subscription_id=subscription_id)
     with _lock:
         _registry[job_id] = js
+    _log_event(js, "queued")
     _executor.submit(_run_sync, job_id, cfg)
     return job_id
 
@@ -393,6 +529,8 @@ def _run_sync(job_id: str, cfg: _SyncConfig) -> None:
     js = _registry[job_id]
     reporter = _make_reporter(job_id, js)
     try:
+        warning, total, failed = None, 0, 0  # set below: index-fail (#38) or partial delivery
+        new_count, playlist_label = 0, ""    # for the "new tracks" notification (issue #42)
         # "mark existing" first run: seed the index from the current playlist and
         # download nothing, so only FUTURE additions are ever fetched (issue #21).
         if cfg.first_run and cfg.initial_mode == "mark_existing":
@@ -400,17 +538,27 @@ def _run_sync(job_id: str, cfg: _SyncConfig) -> None:
             cookie_path = pipeline._write_cookie_file(job_id, cfg.cookies_txt)
             try:
                 cookiefile = str(cookie_path) if cookie_path else None
-                pl_title, _uploader, _count = pipeline._probe_playlist(cfg.url, cookiefile=cookiefile)
+                pl_title, _uploader, _count, _pl_id = pipeline._probe_playlist(
+                    cfg.url, cookiefile=cookiefile)
                 reporter.on_meta(_uploader, pl_title)
                 pairs = pipeline.enumerate_playlist_tracks(
                     cfg.url, cookiefile=cookiefile, limit=settings.max_playlist_items)
             finally:
                 if cookie_path:
                     cookie_path.unlink(missing_ok=True)
-            _record_delivered_safe(job_id, cfg.user_id, pairs)  # best-effort seed
+            seeded = _record_delivered_safe(job_id, cfg.user_id, pairs)
             with session_scope() as session:
-                _sub_result(session, cfg.subscription_id, status="ok", new_count=0,
-                            name=pl_title or None)
+                if seeded:
+                    _sub_result(session, cfg.subscription_id, status="ok", new_count=0,
+                                name=pl_title or None)
+                else:
+                    # The seed WRITE failed → the index is NOT populated. Do not mark the
+                    # subscription synced: that would leave first_run False, so the next sync
+                    # treats the whole playlist as new and re-downloads ALL of it. Record an
+                    # error instead (last_synced_at stays None → it re-seeds next interval) (#38).
+                    warning = _SEED_FAILED_KEY
+                    _sub_result(session, cfg.subscription_id, status="error",
+                                error=_SEED_FAILED_KEY, name=pl_title or None)
             summary = f"{len(pairs)} Titel als vorhanden markiert"
         else:
             # One loaded index snapshot serves both the skip decision and, for a track
@@ -430,10 +578,15 @@ def _run_sync(job_id: str, cfg: _SyncConfig) -> None:
                 destination=cfg.destination, reporter=reporter,
                 audio_format=cfg.audio_format, tag_options=cfg.tag_options,
                 cookies_txt=cfg.cookies_txt, on_server=on_server, existing_ref=existing_ref,
-                existing_tracks=cfg.existing_tracks,
+                existing_tracks=cfg.existing_tracks, fetch_lyrics=cfg.fetch_lyrics,
             )
-            if result.delivered:  # best-effort; must not roll back the status write below
-                _record_delivered_safe(job_id, cfg.user_id, result.delivered)
+            index_ok = True
+            if result.delivered:
+                # Delivery succeeded and the manifest is saved below, so the sync stays "ok";
+                # a stale ServerTrack index just means those tracks re-download next sync.
+                # Surface it on the job (durable in the history), not on the subscription (#38).
+                index_ok = _record_delivered_safe(job_id, cfg.user_id, result.delivered)
+            warning, total, failed = _delivery_warning(result, index_ok)
             with session_scope() as session:
                 # Persist whenever we have a manifest (new downloads OR new references), so
                 # the complete rebuilt playlist — including cross-folder refs — is kept (#31).
@@ -442,20 +595,33 @@ def _run_sync(job_id: str, cfg: _SyncConfig) -> None:
                             playlist_files=result.playlist_files or None,
                             name=result.playlist_name or None)
             summary = result.summary
+            new_count = result.new_track_count
+            playlist_label = result.playlist_name or js.album or ""
 
         with _lock:
             js.phase, js.finished_at, js.summary = "done", _utcnow(), summary
-        _persist(job_id, phase="done", finished_at=js.finished_at,
-                 artist=js.artist, album=js.album,
+            js.warning = warning
+            js.failed_tracks = failed
+            if total:
+                js.total_tracks = total
+        _persist(job_id, phase="done", finished_at=js.finished_at, warning=warning,
+                 artist=js.artist, album=js.album, failed_tracks=failed,
                  current_track=js.current_track, total_tracks=js.total_tracks)
+        _log_event(js, f"done, {failed}/{total} missing" if failed else "done")
+        if new_count > 0:
+            _notify_safe(cfg.user_id, lambda c: notifications.notify_new_tracks(
+                c, playlist=playlist_label, count=new_count))
     except Exception as exc:  # noqa: BLE001 - surface any failure to the user
         log.exception("sync %s failed", job_id)
         err = _clean_error(exc)
         with _lock:
             js.phase, js.error, js.finished_at = "error", err, _utcnow()
         _persist(job_id, phase="error", error=err, finished_at=js.finished_at)
+        _log_event(js, f"error: {err}")
         with session_scope() as session:
             _sub_result(session, cfg.subscription_id, status="error", error=err)
+        _notify_safe(cfg.user_id, lambda c: notifications.notify_error(
+            c, kind="sync", url=cfg.url, error=err))
 
 
 def _prune_locked() -> None:

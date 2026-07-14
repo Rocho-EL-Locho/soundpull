@@ -58,6 +58,30 @@ def test_reconcile_adds_missing_columns(tmp_path):
     assert webdav is None            # nullable, no default
 
 
+def test_reconcile_adds_notification_columns(tmp_path):
+    # Issue #42: the notify_* columns must self-heal onto an old DB, with scalar defaults
+    # backfilled (bool toggles → False, port → 587, security → "starttls").
+    engine = _old_db(tmp_path)
+
+    reconcile_columns(engine)
+
+    cols = {c["name"] for c in inspect(engine).get_columns("usersettings")}
+    assert {"notify_new_tracks", "notify_sync_error", "notify_download_error",
+            "notify_ntfy_url", "notify_ntfy_token_enc", "notify_webhook_url",
+            "notify_email_to", "notify_smtp_host", "notify_smtp_port", "notify_smtp_user",
+            "notify_smtp_password_enc", "notify_smtp_from", "notify_smtp_security"} <= cols
+
+    with engine.connect() as conn:
+        new_tracks, port, security, url = conn.execute(text(
+            "SELECT notify_new_tracks, notify_smtp_port, notify_smtp_security, "
+            "notify_ntfy_url FROM usersettings WHERE id = 1"
+        )).one()
+    assert new_tracks in (0, False)   # bool default False backfilled onto old row
+    assert port == 587                # scalar int default
+    assert security == "starttls"     # scalar str default
+    assert url is None                # nullable, no default
+
+
 def test_reconcile_is_idempotent(tmp_path):
     engine = _old_db(tmp_path)
     reconcile_columns(engine)

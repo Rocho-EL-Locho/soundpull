@@ -156,6 +156,22 @@ bot" check. To download those, store your own YouTube cookie in **Settings → Y
 The cookie is [Fernet-encrypted](SECURITY.md) at rest (requires `FERNET_KEY`), is never shown
 back to you, and is used only for your own downloads. Toggle **Remove stored cookie** to delete it.
 
+> [!NOTE]
+> **Explicit / age-restricted tracks download fine** as long as a valid cookie (from an
+> age-verified account) is stored and the PO-token provider (`bgutil-provider`,
+> `POT_PROVIDER_BASE_URL`) is reachable — the `mweb` client + token serves full-quality audio
+> (format 251). YouTube's *GVS PO token* enforcement is handled automatically: public tracks use
+> the token-free `android_vr` client (no cookie), age-restricted ones use `mweb` + the provider.
+>
+> **Partial albums under heavy use.** A back-to-back marathon of big downloads (e.g. pulling
+> several full discographies in a row) can get your server's IP *temporarily throttled* by
+> YouTube. yt-dlp then silently skips the throttled tracks, so an album can come out with only
+> some of its tracks. Soundpull now **surfaces this** (the job shows *"N von M — bitte erneut
+> herunterladen"* instead of a silent success) and **auto-retries** the missing tracks with a
+> cooldown. If it still comes out partial, just re-download it (the throttle clears within
+> minutes) or space big runs out; `DOWNLOAD_SLEEP_REQUESTS_SECONDS` paces requests to avoid
+> tripping the throttle in the first place. See the download-resilience knobs in `.env.example`.
+
 ## Tech stack
 
 NiceGUI (FastAPI) · Authlib (OIDC) · SQLModel + SQLite · yt-dlp · mutagen · webdav4 ·

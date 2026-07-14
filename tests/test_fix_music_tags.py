@@ -42,6 +42,31 @@ def test_plain_single_artist_unchanged():
     assert parse_featured_artists("Song", "A") == ("Song", "A", "A")
 
 
+# A feat./ft./featuring marker inside the ARTIST tag (not the title) is normalised to
+# " / " too — deliberate deviation from the frozen original, which left it verbatim.
+def test_feat_in_artist_tag_is_normalized():
+    assert parse_featured_artists("Song", "A feat. B") == ("Song", "A / B", "A")
+    assert parse_featured_artists("Song", "A ft. B") == ("Song", "A / B", "A")
+    assert parse_featured_artists("Song", "A featuring B") == ("Song", "A / B", "A")
+    # '&'/','/'und' inside the feature part are split, so "A ft. B & C" → "A / B / C".
+    assert parse_featured_artists("Song", "A ft. B & C") == ("Song", "A / B / C", "A")
+
+
+def test_feat_in_both_title_and_artist_tag_dedupes():
+    # Was buggy: the primary retained the "feat. B" marker → "A feat. B / B". Now clean.
+    assert parse_featured_artists("Song (feat. B)", "A feat. B") == ("Song", "A / B", "A")
+
+
+def test_collab_separators_in_artist_tag_are_kept():
+    # '&'/' x '/' und ' are NOT split — they also occur in real band names.
+    assert parse_featured_artists("Song", "A & B") == ("Song", "A & B", "A & B")
+    assert parse_featured_artists("Song", "A x B") == ("Song", "A x B", "A x B")
+    assert parse_featured_artists("Song", "A und B") == ("Song", "A und B", "A und B")
+    # A band name with '&' in the PRIMARY part survives a feat. on the same tag.
+    assert parse_featured_artists("Song", "Simon & Garfunkel feat. B") \
+        == ("Song", "Simon & Garfunkel / B", "Simon & Garfunkel")
+
+
 # _normalized_tags is the shared path the M4A and Opus/OGG adapters route through,
 # so the "original codec" download gets the exact same feat/album-artist rules.
 def test_normalized_tags_applies_feat_rules_with_explicit_album_artist():

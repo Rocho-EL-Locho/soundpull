@@ -62,10 +62,34 @@ class UserSettings(SQLModel, table=True):
     # WebDAV-only (a browser ZIP has no persistent library); default off (opt-in).
     dedup_skip_existing: bool = False
 
+    # Synced lyrics (issue #43): fetch `.lrc` synced lyrics per track from LRCLIB and
+    # write them as sidecar files (applies to ZIP and WebDAV); default off (opt-in).
+    fetch_synced_lyrics: bool = False
+
     # Per-user YouTube cookie (issue #9), a Netscape cookies.txt fed to yt-dlp so
     # age-gated / bot-checked / throttled tracks download. Fernet-encrypted; never
     # exposed in plaintext to the client.
     youtube_cookies_enc: str | None = None
+
+    # Notifications (issue #42): per-user push/webhook/e-mail alerts for background
+    # events. All opt-in (default off), fanned out to whatever channels are configured.
+    # Event toggles — chosen independently so the user controls exactly which events fire.
+    notify_new_tracks: bool = False       # an interval-sync found new tracks
+    notify_sync_error: bool = False       # a background interval-sync failed
+    notify_download_error: bool = False   # a manual/artist download failed
+    # ntfy push (simple HTTP POST to a topic URL; no SMTP needed).
+    notify_ntfy_url: str | None = None            # e.g. https://ntfy.sh/my-topic
+    notify_ntfy_token_enc: str | None = None      # optional Bearer token; Fernet-encrypted
+    # Generic webhook (JSON POST) — keeps integrations flexible.
+    notify_webhook_url: str | None = None
+    # E-mail via SMTP (stdlib smtplib; no extra dependency).
+    notify_email_to: str | None = None
+    notify_smtp_host: str | None = None
+    notify_smtp_port: int = 587
+    notify_smtp_user: str | None = None
+    notify_smtp_password_enc: str | None = None   # Fernet-encrypted
+    notify_smtp_from: str | None = None
+    notify_smtp_security: str = "starttls"        # "starttls" | "ssl" | "none"
 
     updated_at: datetime = Field(default_factory=_utcnow)
 
@@ -78,6 +102,14 @@ class UserSettings(SQLModel, table=True):
     @property
     def has_youtube_cookies(self) -> bool:
         return bool(self.youtube_cookies_enc)
+
+    @property
+    def has_ntfy_token(self) -> bool:
+        return bool(self.notify_ntfy_token_enc)
+
+    @property
+    def has_smtp_password(self) -> bool:
+        return bool(self.notify_smtp_password_enc)
 
 
 class DownloadHistory(SQLModel, table=True):
@@ -96,7 +128,20 @@ class DownloadHistory(SQLModel, table=True):
     phase: str = "queued"  # queued | metadata | download | tags | upload | done | error
     current_track: int = 0
     total_tracks: int = 0
+    # Tracks that never completed after retries (throttle/403) + files the WebDAV server
+    # rejected — the size of a silent partial delivery. 0 on a clean run; a non-zero value
+    # pairs with the `jobs.partial_delivery` warning so the history shows "N von M" (#…).
+    failed_tracks: int = 0
     error: str | None = None
+    # Non-fatal note on a completed job (issue #38): e.g. the WebDAV upload succeeded but the
+    # server-index update failed, so those tracks may be re-downloaded on the next sync. The
+    # job still ends `done` (files are delivered); this just surfaces the risk in the history.
+    warning: str | None = None
+    # Human-readable event timeline of the job (issue #44): one line per phase/event
+    # (queued → metadata → … → done/error), filled by the worker via `jobs._log_event`.
+    # A technical trace like `error` — deliberately neutral/untranslated (the worker runs
+    # off the request thread, so it has no session language). Shown in the detail dialog.
+    log: str | None = None
 
     created_at: datetime = Field(default_factory=_utcnow, index=True)
     finished_at: datetime | None = None

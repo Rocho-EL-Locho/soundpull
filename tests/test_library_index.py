@@ -5,11 +5,16 @@ match-filter time) equals the key computed from the FINAL tags (when recording a
 delivered track) — otherwise a synced track would never be recognised as "on the
 server" and would re-download every run.
 """
+from contextlib import contextmanager
+
 import app.models  # noqa: F401 — registers tables on SQLModel.metadata
+import pytest
+from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
 from app import library_index
 from app.library_index import is_on_server, load_index, record_tracks, track_key
+from app.models import UserSettings
 
 
 def _mem_session() -> Session:
@@ -239,3 +244,161 @@ def test_walk_remote_files_skips_cache_and_hidden_subtrees():
     assert "__sized__" not in listed                    # cache subtree never listed
     assert "attachments" not in listed                  # attachments store never listed
     assert ".trash" not in listed                       # hidden subtree never listed
+
+
+def test_walk_remote_files_raises_when_root_unreadable():
+    # A failure listing the ROOT means the target is unreachable/misconfigured — it must
+    # PROPAGATE so scan_webdav fails loudly instead of returning a silent empty no-op that
+    # looks like a healthy but empty library (issue #38).
+    class DeadClient:
+        def ls(self, path, detail=True):
+            raise OSError("connection refused")
+
+    errors: list = []
+    with pytest.raises(OSError):
+        list(library_index._walk_remote_files(DeadClient(), "", 0, 8, errors))
+    assert errors == []  # a root failure is raised, not recorded-and-swallowed
+
+
+def _scan_env(monkeypatch, walk):
+    """Wire scan_webdav's collaborators to an in-memory DB + a fake walk (issue #38).
+
+    Returns the engine so a test can pre-seed / inspect index rows. `walk` replaces
+    `_walk_remote_files`; `make_client` is stubbed (the fake walk ignores the client) and a
+    single-connection in-memory engine backs `session_scope`.
+    """
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False},
+                           poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as s:
+        s.add(UserSettings(user_id=1, webdav_url="http://dav.example", webdav_folder=""))
+        s.commit()
+
+    @contextmanager
+    def fake_scope():
+        session = Session(engine)
+        try:
+            yield session
+            session.commit()
+        finally:
+            session.close()
+
+    monkeypatch.setattr("app.db.session_scope", fake_scope)
+    monkeypatch.setattr("app.webdav_util.make_client", lambda *a, **k: object())
+    monkeypatch.setattr(library_index, "_walk_remote_files", walk)
+    return engine
+
+
+def test_scan_webdav_reports_errors_and_skips_prune(monkeypatch):
+    # An incomplete walk (a sub-folder listing failed) must return the errors AND skip
+    # pruning, so a transient failure can't wipe still-present index rows (issue #38).
+    def walk(client, base, depth, max_depth, errors=None):
+        if errors is not None:
+            errors.append(("Artist/Bad", "boom"))
+        return iter(())
+
+    engine = _scan_env(monkeypatch, walk)
+    with Session(engine) as s:  # a stale row a *clean* scan would prune
+        record_tracks(s, 1, [("Ghost", "Gone", "Ghost/Album/Gone.mp3")])
+        s.commit()
+
+    added, pruned, errors = library_index.scan_webdav(1)
+
+    assert added == 0
+    assert pruned == 0                              # incomplete walk → never prunes
+    assert errors and errors[0][0] == "Artist/Bad"  # surfaced to the caller
+    with Session(engine) as s:
+        assert ("ghost", "gone") in library_index.load_index_paths(s, 1)  # row kept
+
+
+def test_scan_webdav_clean_walk_reports_no_errors(monkeypatch):
+    # A successful walk returns an empty errors list — distinct from the incomplete case so
+    # the UI can tell "nothing to skip" apart from "index unavailable" (issue #38).
+    def walk(client, base, depth, max_depth, errors=None):
+        yield "Artist/Album/Song.mp3"
+
+    library_index_engine = _scan_env(monkeypatch, walk)
+
+    added, pruned, errors = library_index.scan_webdav(1)
+
+    assert added == 1
+    assert errors == []
+    with Session(library_index_engine) as s:
+        assert ("artist", "song") in library_index.load_index_paths(s, 1)
+
+
+# --- Lyrics backfill (LRCGET-style, issue #43) --------------------------------
+
+def test_walk_audio_with_lrc_flags_existing_sidecars():
+    # Per audio file, report whether a sibling `.lrc` already exists (from the same
+    # listing); non-audio files are ignored and cache dirs are skipped.
+    tree = {
+        "": [{"name": "Artist", "type": "directory"},
+             {"name": "cache", "type": "directory"}],
+        "Artist": [{"name": "Artist/Album", "type": "directory"}],
+        "Artist/Album": [
+            {"name": "Artist/Album/01 - A.mp3", "type": "file"},
+            {"name": "Artist/Album/02 - B.mp3", "type": "file"},
+            {"name": "Artist/Album/02 - B.lrc", "type": "file"},
+            {"name": "Artist/Album/cover.jpg", "type": "file"},
+        ],
+        "cache": [{"name": "cache/x.mp3", "type": "file"}],
+    }
+
+    class Fake:
+        def ls(self, path, detail=True):
+            return tree.get(path, [])
+
+    out = dict(library_index._walk_audio_with_lrc(Fake(), "", 0, 8))
+    assert out == {"Artist/Album/01 - A.mp3": False,   # needs a sidecar
+                   "Artist/Album/02 - B.mp3": True}    # already has one; cover.jpg + cache/ ignored
+
+
+def test_backfill_lyrics_writes_missing_and_skips_existing(monkeypatch):
+    tree = {
+        "": [{"name": "Artist", "type": "directory"}],
+        "Artist": [{"name": "Artist/Album", "type": "directory"}],
+        "Artist/Album": [
+            {"name": "Artist/Album/01 - Have.mp3", "type": "file"},
+            {"name": "Artist/Album/01 - Have.lrc", "type": "file"},   # already covered
+            {"name": "Artist/Album/02 - Get.mp3", "type": "file"},    # LRCLIB has it
+            {"name": "Artist/Album/03 - None.mp3", "type": "file"},   # LRCLIB has nothing
+        ],
+    }
+    uploaded: dict[str, bytes] = {}
+
+    class FakeDav:
+        def ls(self, path, detail=True):
+            return tree.get(path, [])
+
+        def upload_fileobj(self, fileobj, to_path, overwrite=False, **kw):
+            uploaded[to_path] = fileobj.read()
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False},
+                           poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as s:
+        s.add(UserSettings(user_id=1, webdav_url="http://dav.example", webdav_folder=""))
+        s.commit()
+
+    @contextmanager
+    def fake_scope():
+        session = Session(engine)
+        try:
+            yield session
+            session.commit()
+        finally:
+            session.close()
+
+    monkeypatch.setattr("app.db.session_scope", fake_scope)
+    monkeypatch.setattr("app.webdav_util.make_client", lambda *a, **k: FakeDav())
+    monkeypatch.setattr("app.lyrics.fetch_synced_lyrics",
+                        lambda artist, title, album=None, duration=None:
+                        "[00:00.00]la" if title == "Get" else None)
+
+    written, skipped, missing, errors = library_index.backfill_lyrics(1)
+
+    assert (written, skipped, missing) == (1, 1, 1)   # Get written, Have skipped, None missing
+    assert errors == []
+    assert list(uploaded) == ["Artist/Album/02 - Get.lrc"]
+    assert uploaded["Artist/Album/02 - Get.lrc"].decode() == "[00:00.00]la"

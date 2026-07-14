@@ -6,13 +6,20 @@ services:
     container_name: soundpull
     restart: unless-stopped
     env_file: .env
+    environment:
+      # Reach the PO-token provider sidecar below (YouTube GVS 403 fix). Override
+      # or remove in .env if you run the provider elsewhere. See .env.example.
+      - POT_PROVIDER_BASE_URL=http://bgutil-provider:4416
+    depends_on:
+      - bgutil-provider
     # Named volumes inherit the image's nonroot ownership (uid 65532), so the
     # distroless non-root user can write to them. (/downloads is just staging.)
     volumes:
       - soundpull-data:/data            # SQLite DB (DATABASE_URL=sqlite:////data/app.db)
       - soundpull-downloads:/downloads  # ZIP packaging / WebDAV work dir
     networks:
-      - proxy
+      - proxy      # Traefik / public ingress
+      - internal   # private link to the PO-token provider
     labels:
       - "traefik.enable=true"
       # Replace the host and certresolver with your real values.
@@ -22,11 +29,24 @@ services:
       - "traefik.http.routers.soundpull.tls.certresolver=letsencrypt"
       - "traefik.http.services.soundpull.loadbalancer.server.port=8080"
 
+  # PO-token provider (YouTube GVS 403 fix). Generates GVS PO tokens for yt-dlp's
+  # bgutil plugin so age-restricted/high-quality audio formats download instead of
+  # returning HTTP 403. Only on the internal network — never exposed to Traefik.
+  # Keep the tag in sync with the bgutil-ytdlp-pot-provider pin in pyproject.toml.
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:1.3.1
+    container_name: bgutil-provider
+    restart: unless-stopped
+    init: true            # reap zombie Chrome/Node children
+    networks:
+      - internal
+
 # Traefik provides TLS termination and routing; OIDC auth happens inside the app.
 # NiceGUI uses WebSockets — Traefik forwards these by default, no extra config needed.
 networks:
   proxy:
     external: true
+  internal:               # private soundpull ↔ bgutil-provider link, not routed
 
 volumes:
   soundpull-data:
