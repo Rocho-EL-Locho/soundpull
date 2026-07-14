@@ -20,13 +20,19 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urlparse
 
 import httpx
 import yt_dlp
 
 from app import fix_music_tags, lyrics
 from app.config import settings
+from app.sources import (
+    EXTRACTOR_ARGS_YT as EXTRACTOR_ARGS,
+    SourceSpec,
+    YOUTUBE,
+    detect_source,
+    is_supported_url,
+)
 
 log = logging.getLogger("pipeline")
 
@@ -34,12 +40,6 @@ log = logging.getLogger("pipeline")
 # state does not survive a restart, so anything left here is orphaned — see
 # purge_work_root(), called once at startup.
 _WORK_ROOT = Path(settings.local_music_root) / ".work"
-
-# YouTube hosts we accept; everything else is rejected before yt-dlp runs.
-_YOUTUBE_HOSTS = {
-    "youtube.com", "www.youtube.com", "m.youtube.com",
-    "music.youtube.com", "youtu.be",
-}
 
 
 def purge_work_root() -> None:
@@ -68,16 +68,9 @@ def _write_cookie_file(job_id: str, cookies_txt: str | None) -> Path | None:
     return path
 
 
-def is_supported_url(raw: str) -> bool:
-    """True only for http(s) URLs on a known YouTube host."""
-    try:
-        parsed = urlparse((raw or "").strip())
-    except ValueError:
-        return False
-    if parsed.scheme not in ("http", "https"):
-        return False
-    host = (parsed.hostname or "").lower()
-    return host in _YOUTUBE_HOSTS or host.endswith(".youtube.com")
+# `is_supported_url` is re-exported from app.sources (imported above) so the UI call
+# sites in pages/index.py and pages/subscriptions.py keep importing it from here
+# unchanged, while the host-matching logic has a single home in the source registry.
 
 
 # Chars a Windows-backed / oCIS (OpenCloud) WebDAV server rejects in a path segment even when
@@ -111,7 +104,8 @@ def _safe_segment(name: str) -> str:
 #     251/140 with the token.)
 # Parity-safe: this only selects the extraction client, not the tag pipeline (the
 # frozen postprocessor chain is unchanged); metadata values are client-independent.
-EXTRACTOR_ARGS = "youtube:player_client=android_vr,mweb"
+# The string itself now lives in app.sources (as EXTRACTOR_ARGS_YT) and is imported
+# above under this name, so the frozen flag lists below reference it unchanged.
 
 # yt-dlp flags for the download step, identical to the bash scripts (genre and
 # -o output template are appended per-run). --ignore-config keeps it deterministic.
@@ -318,8 +312,34 @@ def _build_ydl_opts(flags: list[str]) -> dict:
     return yt_dlp.parse_options(flags).ydl_opts
 
 
-def _extractor_args() -> dict:
-    return _build_ydl_opts(["--extractor-args", EXTRACTOR_ARGS]).get("extractor_args", {})
+def _extractor_args(source: SourceSpec = YOUTUBE) -> dict:
+    """Extractor-args dict for a source's probes. YouTube → identical to before (parity)."""
+    if not source.extractor_args:
+        return {}
+    return _build_ydl_opts(["--extractor-args", source.extractor_args]).get("extractor_args", {})
+
+
+def _apply_source(flags: list[str], source: SourceSpec) -> list[str]:
+    """Return a copy of `flags` with the `--extractor-args` pair set for `source`.
+
+    For YouTube this is a **no-op** — the frozen flag lists already carry YouTube's
+    extractor-args, so the produced list (and thus tag output) is byte-identical. This
+    mirrors the `_apply_audio_format()` no-op-by-default precedent that guards parity.
+    A non-YouTube source replaces the `youtube:` extractor-args pair with its own (or
+    drops it when the source needs none).
+    """
+    if source.key == "youtube" or source.extractor_args == EXTRACTOR_ARGS:
+        return list(flags)  # identity — the parity baseline
+    out = list(flags)
+    try:
+        i = out.index("--extractor-args")
+    except ValueError:
+        i = -1
+    if i >= 0:
+        del out[i:i + 2]
+    if source.extractor_args:
+        out += ["--extractor-args", source.extractor_args]
+    return out
 
 
 def _apply_cookie_policy(opts: dict, cookiefile: str | None) -> None:
@@ -334,7 +354,7 @@ def _apply_cookie_policy(opts: dict, cookiefile: str | None) -> None:
     opts["cookiesfrombrowser"] = None    # never read a browser cookie store on the server
 
 
-def _apply_pot_provider(opts: dict) -> None:
+def _apply_pot_provider(opts: dict, source: SourceSpec = YOUTUBE) -> None:
     """Point the bundled bgutil PO-token plugin at the provider server, if configured.
 
     YouTube now requires a GVS PO token for most audio formats (else HTTP 403 on the
@@ -345,6 +365,10 @@ def _apply_pot_provider(opts: dict) -> None:
     token-free clients. Only affects the GVS/download step; a no-op for flat
     enumeration and cover fetches (no formats are requested, so no token is asked
     for), but applied uniformly next to the cookie policy for consistency."""
+    # The PO-token key is YouTube-GVS-specific, so it only applies to a source that
+    # declares supports_pot; a non-YouTube source is a no-op here (parity for YouTube).
+    if not source.supports_pot:
+        return
     base_url = settings.pot_provider_base_url.strip()
     if not base_url:
         return
@@ -375,17 +399,19 @@ def _primary_artist(raw: str | None) -> str:
     return raw.split(", ")[0].strip() or "Unbekannt"
 
 
-def _probe_meta(url: str, is_album: bool, cookiefile: str | None = None) -> tuple[str | None, str | None]:
+def _probe_meta(url: str, is_album: bool, cookiefile: str | None = None,
+                source: SourceSpec | None = None) -> tuple[str | None, str | None]:
     """Read artist/album from the first item (like `yt-dlp --simulate --print`)."""
+    src = source or detect_source(url) or YOUTUBE
     opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
-        "extractor_args": _extractor_args(),
+        "extractor_args": _extractor_args(src),
         "logger": _QuietLogger(),
     }
     _apply_cookie_policy(opts, cookiefile)
-    _apply_pot_provider(opts)
+    _apply_pot_provider(opts, src)
     _apply_socket_timeout(opts)
     if is_album:
         opts["playlist_items"] = "1"
@@ -400,7 +426,8 @@ def _probe_meta(url: str, is_album: bool, cookiefile: str | None = None) -> tupl
     return artist, album
 
 
-def _probe_playlist(url: str, cookiefile: str | None = None) -> tuple[str, str, int, str]:
+def _probe_playlist(url: str, cookiefile: str | None = None,
+                    source: SourceSpec | None = None) -> tuple[str, str, int, str]:
     """Read a playlist's title, uploader, entry count and id (issue #11 / #39).
 
     Uses `extract_flat` so we only touch the playlist envelope, not every video —
@@ -411,16 +438,17 @@ def _probe_playlist(url: str, cookiefile: str | None = None) -> tuple[str, str, 
     id is "" when the extractor exposes none. The id disambiguates the delivery
     folder so two same-named playlists don't collide (issue #39).
     """
+    src = source or detect_source(url) or YOUTUBE
     opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "extract_flat": True,
-        "extractor_args": _extractor_args(),
+        "extractor_args": _extractor_args(src),
         "logger": _QuietLogger(),
     }
     _apply_cookie_policy(opts, cookiefile)
-    _apply_pot_provider(opts)
+    _apply_pot_provider(opts, src)
     _apply_socket_timeout(opts)
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False) or {}
@@ -433,7 +461,8 @@ def _probe_playlist(url: str, cookiefile: str | None = None) -> tuple[str, str, 
 
 
 def enumerate_playlist_tracks(url: str, cookiefile: str | None = None,
-                              limit: int = 0) -> list[tuple[str, str]]:
+                              limit: int = 0,
+                              source: SourceSpec | None = None) -> list[tuple[str, str]]:
     """(artist, title) for each playlist entry, metadata only — NO download (issue #21).
 
     Seeds the server index for a "mark existing" subscription first run: a per-entry
@@ -441,6 +470,7 @@ def enumerate_playlist_tracks(url: str, cookiefile: str | None = None,
     fields. `limit` caps entries (0 = unlimited). Mirrors the artist/title fallbacks
     used by the sync match-filter so the seeded keys line up with later lookups.
     """
+    src = source or detect_source(url) or YOUTUBE
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -448,11 +478,11 @@ def enumerate_playlist_tracks(url: str, cookiefile: str | None = None,
         # A single unavailable/region-locked entry must not abort enumerating the whole
         # playlist — skip it (it appears as a None entry) and keep going (issue #21).
         "ignoreerrors": True,
-        "extractor_args": _extractor_args(),
+        "extractor_args": _extractor_args(src),
         "logger": _QuietLogger(),
     }
     _apply_cookie_policy(opts, cookiefile)
-    _apply_pot_provider(opts)
+    _apply_pot_provider(opts, src)
     _apply_socket_timeout(opts)
     if limit and limit > 0:
         opts["playlistend"] = limit
@@ -472,7 +502,8 @@ def enumerate_playlist_tracks(url: str, cookiefile: str | None = None,
 
 
 def enumerate_artist(url: str, cookiefile: str | None = None,
-                     limit: int = 0) -> tuple[str, list[dict]]:
+                     limit: int = 0,
+                     source: SourceSpec | None = None) -> tuple[str, list[dict]]:
     """Artist name + every release for an artist/channel URL, metadata only (issue #32).
 
     A YouTube Music artist's whole catalogue (albums, EPs AND singles) surfaces via the
@@ -481,7 +512,15 @@ def enumerate_artist(url: str, cookiefile: str | None = None,
     release is downloaded through the normal album path, so a single lands as a 1-track album
     folder (faithful to how YT Music / Navidrome model it). `limit` caps the number of releases
     (0 = unlimited). Returns `(artist_name, [{"title", "url"}, …])`.
+
+    The `/releases`-tab resolution is YouTube-specific, so this is gated on the source's
+    `supports_artist` flag (YouTube declares it True); a source without artist support
+    returns an empty discography rather than probing a YouTube-shaped URL. Feature 06 adds
+    a per-source enumerator for the sources that need a different one.
     """
+    src = source or detect_source(url) or YOUTUBE
+    if not src.supports_artist:
+        return _UNKNOWN_ARTIST, []
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -489,11 +528,11 @@ def enumerate_artist(url: str, cookiefile: str | None = None,
         "extract_flat": True,
         # A dead/region-locked release must not abort enumerating the whole discography.
         "ignoreerrors": True,
-        "extractor_args": _extractor_args(),
+        "extractor_args": _extractor_args(src),
         "logger": _QuietLogger(),
     }
     _apply_cookie_policy(opts, cookiefile)
-    _apply_pot_provider(opts)
+    _apply_pot_provider(opts, src)
     _apply_socket_timeout(opts)
 
     releases_url = url if url.rstrip("/").endswith("/releases") else None
@@ -574,11 +613,13 @@ def _square_crop_jpeg(src: Path) -> bytes | None:
         return None
 
 
-def _fetch_cover(url: str, is_album: bool, dest: Path, cookiefile: str | None = None) -> Path | None:
+def _fetch_cover(url: str, is_album: bool, dest: Path, cookiefile: str | None = None,
+                 source: SourceSpec | None = None) -> Path | None:
     """Download the square album cover into `dest` (cover.jpg). Returns path or None."""
+    src = source or detect_source(url) or YOUTUBE
     opts = {"quiet": True, "no_warnings": True, "skip_download": True, "logger": _QuietLogger()}
     _apply_cookie_policy(opts, cookiefile)
-    _apply_pot_provider(opts)
+    _apply_pot_provider(opts, src)
     _apply_socket_timeout(opts)
     if is_album:
         opts["extract_flat"] = True  # playlist-level thumbnails (the album art)
@@ -1265,7 +1306,8 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
                  stage_dir: Path | None = None, deliver: bool = True,
                  album_name: str | None = None,
                  own_artist: str | None = None,
-                 fetch_lyrics: bool = False) -> Result:
+                 fetch_lyrics: bool = False,
+                 source: SourceSpec | None = None) -> Result:
     """Execute one download end-to-end and return a Result.
 
     Both destinations stage into a temp work dir; then either a ZIP is packaged
@@ -1326,6 +1368,9 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
     is_album = not is_playlist and not is_single  # unknown/legacy modes → album
     is_sync = is_playlist and on_server is not None  # issue #21: playlist-with-dedup
     dedup = on_server is not None  # issue #21/#31: skip-if-present active for this run
+    # Detected once and threaded through the probe/download/cover steps (roadmap feature 02).
+    # Only YouTube is registered, so this resolves to YOUTUBE and behaviour is unchanged.
+    source_spec = source or detect_source(url) or YOUTUBE
 
     # Cross-folder m3u references only make sense for a WebDAV library; a browser ZIP has
     # no library and its tracks are packaged under a single root, so a `../` reference would
@@ -1352,7 +1397,8 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
         work_base.mkdir(parents=True, exist_ok=True)
         pl_title = ""
         if is_playlist:
-            pl_title, pl_uploader, pl_count, pl_id = _probe_playlist(url, cookiefile=cookiefile)
+            pl_title, pl_uploader, pl_count, pl_id = _probe_playlist(
+                url, cookiefile=cookiefile, source=source_spec)
             if settings.max_playlist_items > 0 and pl_count:
                 pl_count = min(pl_count, settings.max_playlist_items)
             reporter.on_meta(pl_uploader, pl_title)
@@ -1368,7 +1414,7 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
             out_tmpl = str(playlist_dir / _PLAYLIST_TRACK_TMPL)
             base_flags = _SINGLE_FLAGS  # per-track tags, no album track-number remap
         else:
-            artist_raw, album_raw = _probe_meta(url, is_album, cookiefile=cookiefile)
+            artist_raw, album_raw = _probe_meta(url, is_album, cookiefile=cookiefile, source=source_spec)
             # In artist mode (`own_artist` set) force the known performer as the album's primary
             # artist (issue #56): releases on a label channel probe as artist=<label> (e.g.
             # "Drum&BassArena"), which would fold the whole album under the label in Navidrome and
@@ -1392,6 +1438,9 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
 
         # 2) Download (parity-safe opts from parse_options + our hooks).
         flags = _apply_audio_format(base_flags, audio_format)
+        # Source-specific extractor-args (feature 02). No-op for YouTube (the frozen flag
+        # lists already carry YouTube's args), so the produced list stays byte-identical.
+        flags = _apply_source(flags, source_spec)
         flags = _apply_tag_options(flags, tag_options)
         if tag_options.genre:
             flags += _genre_flags(genre)
@@ -1405,7 +1454,7 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
         opts = _build_ydl_opts(flags)
         opts.update({"quiet": True, "no_warnings": True, "noprogress": True, "logger": _QuietLogger()})
         _apply_cookie_policy(opts, cookiefile)
-        _apply_pot_provider(opts)
+        _apply_pot_provider(opts, source_spec)
         _apply_socket_timeout(opts)
         if is_playlist and settings.max_playlist_items > 0:
             opts["playlistend"] = settings.max_playlist_items  # cap runaway playlists
@@ -1524,13 +1573,17 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
             def cover_for(fp: str) -> bytes | None:
                 if not tag_options.cover:
                     return None  # cover disabled → thumbnail already stripped
-                src = thumb_by_stem.get(Path(fp).stem)
-                return _square_crop_jpeg(src) if src else None  # else keep embedded
+                thumb = thumb_by_stem.get(Path(fp).stem)
+                # Crop 16:9 thumbnails to a square and re-encode to JPEG; an already-square
+                # source is unchanged by the crop, so this is correct for every source and
+                # always yields the JPEG Navidrome wants (source.cover_square_crop stays a
+                # declared capability for feature 06's per-source cover strategy).
+                return _square_crop_jpeg(thumb) if thumb else None
 
             tracks = [Path(p) for p in fix_music_tags.process_tree(
                 str(playlist_dir), tag_options, cover_for=cover_for)]
-            for src in thumb_by_stem.values():
-                src.unlink(missing_ok=True)  # don't ship the standalone thumbnails
+            for thumb in thumb_by_stem.values():
+                thumb.unlink(missing_ok=True)  # don't ship the standalone thumbnails
             # Record what we're delivering (issue #21/#31): (artist, title, rel_path) per
             # track, read from the FINAL tags so the server index matches later lookups;
             # rel_path (relative to the WebDAV base) lets a future playlist reference it.
@@ -1559,7 +1612,8 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
             # them like any clean track instead of them shipping as mis-tagged duplicates.
             if own_artist:
                 _repair_album_titles(album_dir, own_artist)
-            cover_path = (_fetch_cover(url, is_album, album_dir / "cover.jpg", cookiefile=cookiefile)
+            cover_path = (_fetch_cover(url, is_album, album_dir / "cover.jpg",
+                                       cookiefile=cookiefile, source=source_spec)
                           if tag_options.cover else None)
             fix_music_tags.process_directory(
                 str(album_dir),
@@ -1660,11 +1714,13 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
     """
     work_base = _WORK_ROOT / job_id
     cookie_path = _write_cookie_file(job_id, cookies_txt)
+    source_spec = detect_source(url) or YOUTUBE  # feature 02; only YouTube registered → unchanged
     try:
         work_base.mkdir(parents=True, exist_ok=True)
         reporter.on_phase("metadata")
         artist, releases = enumerate_artist(
-            url, cookiefile=str(cookie_path) if cookie_path else None, limit=max_items)
+            url, cookiefile=str(cookie_path) if cookie_path else None, limit=max_items,
+            source=source_spec)
         if not releases:
             # No `/releases` tab / no album playlists. The usual cause is an auto-generated
             # "… - Topic" channel (or a plain uploads channel), which only exposes a flat list
@@ -1724,7 +1780,8 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
                                 audio_format=audio_format, tag_options=tag_options,
                                 cookies_txt=cookies_txt, on_server=on_server,
                                 stage_dir=work_base, deliver=False, album_name=album_name,
-                                own_artist=own_artist, fetch_lyrics=fetch_lyrics)
+                                own_artist=own_artist, fetch_lyrics=fetch_lyrics,
+                                source=source_spec)
 
         # Fan out into up to `album_concurrency` parallel album downloads; results are aggregated
         # here in the calling thread (as_completed yields in this thread), so no locking is needed.
