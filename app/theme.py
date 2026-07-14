@@ -256,9 +256,21 @@ def _build_sidebar(active: str):
     sidebar_open = bool(app.storage.user.get("sidebar_open", True))
     drawer = ui.left_drawer(value=sidebar_open, fixed=True, bordered=False, elevated=False) \
         .classes("sp-drawer").props(f"width={_DRAWER_WIDTH}").style("padding:0")
+
+    def _close() -> None:
+        drawer.hide()
+        app.storage.user["sidebar_open"] = False
+
     nav_items: list = []
     with drawer:
         with ui.column().classes("w-full").style("height:100%; padding:20px 14px; gap:6px"):
+            # Explicit close button: on desktop the open drawer covers the header's
+            # hamburger toggle, and there is no click-outside backdrop in push mode — so
+            # this is the only always-reachable way to collapse the sidebar without a
+            # touch swipe.
+            with ui.row().classes("w-full").style("justify-content:flex-end; margin-bottom:2px"):
+                ui.button(icon="close", on_click=_close).props("flat round dense") \
+                    .classes("text-white/60").tooltip(t("nav.close_menu"))
             for key, target, active_key, icon in _NAV_ITEMS:
                 link = _sidebar_item(key, target, active_key, icon, active)
                 nav_items.append((link, active_key))
