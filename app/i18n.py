@@ -29,6 +29,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "nav.logout": "Abmelden",
         "nav.language": "Sprache",
         "nav.menu": "Menü ein-/ausklappen",
+        "nav.close_menu": "Menü schließen",
         "nav.selfhosted": "self-hosted",
         # footer
         "footer.tagline": "Soundpull · self-hosted · MIT-Lizenz",
@@ -311,6 +312,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "nav.logout": "Log out",
         "nav.language": "Language",
         "nav.menu": "Toggle menu",
+        "nav.close_menu": "Close menu",
         "nav.selfhosted": "self-hosted",
         # footer
         "footer.tagline": "Soundpull · self-hosted · MIT license",
