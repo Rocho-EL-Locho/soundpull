@@ -12,6 +12,7 @@ from app.genres import DEFAULT_GENRE
 from app.i18n import audio_format_labels, genre_options, t
 from app.jobs import JobState, get_user_jobs, start_job, tag_options_from_settings
 from app.pipeline import is_supported_url, normalize_audio_format
+from app.sources import suggest_mode
 from app.theme import tag_option_switches
 
 
@@ -198,8 +199,36 @@ def index_content(url: str = "") -> None:
             if mode_tgl.value == "artist":
                 dedup_sw.set_value(True)
 
-        mode_tgl.on_value_change(lambda: _apply_artist_dedup_default())
+        # URL intelligence (roadmap feature 02): pasting a URL pre-selects the most likely
+        # mode. We must not fight a manual choice — once the user picks a mode themselves,
+        # `mode_state["manual"]` latches and auto-suggestion stops for the rest of the
+        # session, so a later URL edit never clobbers their pick. `suppress` distinguishes
+        # our own programmatic `set_value` (which also fires on_value_change) from a real click.
+        mode_state = {"manual": False}
+        suppress = {"on": False}
+
+        def _on_mode_change() -> None:
+            if not suppress["on"]:
+                mode_state["manual"] = True  # a genuine user pick — stop auto-suggesting
+            _apply_artist_dedup_default()
+
+        def _suggest_mode_from_url() -> None:
+            if mode_state["manual"]:
+                return  # respect the user's explicit choice — never override it
+            guess = suggest_mode(url_in.value or "")
+            if not guess:
+                return
+            suppress["on"] = True
+            try:
+                mode_tgl.set_value(guess)
+            finally:
+                suppress["on"] = False
+
+        mode_tgl.on_value_change(lambda: _on_mode_change())
+        url_in.on_value_change(lambda: _suggest_mode_from_url())
         _select_dest(d_dest)  # sets initial card highlight + dedup visibility
+        if (url or "").strip():
+            _suggest_mode_from_url()  # a prefilled ?url= gets its mode suggested once
         _apply_artist_dedup_default()  # default artist mode to skip-existing on
 
         with ui.expansion(t("meta.heading"), icon="tune").classes("w-full glass rounded-lg") \

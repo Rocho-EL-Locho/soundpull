@@ -24,6 +24,7 @@ from app.pipeline import (
     _apply_cookie_policy,
     _apply_pot_provider,
     _apply_socket_timeout,
+    _apply_source,
     _apply_tag_options,
     _build_playlist_manifest,
     _build_ydl_opts,
@@ -51,6 +52,7 @@ from app.pipeline import (
     normalize_audio_format,
     pick_square_cover,
 )
+from app.sources import YOUTUBE
 
 
 def _jpeg_dimensions(data: bytes) -> tuple[int, int] | None:
@@ -138,6 +140,15 @@ def test_default_audio_format_is_noop_parity():
     # byte-identical flags → byte-identical tags (the parity invariant).
     assert _apply_audio_format(_ALBUM_FLAGS, DEFAULT_AUDIO_FORMAT) == _ALBUM_FLAGS
     assert _apply_audio_format(_SINGLE_FLAGS, DEFAULT_AUDIO_FORMAT) == _SINGLE_FLAGS
+
+
+def test_apply_source_youtube_is_noop_parity():
+    # feature 02: the YouTube source must leave the frozen flag lists byte-identical
+    # (they already carry YouTube's --extractor-args), so tag output is unchanged.
+    assert _apply_source(_ALBUM_FLAGS, YOUTUBE) == _ALBUM_FLAGS
+    assert _apply_source(_SINGLE_FLAGS, YOUTUBE) == _SINGLE_FLAGS
+    # returns a copy, never the same list object (so a caller can't mutate the frozen list)
+    assert _apply_source(_ALBUM_FLAGS, YOUTUBE) is not _ALBUM_FLAGS
 
 
 def test_mp3_192_changes_only_the_bitrate():
@@ -1193,7 +1204,7 @@ def test_run_artist_download_browser_stages_and_zips_once(monkeypatch, tmp_path)
     import app.pipeline as pipeline
     monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
     monkeypatch.setattr(pipeline, "enumerate_artist",
-                        lambda url, cookiefile=None, limit=0: ("Artist", [
+                        lambda url, cookiefile=None, limit=0, source=None: ("Artist", [
                             {"title": "A", "url": "uA"},
                             {"title": "B", "url": "uB"},
                             {"title": "C", "url": "uC"}]))
@@ -1240,7 +1251,7 @@ def test_run_artist_download_webdav_uploads_whole_tree_once(monkeypatch, tmp_pat
     import app.pipeline as pipeline
     monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
     monkeypatch.setattr(pipeline, "enumerate_artist",
-                        lambda url, cookiefile=None, limit=0: ("Artist", [{"title": "A", "url": "uA"}]))
+                        lambda url, cookiefile=None, limit=0, source=None: ("Artist", [{"title": "A", "url": "uA"}]))
 
     def fake_run_download(**kw):
         d = kw["stage_dir"] / "Artist" / "A"
@@ -1267,7 +1278,7 @@ def test_run_artist_download_disambiguates_duplicate_release_titles(monkeypatch,
     import app.pipeline as pipeline
     monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
     monkeypatch.setattr(pipeline, "enumerate_artist",
-                        lambda url, cookiefile=None, limit=0: ("Artist", [
+                        lambda url, cookiefile=None, limit=0, source=None: ("Artist", [
                             {"title": "Live", "url": "u1"},
                             {"title": "Live", "url": "u2"}]))
     seen = []
@@ -1309,7 +1320,7 @@ def test_run_artist_download_passes_own_artist_filter(monkeypatch, tmp_path):
     monkeypatch.setattr(pipeline, "run_download",
                         lambda **kw: (calls.append(kw), fake_run_download(**kw))[1])
     monkeypatch.setattr(pipeline, "enumerate_artist",
-                        lambda url, cookiefile=None, limit=0: ("BCee - Topic",
+                        lambda url, cookiefile=None, limit=0, source=None: ("BCee - Topic",
                                                                [{"title": "A", "url": "uA"}]))
     run_artist_download(job_id="ja", url="u", genre="Rap",
                         destination=Destination(type="browser"), reporter=Reporter())
@@ -1318,7 +1329,7 @@ def test_run_artist_download_passes_own_artist_filter(monkeypatch, tmp_path):
     # An unresolved fallback name must NOT be used as a filter (would drop everything).
     calls.clear()
     monkeypatch.setattr(pipeline, "enumerate_artist",
-                        lambda url, cookiefile=None, limit=0: (pipeline._UNKNOWN_ARTIST,
+                        lambda url, cookiefile=None, limit=0, source=None: (pipeline._UNKNOWN_ARTIST,
                                                                [{"title": "A", "url": "uA"}]))
     run_artist_download(job_id="jb", url="u", genre="Rap",
                         destination=Destination(type="browser"), reporter=Reporter())
@@ -1329,7 +1340,7 @@ def test_run_artist_download_raises_when_no_releases(monkeypatch, tmp_path):
     import app.pipeline as pipeline
     monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
     monkeypatch.setattr(pipeline, "enumerate_artist",
-                        lambda url, cookiefile=None, limit=0: ("Artist", []))
+                        lambda url, cookiefile=None, limit=0, source=None: ("Artist", []))
     # The message must explain WHY (no album releases), not just "not an artist page".
     with pytest.raises(RuntimeError, match="Album"):
         run_artist_download(job_id="j3", url="u", genre="Rap",
@@ -1346,7 +1357,7 @@ def test_run_artist_download_stages_albums_in_parallel(monkeypatch, tmp_path):
     import app.pipeline as pipeline
     monkeypatch.setattr(pipeline, "_WORK_ROOT", tmp_path / ".work")
     monkeypatch.setattr(pipeline, "enumerate_artist",
-                        lambda url, cookiefile=None, limit=0: ("Artist", [
+                        lambda url, cookiefile=None, limit=0, source=None: ("Artist", [
                             {"title": "A", "url": "uA"},
                             {"title": "B", "url": "uB"},
                             {"title": "C", "url": "uC"}]))
