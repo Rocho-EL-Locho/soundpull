@@ -17,7 +17,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 import app.db
 import app.webdav_util
 from app import duplicates, library_ops
-from app.duplicates import PathInfo, _build_report, _keeper, rewrite_m3u
+from app.duplicates import PathInfo, _build_report, _is_playlist_folder, _keeper, rewrite_m3u
 from app.library_index import track_key
 from app.models import DuplicateReport, PlaylistSubscription, ServerTrack, UserSettings
 
@@ -95,6 +95,18 @@ def test_feat_variants_collapse_into_exact_key():
     report = _build_report(files, counts)
     assert len(report.exact) == 1
     assert len(report.probable) == 0
+
+
+@pytest.mark.parametrize("folder,expected", [
+    ("Chill [PLFgquLnL59alW3xmYiWRaoz0]", True),      # real YouTube playlist id
+    ("Mix [OLAK5uy_kd9lF3aH8Nq2K1]", True),           # auto-generated album-playlist id
+    ("Artist/Greatest Hits [Deluxe Edition]", False),  # album edition suffix, not a playlist
+    ("Artist/Album [Remastered]", False),             # ditto (no digit, has letters only)
+    ("Artist/Album [2019]", False),                   # year suffix (too short / digits-only)
+    ("Artist/Plain Album", False),
+])
+def test_is_playlist_folder_heuristic(folder, expected):
+    assert _is_playlist_folder(folder) is expected
 
 
 # --- pure m3u repair -------------------------------------------------------
@@ -330,3 +342,50 @@ def test_resolve_group_repairs_subscription_manifest(env):
             PlaylistSubscription.user_id == 1)).first()
         entries = json.loads(sub.playlist_files)
     assert entries[0]["name"] == "../Burial/Untrue/05 - Archangel.mp3"
+
+
+def test_manifest_repair_matches_by_content_despite_title_drift(env):
+    # The subscription's cached name ("Old Title") no longer matches the on-disk folder/m3u name
+    # ("Late Night") — a name-based match would fail; a content-based match still finds it.
+    client, scope = env
+    import json
+    keeper = "Burial/Untrue/05 - Archangel.mp3"
+    loser = "Burial/Archangel/01 - Archangel.mp3"
+    _add_audio(client, keeper)
+    _add_audio(client, loser)
+    _index(scope, keeper)
+    client.files["lib/Late Night [PL9]/Late Night.m3u8"] = (
+        "#EXTM3U\n../Burial/Archangel/01 - Archangel.mp3\n").encode("utf-8")
+    manifest = [{"index": 1, "name": "../Burial/Archangel/01 - Archangel.mp3",
+                 "title": "Archangel", "artist": "Burial", "dur": -1}]
+    with scope() as s:
+        s.add(PlaylistSubscription(user_id=1, url="https://x", name="Old Title",
+                                   playlist_files=json.dumps(manifest)))
+        s.commit()
+
+    result = duplicates.resolve_group(1, keeper, [loser])
+
+    assert result.manifests_repaired == 1
+    with scope() as s:
+        sub = s.exec(select(PlaylistSubscription).where(
+            PlaylistSubscription.user_id == 1)).first()
+        assert json.loads(sub.playlist_files)[0]["name"] == "../Burial/Untrue/05 - Archangel.mp3"
+
+
+def test_save_report_updates_groups_without_restamping(env):
+    client, scope = env
+    _add_audio(client, "A/Alb/01 - S.mp3")
+    _add_audio(client, "A/Sng/01 - S.mp3")
+    report = duplicates.analyze(1)
+    with scope() as s:
+        created_before = s.exec(select(DuplicateReport).where(
+            DuplicateReport.user_id == 1)).first().created_at
+
+    report.exact = []                       # simulate a resolve pruning the only group
+    duplicates.save_report(1, report)
+
+    reloaded = duplicates.load_report(1)
+    assert reloaded.exact == []             # persisted pruned state (no stale group on reload)
+    with scope() as s:
+        assert s.exec(select(DuplicateReport).where(
+            DuplicateReport.user_id == 1)).first().created_at == created_before  # not re-stamped

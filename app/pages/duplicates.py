@@ -84,32 +84,45 @@ def duplicates_content() -> None:
             render_body.refresh()
 
     # --- resolve actions -----------------------------------------------------------------
+    def _gid(tier: str, group) -> str:
+        """Stable per-group id: the group's suggested_keeper is a unique rel_path per group."""
+        return f"{tier}:{group.suggested_keeper}"
+
     def _keeper_for(gid: str, group) -> str:
         return state["keepers"].get(gid, group.suggested_keeper)
 
     async def _do_resolve(groups_with_ids: list[tuple[str, object]]) -> None:
-        """Trash the non-keepers of each (gid, group) off-thread, then drop them from the view."""
-        def _work() -> int:
+        """Trash the non-keepers of each (gid, group) off-thread, then drop the fully-cleaned
+        groups from the view and re-persist the pruned report so a reload stays in sync."""
+        def _work() -> tuple[int, set]:
             trashed = 0
+            resolved: set = set()
             for gid, group in groups_with_ids:
                 keeper = _keeper_for(gid, group)
                 remove = [p.rel_path for p in group.paths if p.rel_path != keeper]
                 res = duplicates.resolve_group(uid, keeper, remove)
                 trashed += len(res.trashed)
-            return trashed
+                if len(res.trashed) == len(remove):  # every non-keeper actually gone
+                    resolved.add(gid)
+            return trashed, resolved
         try:
-            trashed = await run.io_bound(_work)
+            trashed, resolved_ids = await run.io_bound(_work)
         except Exception as exc:  # noqa: BLE001
             ui.notify(t("duplicates.resolve_error", error=exc), type="negative")
             return
-        # Drop the resolved groups from the in-memory report so the card disappears.
-        resolved_ids = {gid for gid, _ in groups_with_ids}
+        # Drop only the groups whose copies were ALL trashed (a partial failure keeps the card so
+        # the still-present duplicate isn't silently hidden), keyed by the stable gid.
         report = state["report"]
         if report is not None:
-            report.exact = [g for i, g in enumerate(report.exact)
-                            if f"exact:{i}" not in resolved_ids]
-            report.probable = [g for i, g in enumerate(report.probable)
-                               if f"probable:{i}" not in resolved_ids]
+            report.exact = [g for g in report.exact if _gid("exact", g) not in resolved_ids]
+            report.probable = [g for g in report.probable
+                               if _gid("probable", g) not in resolved_ids]
+            for gid in resolved_ids:
+                state["keepers"].pop(gid, None)
+            try:
+                await run.io_bound(duplicates.save_report, uid, report)
+            except Exception as exc:  # noqa: BLE001 - persistence is best-effort; UI already updated
+                log.warning("could not persist pruned duplicate report: %s", exc)
         ui.notify(t("duplicates.resolved", count=trashed), type="positive")
         render_body.refresh()
 
@@ -198,8 +211,12 @@ def duplicates_content() -> None:
                     ui.label(t("duplicates.no_webdav")).classes("text-amber-300 text-sm")
             return
 
-        exact_ids = [(f"exact:{i}", g) for i, g in enumerate(report.exact)]
-        probable_ids = [(f"probable:{i}", g) for i, g in enumerate(report.probable)]
+        # Group IDs are STABLE (keyed by the group's suggested_keeper rel_path, unique per group)
+        # — NOT the list position. A positional id would shift when a resolve prunes the list,
+        # orphaning `state["keepers"]` entries and mis-applying one group's keeper to another
+        # (which could make `remove` cover every copy → the track loses all copies).
+        exact_ids = [(_gid("exact", g), g) for g in report.exact]
+        probable_ids = [(_gid("probable", g), g) for g in report.probable]
 
         if not exact_ids and not probable_ids:
             with ui.card().classes("glass w-full rounded-2xl p-10 gap-3 items-center text-center"):

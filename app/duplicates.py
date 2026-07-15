@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import posixpath
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
@@ -131,14 +132,18 @@ class Report:
 
 # --- Grouping / keeper heuristic -------------------------------------------
 
-def _is_playlist_folder(folder: str) -> bool:
-    """True for a `<name> [<id>]` playlist folder — its basename ends in ``[...]``.
+# A playlist delivery folder is ``<name> [<playlist_id>]`` (pipeline._playlist_folder_name). The
+# id is a YouTube playlist id (``PL…``/``OLAK5uy_…``/``RD…``): a long, space-free, id-like token
+# that contains a digit. Requiring all three avoids misreading an album's bracketed EDITION
+# suffix ("Greatest Hits [Deluxe Edition]", "[Remastered]") as a playlist folder — which would
+# wrongly DEMOTE a real-album copy in the keeper heuristic.
+_PLAYLIST_ID = re.compile(r"\[([A-Za-z0-9_-]{10,})\]$")
 
-    Mirrors the `pipeline._playlist_folder_name` convention without importing its regex; a real
-    album folder is ``Artist/Album`` (no bracketed id), a playlist folder is ``Chill [PLxxxx]``.
-    """
-    base = posixpath.basename(folder.rstrip("/"))
-    return base.endswith("]") and " [" in base
+
+def _is_playlist_folder(folder: str) -> bool:
+    """True for a `<name> [<playlist_id>]` playlist folder (issue #39 delivery convention)."""
+    m = _PLAYLIST_ID.search(posixpath.basename(folder.rstrip("/")))
+    return bool(m) and any(c.isdigit() for c in m.group(1))
 
 
 def _keeper(paths: list[PathInfo]) -> str:
@@ -263,22 +268,42 @@ def _make_group(tier: str, copies: list[tuple[str, str, str]],
 
 # --- Persistence -----------------------------------------------------------
 
+def _payload(report: Report) -> str:
+    return json.dumps({"exact": [_group_json(g) for g in report.exact],
+                       "probable": [_group_json(g) for g in report.probable]})
+
+
 def _persist(user_id: int, report: Report) -> int:
+    """Store a fresh analysis result (stamps `created_at = now`, replacing any prior row)."""
     from app.db import session_scope
     from app.models import DuplicateReport
 
-    payload = json.dumps({"exact": [_group_json(g) for g in report.exact],
-                          "probable": [_group_json(g) for g in report.probable]})
     with session_scope() as session:
         row = session.exec(
             select(DuplicateReport).where(DuplicateReport.user_id == user_id)).first()
         if row is None:
             row = DuplicateReport(user_id=user_id)
-        row.groups = payload
+        row.groups = _payload(report)
         row.created_at = datetime.now(timezone.utc)
         session.add(row)
         session.flush()
         return row.id
+
+
+def save_report(user_id: int, report: Report) -> None:
+    """Persist an UPDATED report (e.g. after a resolve pruned groups) WITHOUT re-stamping the
+    analysis time, so the stored report stays in sync with the UI and a page reload doesn't show
+    already-resolved groups. No-op if there is no report row to update."""
+    from app.db import session_scope
+    from app.models import DuplicateReport
+
+    with session_scope() as session:
+        row = session.exec(
+            select(DuplicateReport).where(DuplicateReport.user_id == user_id)).first()
+        if row is None:
+            return
+        row.groups = _payload(report)
+        session.add(row)
 
 
 def _group_json(g: Group) -> dict:
@@ -396,16 +421,24 @@ def repair_playlist_refs(user_id: int, removed: set[str], keeper_rel: str) -> Re
     if not removed:
         return result
 
-    # 1) On-disk .m3u8 files (what Navidrome actually reads).
+    # 1) On-disk .m3u8 files (what Navidrome actually reads). While reading each, record its
+    #    ORIGINAL path-line set per folder so a subscription can be matched to its folder by
+    #    manifest CONTENT below (robust to a playlist title change, which would break a name match).
     try:
         m3u_rels = library_ops.list_playlist_files(user_id)
     except Exception as exc:  # noqa: BLE001 - repair is best-effort
         log.warning("duplicate repair: listing playlist files failed: %s", exc)
         m3u_rels = []
+    folder_names: dict[str, set[str]] = {}
     for rel in m3u_rels:
         folder = posixpath.dirname(rel)
         try:
             text = library_ops.read_library_text(user_id, rel)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("duplicate repair: reading %r failed: %s", rel, exc)
+            continue
+        folder_names.setdefault(folder, set()).update(_m3u_path_lines(text))
+        try:
             new = rewrite_m3u(text, folder, removed, keeper_rel)
             if new is not None:
                 library_ops.write_library_text(user_id, rel, new)
@@ -414,28 +447,37 @@ def repair_playlist_refs(user_id: int, removed: set[str], keeper_rel: str) -> Re
             log.warning("duplicate repair: rewriting %r failed: %s", rel, exc)
 
     # 2) Subscription manifests (so a later sync doesn't regenerate the stale reference).
-    result.manifests_repaired = _repair_subscription_manifests(user_id, m3u_rels, removed,
+    result.manifests_repaired = _repair_subscription_manifests(user_id, folder_names, removed,
                                                                 keeper_rel)
     return result
 
 
-def _subscription_folder(sub_name: str, m3u_rels: list[str]) -> Optional[str]:
-    """Best-effort map a subscription to its playlist folder via the on-disk `.m3u8` name.
+def _m3u_path_lines(text: str) -> list[str]:
+    """The (stripped) track-path lines of an m3u — the non-blank, non-``#`` lines."""
+    return [ln.strip() for ln in text.split("\n")
+            if ln.strip() and not ln.strip().startswith("#")]
 
-    A subscription's playlist is delivered to ``<name> [<id>]/<name>.m3u8`` where ``<name>`` is
-    `pipeline._safe_segment(sub.name)`. Match the m3u whose basename stem equals that safe name;
-    return its folder. Ambiguous (≥2 matches) or missing → None (that subscription is skipped).
+
+def _match_folder(names: set[str], folder_names: dict[str, set[str]]) -> Optional[str]:
+    """Pick the playlist folder whose on-disk m3u shares the most track names with `names`.
+
+    A subscription's `.m3u8` is generated FROM its manifest, so the folder whose path-line set
+    overlaps the manifest's entry names most is that subscription's folder — regardless of the
+    playlist title (a name-based match breaks if the title changed between syncs). Returns None
+    when nothing overlaps or the top score is tied (ambiguous → don't risk a mis-assignment).
     """
-    from app.pipeline import _safe_segment
+    if not names:
+        return None
+    scored = sorted(((len(names & fn), f) for f, fn in folder_names.items()), reverse=True)
+    if not scored or scored[0][0] == 0:
+        return None
+    if len(scored) > 1 and scored[1][0] == scored[0][0]:
+        return None  # ambiguous — two folders match equally well
+    return scored[0][1]
 
-    stem = _safe_segment(sub_name)
-    matches = [posixpath.dirname(rel) for rel in m3u_rels
-               if posixpath.splitext(posixpath.basename(rel))[0] == stem]
-    return matches[0] if len(matches) == 1 else None
 
-
-def _repair_subscription_manifests(user_id: int, m3u_rels: list[str], removed: set[str],
-                                   keeper_rel: str) -> int:
+def _repair_subscription_manifests(user_id: int, folder_names: dict[str, set[str]],
+                                   removed: set[str], keeper_rel: str) -> int:
     from app.db import session_scope
     from app.models import PlaylistSubscription
 
@@ -447,12 +489,15 @@ def _repair_subscription_manifests(user_id: int, m3u_rels: list[str], removed: s
                     PlaylistSubscription.user_id == user_id,
                     PlaylistSubscription.playlist_files.is_not(None))).all()
             for sub in subs:
-                folder = _subscription_folder(sub.name, m3u_rels)
-                if folder is None:
-                    continue
                 try:
                     entries = json.loads(sub.playlist_files or "[]")
                 except (ValueError, TypeError):
+                    continue
+                names = {e.get("name", "") for e in entries if e.get("name")}
+                folder = _match_folder(names, folder_names)
+                if folder is None:
+                    log.info("duplicate repair: no playlist folder matched subscription %r — "
+                             "manifest left unchanged", sub.name)
                     continue
                 new_entries = _rewrite_manifest(entries, folder, removed, keeper_rel)
                 if new_entries is not None:
