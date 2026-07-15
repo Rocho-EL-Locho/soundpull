@@ -14,9 +14,11 @@ settings-import that merges a previously exported JSON back onto the user's sett
   against the model; unknown / wrong-typed / secret keys are skipped, never written.
 
 **Encoding:** the CSVs are emitted with a leading UTF-8 BOM so Excel/LibreOffice render umlauts
-correctly; the JSON exports carry no BOM. Everything is per-user and delivered via the browser
-(`ui.download`) — nothing here writes into the music library, and there are no pipeline/model
-changes, so metadata parity is untouched.
+correctly; the JSON exports carry no BOM. CSV cells that a spreadsheet would evaluate as a formula
+(leading `=`/`+`/`-`/`@` or a tab/CR — e.g. a hostile track title) are prefixed with an apostrophe
+(`_csv_safe`) so they open as inert text; a future re-import parser should strip that leading `'`.
+Everything is per-user and delivered via the browser (`ui.download`) — nothing here writes into the
+music library, and there are no pipeline/model changes, so metadata parity is untouched.
 """
 from __future__ import annotations
 
@@ -34,6 +36,15 @@ from app.library_index import _artist_title_from_path, split_rel_path
 log = logging.getLogger("exports")
 
 _BOM = "﻿"  # UTF-8 BOM → Excel/LibreOffice auto-detect UTF-8 (umlauts intact)
+
+# CSV formula-injection guard: a cell a spreadsheet would evaluate as a formula (leading
+# =/+/-/@ or a tab/CR) is prefixed with an apostrophe so Excel/LibreOffice treat it as text.
+_CSV_FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value) -> str:
+    s = "" if value is None else str(value)
+    return "'" + s if s[:1] in _CSV_FORMULA_LEAD else s
 
 # Exportable + importable UserSettings fields → value category for import type-checking.
 # EXPLICIT allowlist: the four `*_enc` secrets, ids and runtime timestamps are intentionally
@@ -99,7 +110,8 @@ def library_manifest_csv(user_id: int) -> str:
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=_LIBRARY_HEADER)
     writer.writeheader()
-    writer.writerows(_library_rows(user_id))
+    for row in _library_rows(user_id):
+        writer.writerow({k: _csv_safe(v) for k, v in row.items()})
     return _BOM + buf.getvalue()
 
 
@@ -122,14 +134,14 @@ def history_csv(user_id: int) -> str:
             .order_by(DownloadHistory.created_at)
         ).all()
         for h in rows:
-            writer.writerow({
+            writer.writerow({k: _csv_safe(v) for k, v in {
                 "id": h.id, "url": h.url, "mode": h.mode, "genre": h.genre,
                 "audio_format": h.audio_format, "destination_type": h.destination_type,
                 "artist": h.artist or "", "album": h.album or "", "phase": h.phase,
                 "total_tracks": h.total_tracks, "failed_tracks": h.failed_tracks,
                 "error": h.error or "",
                 "created_at": _iso(h.created_at), "finished_at": _iso(h.finished_at),
-            })
+            }.items()})
     return _BOM + buf.getvalue()
 
 

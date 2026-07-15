@@ -72,6 +72,23 @@ def test_library_csv_content_bom_header_quoting(env):
     assert data["seed"] == ["x", "seed", "", ""]          # rel_path=None seed falls back cleanly
 
 
+def test_library_csv_neutralizes_formula_injection(env):
+    with env() as s:  # rel_path=None → artist/title come straight from the (attacker) tags
+        s.add(ServerTrack(user_id=1, artist_norm="x", title_norm="=cmd|' /C calc'!A0",
+                          rel_path=None))
+    rows = list(csv.reader(io.StringIO(exports.library_manifest_csv(1)[1:])))
+    assert rows[1][0] == "x"                        # safe cell untouched
+    assert rows[1][1] == "'=cmd|' /C calc'!A0"      # formula-leading title neutralized with a quote
+
+
+def test_csv_safe_guards_all_formula_leads():
+    for lead in ("=", "+", "-", "@", "\t", "\r"):
+        assert exports._csv_safe(f"{lead}x") == f"'{lead}x"
+    assert exports._csv_safe("normal") == "normal"
+    assert exports._csv_safe(None) == ""
+    assert exports._csv_safe(5) == "5"
+
+
 def test_library_row_count_matches_index(env):
     with env() as s:
         for i in range(5):
