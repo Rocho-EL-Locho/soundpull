@@ -1,6 +1,7 @@
 """Thin helpers around the webdav4 client (connection, listing, file operations)."""
 from __future__ import annotations
 
+import io
 import logging
 import posixpath
 import time
@@ -165,6 +166,26 @@ def download_file(client: Client, remote_path: str, local_path: Path) -> None:
     local.parent.mkdir(parents=True, exist_ok=True)
     retry_transient(lambda: client.download_file(remote_path, str(local)),
                     desc=f"download {remote_path!r}")
+
+
+def read_text(client: Client, remote_path: str, *, encoding: str = "utf-8") -> str:
+    """Download a small text file (e.g. an `.m3u8`) into memory and decode it (roadmap 04)."""
+    buf = io.BytesIO()
+    retry_transient(lambda: client.download_fileobj(remote_path, buf),
+                    desc=f"read {remote_path!r}")
+    return buf.getvalue().decode(encoding)
+
+
+def write_text(client: Client, remote_path: str, text: str, *, encoding: str = "utf-8") -> None:
+    """Upload `text` to `remote_path`, overwriting (roadmap 04 — playlist m3u repair).
+
+    Mirrors the in-memory upload frame `library_index` uses for `.lrc` sidecars
+    (`client.upload_fileobj(BytesIO(...), …, overwrite=True)`) — no temp file on disk.
+    """
+    retry_transient(
+        lambda: client.upload_fileobj(io.BytesIO(text.encode(encoding)), remote_path,
+                                      overwrite=True),
+        desc=f"write {remote_path!r}")
 
 
 def delete_path(client: Client, remote_path: str) -> None:

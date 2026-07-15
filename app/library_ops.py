@@ -79,11 +79,17 @@ def _load(user_id: int):
     return client, base, retention
 
 
-def _walk_all_files(client, path: str, depth: int = 0, max_depth: int = 10):
+def _walk_all_files(client, path: str, depth: int = 0, max_depth: int = 10,
+                    skip_cache_dirs: bool = False):
     """Yield every file path (any type, recursive, depth-bounded) under `path`.
 
     Unlike `library_index._walk_remote_files` this keeps NON-audio files too (`.lrc`,
     `.m3u8`, …) — the trash holds whatever was moved into it, not just audio.
+
+    `skip_cache_dirs` prunes the cache / internal-state subtrees `library_index._is_skippable_dir`
+    knows about (e.g. oCIS `__sized__`/`attachments` hash shards) — off by default so the trash
+    walk keeps its exact semantics, on for a whole-library scan (roadmap 04) that would otherwise
+    PROPFIND thousands of irrelevant folders.
     """
     try:
         entries = client.ls(path or "", detail=True)
@@ -99,8 +105,9 @@ def _walk_all_files(client, path: str, depth: int = 0, max_depth: int = 10):
         if not name or name == path.rstrip("/"):
             continue
         if entry.get("type") == "directory":
-            if depth < max_depth:
-                yield from _walk_all_files(client, name, depth + 1, max_depth)
+            if depth < max_depth and not (skip_cache_dirs
+                                          and library_index._is_skippable_dir(name)):
+                yield from _walk_all_files(client, name, depth + 1, max_depth, skip_cache_dirs)
         else:
             yield name
 
@@ -207,6 +214,45 @@ def move_track(user_id: int, src_rel: str, dst_rel: str) -> None:
 
     with session_scope() as session:
         library_index.update_rel_path(session, user_id, src, dst)
+
+
+_M3U_EXTS = (".m3u8", ".m3u")
+
+
+def list_playlist_files(user_id: int) -> list[str]:
+    """Every ``.m3u8``/``.m3u`` in the library, as paths relative to `webdav_folder` (roadmap 04).
+
+    The candidate set the duplicate finder rewrites when a trashed track was referenced by a
+    playlist (issue #31 cross-folder references). Uses the trash-aware `_walk_all_files` walker
+    (keeps non-audio files); the `.soundpull-trash` subtree lives under a dot-prefixed folder,
+    but that walker does not skip it — the caller only reads/edits *real* playlist folders, and
+    a stale trashed m3u is harmless to leave untouched.
+    """
+    client, base, _ = _load(user_id)
+    prefix = f"{base}/" if base else ""
+    out: list[str] = []
+    # skip_cache_dirs prunes cache/attachment shards AND the dot-prefixed `.soundpull-trash`
+    # subtree, so a trashed m3u is never picked up and huge cache trees aren't PROPFINDed.
+    for full in _walk_all_files(client, base, skip_cache_dirs=True):
+        if not full.lower().endswith(_M3U_EXTS):
+            continue
+        rel = full[len(prefix):] if prefix and full.startswith(prefix) else full
+        out.append(rel)
+    return out
+
+
+def read_library_text(user_id: int, rel_path: str) -> str:
+    """Download a small library text file (e.g. an `.m3u8`) and decode it (roadmap 04)."""
+    rel = resolve_rel(rel_path)
+    client, base, _ = _load(user_id)
+    return webdav_util.read_text(client, _join(base, rel))
+
+
+def write_library_text(user_id: int, rel_path: str, text: str) -> None:
+    """Overwrite a small library text file (roadmap 04 — playlist m3u repair)."""
+    rel = resolve_rel(rel_path)
+    client, base, _ = _load(user_id)
+    webdav_util.write_text(client, _join(base, rel), text)
 
 
 def list_trash(user_id: int) -> list[TrashEntry]:

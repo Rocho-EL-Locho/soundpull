@@ -393,6 +393,26 @@ def _walk_remote_files(client, path: str, depth: int, max_depth: int,
             yield name
 
 
+def iter_library_files(client, base: str, *, max_depth: int = 8,
+                       errors: list | None = None):
+    """Yield every audio file under `base` as a path **relative to `base`** (issue #04).
+
+    The reusable core of the WebDAV walk shared by `scan_webdav` (index reconciliation)
+    and the duplicate finder (roadmap 04). `base` is the user's `webdav_folder` (already
+    `strip("/")`-ed); each yielded `rel` is exactly the frame `scan_webdav` stores as
+    `ServerTrack.rel_path` and a playlist m3u references across folders (issue #31).
+
+    Semantics are inherited verbatim from `_walk_remote_files`: a failed *sub*-directory
+    listing is logged + appended to `errors` (when given) and skipped so one unreadable
+    folder can't abort the walk; a failure at the **root** propagates (unreachable target
+    is a hard failure, not a silent empty result — issue #38). Directory/skip/extension
+    rules are unchanged.
+    """
+    prefix = f"{base}/" if base else ""
+    for full in _walk_remote_files(client, base, depth=0, max_depth=max_depth, errors=errors):
+        yield full[len(prefix):] if prefix and full.startswith(prefix) else full
+
+
 def _walk_audio_with_lrc(client, path: str, depth: int, max_depth: int,
                          errors: list | None = None):
     """Like `_walk_remote_files`, but yields ``(audio_path, has_lrc)`` per audio file.
@@ -569,12 +589,10 @@ def scan_webdav(user_id: int, max_depth: int = 8) -> tuple[int, int, list]:
         base = (us.webdav_folder or "").strip("/")
 
     client = make_client(url, username, password)
-    prefix = f"{base}/" if base else ""
     pairs: list[tuple[str, str, str]] = []
     found_paths: set[str] = set()
     errors: list = []
-    for full in _walk_remote_files(client, base, depth=0, max_depth=max_depth, errors=errors):
-        rel = full[len(prefix):] if prefix and full.startswith(prefix) else full
+    for rel in iter_library_files(client, base, max_depth=max_depth, errors=errors):
         parts = [p for p in rel.split("/") if p]
         if not parts:
             continue
