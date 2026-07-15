@@ -14,6 +14,7 @@ from app.scheduler import start_scheduler, stop_scheduler
 
 # Page content builders, mounted client-side by the app-shell sub_pages router.
 from app.pages.duplicates import duplicates_content  # noqa: E402
+from app.pages.health import health_content  # noqa: E402
 from app.pages.history import history_content  # noqa: E402
 from app.pages.index import index_content  # noqa: E402
 from app.pages.library import library_content  # noqa: E402
@@ -71,6 +72,7 @@ _SUB_PAGES = {
     "/": index_content,
     "/library": library_content,
     "/duplicates": duplicates_content,
+    "/health": health_content,
     "/history": history_content,
     "/subscriptions": subscriptions_content,
     "/settings": settings_content,
@@ -80,6 +82,7 @@ _SUB_PAGES = {
 @ui.page("/")
 @ui.page("/library")
 @ui.page("/duplicates")
+@ui.page("/health")
 @ui.page("/history")
 @ui.page("/subscriptions")
 @ui.page("/settings")

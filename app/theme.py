@@ -40,6 +40,7 @@ _NAV_ITEMS = [
     ("nav.download", "/", "download", "download"),
     ("nav.library", "/library", "library", "library_music"),
     ("nav.duplicates", "/duplicates", "duplicates", "content_copy"),
+    ("nav.health", "/health", "health", "health_and_safety"),
     ("nav.history", "/history", "history", "history"),
     ("nav.subscriptions", "/subscriptions", "subscriptions", "sync"),
     ("nav.settings", "/settings", "settings", "settings"),

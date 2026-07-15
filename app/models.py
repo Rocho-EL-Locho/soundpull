@@ -240,3 +240,18 @@ class DuplicateReport(SQLModel, table=True):
     user_id: int = Field(foreign_key="user.id", index=True, unique=True)
     groups: str = Field(default="{}")          # JSON: {"exact": [...], "probable": [...]}
     created_at: datetime = Field(default_factory=_utcnow)
+
+
+class HealthReport(SQLModel, table=True):
+    """Latest library-health audit result for a user (roadmap 05).
+
+    One row per user (`user_id` unique), replaced/updated as checks run and fixes prune
+    findings — so the /health page can be left and re-opened without re-auditing. `findings`
+    is a JSON blob: ``{"cheap": [...], "deep": [...], "checked_albums": [...], "cheap_run_at": ...}``
+    (same opaque-JSON-string precedent as `DuplicateReport.groups`; (de)serialisation lives in
+    `app.health`). Additive table → auto-created by `init_db()`.
+    """
+    id: int | None = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id", index=True, unique=True)
+    findings: str = Field(default="{}")        # JSON (see class docstring)
+    created_at: datetime = Field(default_factory=_utcnow)
