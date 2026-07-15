@@ -163,6 +163,50 @@ def _suggest_mode_soundcloud(raw: str) -> str | None:
     return None
 
 
+def _matches_bandcamp(raw: str) -> bool:
+    """True only for http(s) URLs on a bandcamp.com host (roadmap 11).
+
+    Bandcamp gives every artist a subdomain (``<artist>.bandcamp.com``), so the match is a
+    SUFFIX check, not set membership: the host must equal ``bandcamp.com`` or end in
+    ``.bandcamp.com``. That rejects lookalikes safely — ``bandcamp.com.evil.com`` (ends in
+    ``.evil.com``) and ``evilbandcamp.com`` (no leading dot) both fail. Custom artist domains
+    (CNAMEs) are intentionally NOT matched this iteration (spec: host-based detection only).
+    """
+    try:
+        parsed = urlparse((raw or "").strip())
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").lower()
+    return host == "bandcamp.com" or host.endswith(".bandcamp.com")
+
+
+def _suggest_mode_bandcamp(raw: str) -> str | None:
+    """Best-guess download mode from a Bandcamp URL's shape (roadmap 11 spec table).
+
+    | URL shape                                   | mode      |
+    |---------------------------------------------|-----------|
+    | ``<artist>.bandcamp.com/track/<slug>``      | single    |
+    | ``<artist>.bandcamp.com/album/<slug>``      | album     |
+    | ``<artist>.bandcamp.com`` / ``…/music``     | artist    |
+    | anything else                               | None      |
+    """
+    try:
+        p = urlparse((raw or "").strip())
+    except ValueError:
+        return None
+    segs = [s for s in (p.path or "").split("/") if s]
+    if not segs or segs[0].lower() == "music":
+        return "artist"
+    kind = segs[0].lower()
+    if kind == "track":
+        return "single"
+    if kind == "album":
+        return "album"
+    return None
+
+
 YOUTUBE = SourceSpec(
     key="youtube",
     label="YouTube Music",
@@ -192,8 +236,25 @@ SOUNDCLOUD = SourceSpec(
     suggest_mode=_suggest_mode_soundcloud,
 )
 
+BANDCAMP = SourceSpec(
+    key="bandcamp",
+    label="Bandcamp",
+    # yt-dlp handles Bandcamp natively — no extractor-args, no PO tokens, no cookie plumbing.
+    extractor_args=None,
+    supports_cookies=False,
+    supports_pot=False,
+    supports_artist=True,
+    cover_square_crop=True,
+    # The page owner is the artist in the overwhelming case; a label selling third-party
+    # releases still carries a proper `artist` tag, which the credit-tag-first order in
+    # `_artist_credit_text` prefers — so trusting the uploader is safe (roadmap 11).
+    trust_uploader_as_artist=True,
+    matches=_matches_bandcamp,
+    suggest_mode=_suggest_mode_bandcamp,
+)
+
 # The registry. Detection walks it in order, first match wins.
-_REGISTRY: tuple[SourceSpec, ...] = (YOUTUBE, SOUNDCLOUD)
+_REGISTRY: tuple[SourceSpec, ...] = (YOUTUBE, SOUNDCLOUD, BANDCAMP)
 
 
 def detect_source(url: str) -> SourceSpec | None:

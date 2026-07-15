@@ -7,6 +7,7 @@ registry entry, and a non-YouTube source derives its own yt-dlp flags.
 import app.sources as sources
 from app.pipeline import _ALBUM_FLAGS, _apply_source
 from app.sources import (
+    BANDCAMP,
     SOUNDCLOUD,
     SourceSpec,
     YOUTUBE,
@@ -33,6 +34,8 @@ def test_detect_source_rejects_unknown_and_garbage():
     for url in (
         "https://youtube.com.evil.com/x",       # not a real youtube host
         "https://soundcloud.com.evil.com/x",    # not a real soundcloud host
+        "https://bandcamp.com.evil.com/x",      # bandcamp lookalike: ends in .evil.com
+        "https://evilbandcamp.com/x",           # bandcamp lookalike: no leading dot
         "https://evil.com/youtube.com",         # substring only
         "file:///etc/passwd",                   # wrong scheme
         "not a url at all",
@@ -40,6 +43,32 @@ def test_detect_source_rejects_unknown_and_garbage():
     ):
         assert detect_source(url) is None, url
         assert not is_supported_url(url)
+
+
+def test_detect_source_accepts_bandcamp_hosts():
+    # Every artist gets a <artist>.bandcamp.com subdomain; the bare apex also matches.
+    for url in (
+        "https://c418.bandcamp.com/album/minecraft-volume-alpha",
+        "https://c418.bandcamp.com/track/key",
+        "https://c418.bandcamp.com/music",
+        "https://c418.bandcamp.com",
+        "https://bandcamp.com",
+    ):
+        assert detect_source(url) is BANDCAMP, url
+    assert is_supported_url("https://c418.bandcamp.com/album/x")
+
+
+def test_suggest_mode_bandcamp_table():
+    cases = {
+        "https://c418.bandcamp.com/track/key": "single",
+        "https://c418.bandcamp.com/album/minecraft-volume-alpha": "album",
+        "https://c418.bandcamp.com/music": "artist",
+        "https://c418.bandcamp.com": "artist",
+        "https://c418.bandcamp.com/": "artist",
+        "https://c418.bandcamp.com/community": None,   # some other tab → no suggestion
+    }
+    for url, expected in cases.items():
+        assert suggest_mode(url) == expected, url
 
 
 def test_detect_source_accepts_soundcloud_hosts():

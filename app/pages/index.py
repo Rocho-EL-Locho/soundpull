@@ -13,7 +13,7 @@ from app.genres import DEFAULT_GENRE
 from app.i18n import audio_format_labels, genre_options, t
 from app.jobs import JobState, get_user_jobs, start_job, tag_options_from_settings
 from app.pipeline import is_supported_url, normalize_audio_format
-from app.sources import suggest_mode
+from app.sources import detect_source, suggest_mode
 from app.theme import tag_option_switches
 
 
@@ -156,6 +156,13 @@ def index_content(url: str = "") -> None:
                 audio_sel = ui.select(audio_format_labels(), value=d_audio) \
                     .props("outlined dense dark").classes("w-full")
 
+        # Bandcamp quality hint (roadmap 11): shown only when a Bandcamp URL is detected —
+        # its free streams are ~128 kbps MP3, so "Original" (remux) is the honest choice.
+        with ui.row().classes("w-full items-start gap-2") as bandcamp_hint:
+            ui.icon("info", size="18px").classes("text-amber-300/80 mt-0.5")
+            ui.label(t("index.bandcamp_hint")).classes("text-xs text-amber-200/80 flex-1")
+        bandcamp_hint.set_visibility(False)
+
         # Mode.
         with ui.column().classes("w-full gap-1.5"):
             _field_label(t("index.mode_label"))
@@ -230,11 +237,19 @@ def index_content(url: str = "") -> None:
             finally:
                 suppress["on"] = False
 
+        def _update_source_hint() -> None:
+            spec = detect_source(url_in.value or "")
+            bandcamp_hint.set_visibility(bool(spec and spec.key == "bandcamp"))
+
+        def _on_url_change() -> None:
+            _suggest_mode_from_url()
+            _update_source_hint()
+
         mode_tgl.on_value_change(lambda: _on_mode_change())
-        url_in.on_value_change(lambda: _suggest_mode_from_url())
+        url_in.on_value_change(lambda: _on_url_change())
         _select_dest(d_dest)  # sets initial card highlight + dedup visibility
         if (url or "").strip():
-            _suggest_mode_from_url()  # a prefilled ?url= gets its mode suggested once
+            _on_url_change()  # a prefilled ?url= gets its mode suggested + hint once
         _apply_artist_dedup_default()  # default artist mode to skip-existing on
 
         with ui.expansion(t("meta.heading"), icon="tune").classes("w-full glass rounded-lg") \

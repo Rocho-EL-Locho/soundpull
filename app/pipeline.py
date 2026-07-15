@@ -13,6 +13,7 @@ import posixpath
 import re
 import shutil
 import subprocess
+import threading
 import time
 import zipfile
 from collections import Counter
@@ -442,12 +443,13 @@ def _probe_meta(url: str, is_album: bool, cookiefile: str | None = None,
         entry = entries[0] if entries else info
     artist = (entry or {}).get("artist") or (entry or {}).get("uploader")
     album = (entry or {}).get("album")
-    # A SoundCloud set carries no per-track `album` tag, so the set's own title names the album
-    # (roadmap 06). Gated on the SOURCE (not just `is_album`): a YouTube playlist downloaded in
-    # album mode may also have a tag-less first track, and there the old `album=None` →
-    # "Unbekannt Album" must stand — folding in the playlist title would change YouTube tag
-    # output and break the byte-identical parity invariant. Only SoundCloud takes this fallback.
-    if is_album and not album and src.key == "soundcloud" and info and info.get("entries"):
+    # A SoundCloud set / Bandcamp release can carry no per-track `album` tag, so the item's own
+    # title names the album — a set/album playlist title, or (Bandcamp `/track/`) the standalone
+    # track's title, so it lands in its own folder instead of a shared "Unbekannt Album" (roadmap
+    # 06/11). Gated on the SOURCE (not just `is_album`): a YouTube playlist downloaded in album
+    # mode may also have a tag-less first track, and there the old `album=None` → "Unbekannt Album"
+    # must stand — folding in the title would change YouTube tag output and break parity.
+    if is_album and not album and src.key in ("soundcloud", "bandcamp"):
         album = info.get("title")
     return artist, album
 
@@ -563,6 +565,8 @@ def enumerate_artist(url: str, cookiefile: str | None = None,
 
     if src.key == "soundcloud":
         return _enumerate_artist_soundcloud(url, opts, limit)
+    if src.key == "bandcamp":
+        return _enumerate_artist_bandcamp(url, opts, limit)
 
     releases_url = url if url.rstrip("/").endswith("/releases") else None
     if releases_url is None:
@@ -643,6 +647,55 @@ def _enumerate_artist_soundcloud(url: str, opts: dict, limit: int) -> tuple[str,
     return artist, releases
 
 
+def _bandcamp_slug_title(release_url: str) -> str:
+    """Human-ish display title from a Bandcamp release URL (roadmap 11).
+
+    Flat enumeration of a Bandcamp ``/music`` page returns no per-entry title, so the last path
+    segment (``/album/minecraft-volume-alpha`` → "minecraft volume alpha") labels the release in
+    progress/logging. It is display-only — the real album name is recovered per-release from the
+    clean `album` tag at download time (the enumerator passes no forced album_name for Bandcamp).
+    """
+    slug = urlparse(release_url).path.rstrip("/").rsplit("/", 1)[-1]
+    return slug.replace("-", " ").replace("_", " ").strip() or "Release"
+
+
+def _enumerate_artist_bandcamp(url: str, opts: dict, limit: int) -> tuple[str, list[dict]]:
+    """Artist name + releases for a Bandcamp artist page (roadmap 11).
+
+    The artist's ``/music`` page lists every album and standalone track; a flat probe yields their
+    URLs (titles come back empty → derived from the slug for display only). The flat envelope only
+    carries the lowercase subdomain, so the real artist name is recovered by probing the first
+    release for its clean `artist`/`uploader` tag (one extra metadata call per run). Returns
+    ``(artist, [{title, url}])`` — each release self-names its album from its own metadata later.
+    """
+    p = urlparse(url)
+    music_url = f"{p.scheme}://{p.netloc}/music"
+    with yt_dlp.YoutubeDL(opts) as ydl:  # opts already carries extract_flat=True
+        info = ydl.extract_info(music_url, download=False) or {}
+
+    releases: list[dict] = []
+    seen: set[str] = set()
+    for entry in (info.get("entries") or []):
+        u = entry and entry.get("url")
+        if u and u not in seen:
+            seen.add(u)
+            releases.append({"title": entry.get("title") or _bandcamp_slug_title(u), "url": u})
+    if limit and limit > 0:
+        releases = releases[:limit]
+
+    artist = _UNKNOWN_ARTIST
+    if releases:
+        try:
+            with yt_dlp.YoutubeDL({**opts, "extract_flat": False, "playlist_items": "1"}) as ydl:
+                first = ydl.extract_info(releases[0]["url"], download=False) or {}
+            entries = [e for e in (first.get("entries") or [first]) if e]
+            probe = entries[0] if entries else first
+            artist = probe.get("artist") or probe.get("uploader") or _UNKNOWN_ARTIST
+        except Exception as exc:  # noqa: BLE001 - name is best-effort; crediting is casefold-tolerant
+            log.warning("bandcamp enumerate: artist-name probe failed: %s", exc)
+    return artist, releases
+
+
 def pick_square_cover(thumbnails: list[dict] | None) -> str | None:
     """Largest square thumbnail; prefer signed (sqp=) URLs (verbatim logic)."""
     signed_best = None
@@ -681,6 +734,26 @@ def _pick_soundcloud_cover(thumbnails: list[dict] | None) -> str | None:
         m = _SC_ART_SUFFIX.search(u)
         if m:
             return _SC_ART_SUFFIX.sub(f"-t500x500.{m.group(1)}", u)
+    return pick_square_cover(thumbnails)
+
+
+# Bandcamp artwork URLs carry a trailing size code, e.g. …/img/a1234567890_5.jpg (_10 = 1200px).
+_BC_ART_SIZE = re.compile(r"(_)\d+(\.(?:jpe?g|png))$", re.IGNORECASE)
+
+
+def _pick_bandcamp_cover(thumbnails: list[dict] | None) -> str | None:
+    """Best square Bandcamp cover URL (roadmap 11).
+
+    Bandcamp serves ONE thumbnail with no width/height, so `pick_square_cover` (which needs
+    `w == h > 0`) can't select it. Bandcamp art is square by design; the trailing ``_<n>`` size
+    code just picks a resolution, so we upgrade it to ``_10`` (1200×1200) — the largest standard
+    square — and let `_square_crop_jpeg` stay a no-op. Falls back to the generic picker if no
+    Bandcamp size code is present.
+    """
+    for t in thumbnails or []:
+        u = t.get("url") or ""
+        if _BC_ART_SIZE.search(u):
+            return _BC_ART_SIZE.sub(r"_10\2", u)
     return pick_square_cover(thumbnails)
 
 
@@ -739,8 +812,12 @@ def _fetch_cover(url: str, is_album: bool, dest: Path, cookiefile: str | None = 
         log.warning("cover probe failed: %s", exc)
         return None
     thumbnails = (data or {}).get("thumbnails")
-    cover_url = (_pick_soundcloud_cover(thumbnails) if src.key == "soundcloud"
-                 else pick_square_cover(thumbnails))
+    if src.key == "soundcloud":
+        cover_url = _pick_soundcloud_cover(thumbnails)
+    elif src.key == "bandcamp":
+        cover_url = _pick_bandcamp_cover(thumbnails)
+    else:
+        cover_url = pick_square_cover(thumbnails)
     if not cover_url:
         return None
     data_bytes = _download_cover(cover_url)
@@ -1444,7 +1521,8 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
                  album_name: str | None = None,
                  own_artist: str | None = None,
                  fetch_lyrics: bool = False,
-                 source: SourceSpec | None = None) -> Result:
+                 source: SourceSpec | None = None,
+                 reserve_folder: Callable[[str], str] | None = None) -> Result:
     """Execute one download end-to-end and return a Result.
 
     Both destinations stage into a temp work dir; then either a ZIP is packaged
@@ -1570,9 +1648,20 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
             # carry no per-track `album` tag, so `%(album)s` would resolve to "NA" and file the
             # whole set under Artist/NA/ — force the resolved set title (from `_probe_meta`) as the
             # folder instead. YouTube keeps `%(album)s` → byte-identical (its tracks always tag it).
-            force_album_folder = bool(album_name) or source_spec.key == "soundcloud"
+            # Bandcamp (roadmap 11) forces the folder too: its `album` tag IS clean, but a
+            # standalone `/track/` release carries none → forcing the resolved `album` keeps it out
+            # of an "NA" folder, and an album groups into one literal, traversal-safe segment.
+            force_album_folder = bool(album_name) or source_spec.key in ("soundcloud", "bandcamp")
             if is_album and force_album_folder:
                 subfolder = _safe_segment(album)
+                # In an artist run whose releases self-name their album (Bandcamp: no forced
+                # album_name), two releases can resolve to the SAME folder — a reissue/remaster or
+                # two same-titled EPs. `reserve_folder` atomically claims a unique folder name
+                # across the concurrent fan-out (append " (2)" …), so they don't clobber each
+                # other's cover / cross-tag. The album TAG stays `album` (clean) — only the folder
+                # is disambiguated. None (every direct download, YouTube/SoundCloud) → unchanged.
+                if reserve_folder is not None:
+                    subfolder = reserve_folder(subfolder)
             else:
                 subfolder = "%(album)s" if is_album else "Singles"
             out_tmpl = str(work_base / _safe_segment(primary_artist) / subfolder / "%(title)s.%(ext)s")
@@ -1894,6 +1983,28 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
         # stripped so the match targets the bare performer name.
         own_artist = artist.removesuffix(" - Topic").strip() if artist else ""
         own_artist = own_artist if own_artist and own_artist != _UNKNOWN_ARTIST else None
+        # Bandcamp (roadmap 11): the #56 credit filter is a YouTube-`/releases`-tab fix — its
+        # metadata is CLEAN and a Bandcamp page may be a LABEL hosting many artists. Forcing one
+        # `own_artist` would wrongly drop every release by a different performer and mis-file the
+        # survivors under that one name. So skip it: each release tags itself from its own clean
+        # `artist`/`album` metadata (the credit-tag-first order the spec calls for), and dedup
+        # (`on_server`) still works per-track.
+        if source_spec.key == "bandcamp":
+            own_artist = None
+
+        # Bandcamp releases self-name their album (no forced album_name), so two could resolve to
+        # the same folder — claim a unique one per release across the concurrent fan-out.
+        _folder_lock = threading.Lock()
+        _claimed_folders: set[str] = set()
+
+        def _reserve_folder(name: str) -> str:
+            with _folder_lock:
+                candidate, n = name, 1
+                while candidate in _claimed_folders:
+                    n += 1
+                    candidate = f"{name} ({n})"
+                _claimed_folders.add(candidate)
+                return candidate
 
         # Per-release reporter: forward track/meta to the outer reporter, but swallow phase
         # changes — the orchestrator owns the macro phase (so sub-albums don't flip it). With a
@@ -1910,13 +2021,23 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
         # and independent of completion order: two releases can share a title (a reissue, a
         # re-released single) and would otherwise stage into the SAME `Artist/<title>/` folder,
         # clobbering each other's cover / re-tagging each other's tracks.
+        # Each entry is (index, release, display_label, forced_album_name). For most sources the
+        # enumerated release title IS the album name, so it doubles as the forced folder/tag name.
+        # Bandcamp (roadmap 11) is the exception: flat enumeration gives no title, so the release
+        # dict carries only a slug-derived label — the clean per-track `album` tag names each
+        # release itself (forced_album_name=None → run_download probes it), so the slug never
+        # pollutes the tag. Folder collisions between same-titled Bandcamp releases are handled at
+        # download time by `_reserve_folder`, not by this title counter.
         used_titles: dict[str, int] = {}
-        planned: list[tuple[int, dict, str]] = []
+        planned: list[tuple[int, dict, str, str | None]] = []
         for i, rel in enumerate(releases, 1):
-            base = rel["title"]
+            base = rel["title"] or f"Release {i}"
+            if source_spec.key == "bandcamp":
+                planned.append((i, rel, base, None))
+                continue
             used_titles[base] = used_titles.get(base, 0) + 1
             album_name = base if used_titles[base] == 1 else f"{base} ({used_titles[base]})"
-            planned.append((i, rel, album_name))
+            planned.append((i, rel, album_name, album_name))
 
         delivered_all: list = []
         new_count = 0
@@ -1927,6 +2048,10 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
         reporter.on_phase("download")
         reporter.on_album(0, total, "")   # publish the album total before fan-out
 
+        # A release that self-names its album (album_name=None → Bandcamp) claims a unique staging
+        # folder so same-titled releases don't collide; a forced album_name is already unique.
+        reserve = _reserve_folder if source_spec.key == "bandcamp" else None
+
         def _stage_release(i: int, rel: dict, album_name: str) -> Result:
             return run_download(job_id=f"{job_id}.{i}", url=rel["url"], genre=genre,
                                 mode="album", destination=destination, reporter=album_reporter,
@@ -1934,14 +2059,14 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
                                 cookies_txt=cookies_txt, on_server=on_server,
                                 stage_dir=work_base, deliver=False, album_name=album_name,
                                 own_artist=own_artist, fetch_lyrics=fetch_lyrics,
-                                source=source_spec)
+                                source=source_spec, reserve_folder=reserve)
 
         # Fan out into up to `album_concurrency` parallel album downloads; results are aggregated
         # here in the calling thread (as_completed yields in this thread), so no locking is needed.
         workers = max(1, min(album_concurrency, total))
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_stage_release, i, rel, name): name
-                       for (i, rel, name) in planned}
+            futures = {pool.submit(_stage_release, i, rel, album_name): label
+                       for (i, rel, label, album_name) in planned}
             for fut in as_completed(futures):
                 album_name = futures[fut]
                 done += 1
