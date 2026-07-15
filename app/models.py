@@ -225,3 +225,18 @@ class PlaylistSubscription(SQLModel, table=True):
     last_new_count: int = 0                    # tracks added by the last sync
 
     created_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
+class DuplicateReport(SQLModel, table=True):
+    """Latest duplicate-finder analysis result for a user (roadmap 04).
+
+    One row per user (`user_id` unique), replaced on each re-run, so the review page can
+    be left and re-opened without re-scanning. `groups` is a JSON blob of the exact +
+    probable duplicate groups (same precedent as `PlaylistSubscription.playlist_files`:
+    an opaque JSON string in a TEXT column; the (de)serialisation lives in
+    `app.duplicates`). Additive table → auto-created by `init_db()`.
+    """
+    id: int | None = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id", index=True, unique=True)
+    groups: str = Field(default="{}")          # JSON: {"exact": [...], "probable": [...]}
+    created_at: datetime = Field(default_factory=_utcnow)

@@ -135,7 +135,7 @@ Track progress by checking items off here when the PR is merged:
 
 - [x] 01 WebDAV file operations + trash
 - [x] 02 Multi-source architecture
-- [ ] 03 Library browser
+- [x] 03 Library browser
 - [ ] 04 Duplicate finder & cleanup
 - [ ] 05 Library health check
 - [ ] 06 SoundCloud support
