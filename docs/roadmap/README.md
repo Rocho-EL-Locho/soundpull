@@ -144,7 +144,7 @@ Track progress by checking items off here when the PR is merged:
 - [ ] 09 Configurable tagging rules
 - [ ] 10 Statistics dashboard
 - [ ] 11 Bandcamp support
-- [ ] 12 Batch import from track list
+- [x] 12 Batch import from track list
 - [ ] 13 Spotify / Apple Music playlist import
 - [ ] 14 Track selection before download
 - [ ] 15 Job queue control (cancel / reorder)
