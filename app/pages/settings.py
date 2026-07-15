@@ -1,6 +1,7 @@
 """Settings page: per-user defaults, WebDAV target, and the bookmarklet."""
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
 
@@ -501,6 +502,77 @@ def settings_content() -> None:
 
         ui.button(t("settings.save_button"), icon="save", on_click=save) \
             .props("unelevated").classes("accent-grad text-white hover-glow self-end px-6")
+
+    # Export & backup (roadmap 17): a user's own data out as browser downloads + settings re-import.
+    from app import exports
+
+    with ui.card().classes("glass w-full rounded-2xl p-6 gap-3"):
+        ui.label(t("settings.export_title")).classes("text-lg font-semibold")
+        ui.label(t("settings.export_desc")).classes("text-xs text-white/60")
+
+        async def _download(fn, kind: str, ext: str, media: str) -> None:
+            data = await run.io_bound(fn, uid)
+            stamp = datetime.now().strftime("%Y-%m-%d")
+            ui.download.content(data.encode("utf-8"), f"soundpull-{kind}-{stamp}.{ext}", media)
+
+        with ui.row().classes("flex-wrap gap-2"):
+            ui.button(t("settings.export_library_csv"), icon="table_view",
+                      on_click=lambda: _download(exports.library_manifest_csv, "library", "csv",
+                                                 "text/csv")).props("outline").classes("text-white/90")
+            ui.button(t("settings.export_library_json"), icon="data_object",
+                      on_click=lambda: _download(exports.library_manifest_json, "library", "json",
+                                                 "application/json")).props("outline") \
+                .classes("text-white/90")
+            ui.button(t("settings.export_history_csv"), icon="history",
+                      on_click=lambda: _download(exports.history_csv, "history", "csv",
+                                                 "text/csv")).props("outline").classes("text-white/90")
+            ui.button(t("settings.export_settings_json"), icon="tune",
+                      on_click=lambda: _download(exports.settings_json, "settings", "json",
+                                                 "application/json")).props("outline") \
+                .classes("text-white/90")
+
+        ui.label(t("settings.import_settings")).classes("text-sm font-semibold pt-2")
+
+        def _confirm_import(payload: str) -> None:
+            try:
+                data = json.loads(payload)
+                keys = sorted(k for k in data if k in exports._FIELD_KINDS) \
+                    if isinstance(data, dict) else []
+            except (ValueError, TypeError):
+                keys = []
+            dialog = ui.dialog()
+            with dialog, ui.card().classes("glass w-full max-w-md rounded-2xl p-4 gap-2"):
+                ui.label(t("settings.import_confirm_title")).classes("font-semibold")
+                ui.label(t("settings.import_confirm_body", count=len(keys))).classes(
+                    "text-sm text-white/70")
+                if keys:
+                    ui.label(", ".join(keys)).classes("text-xs text-white/50 break-all")
+                ui.label(t("settings.import_secrets_note")).classes("text-xs text-amber-300 pt-1")
+
+                async def confirm() -> None:
+                    dialog.close()
+                    res = await run.io_bound(exports.apply_settings_json, uid, payload)
+                    ui.notify(t("settings.import_done", applied=len(res.applied),
+                                skipped=len(res.skipped)),
+                              type="positive" if res.applied else "warning")
+                    ui.navigate.reload()  # re-render every widget from the freshly-written DB
+
+                with ui.row().classes("w-full justify-end gap-2 pt-2"):
+                    ui.button(t("settings.cancel"), on_click=dialog.close).props("flat")
+                    ui.button(t("settings.import_button"), icon="upload",
+                              on_click=confirm).classes("accent-grad text-white")
+            dialog.open()
+
+        async def _on_upload(e) -> None:
+            try:
+                payload = await e.file.text()
+            except Exception as exc:  # noqa: BLE001 - surface a bad/oversized upload to the user
+                ui.notify(t("settings.import_error", error=exc), type="negative")
+                return
+            _confirm_import(payload)
+
+        ui.upload(on_upload=_on_upload, auto_upload=True, max_files=1, max_file_size=1_000_000) \
+            .props("accept=.json flat dense").classes("w-full")
 
     # Bookmarklet — dragging a javascript: link is blocked in many browsers,
     # so the reliable path is: copy the code, create a bookmark, paste as URL.
