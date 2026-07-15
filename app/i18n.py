@@ -253,6 +253,22 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "settings.lyrics_desc": "Lädt — soweit vorhanden — synchronisierten Liedtext von "
                                 "LRCLIB und legt pro Titel eine .lrc-Datei daneben ab, die "
                                 "Navidrome anzeigt. Ohne Treffer wird der Titel übersprungen.",
+        # Export & Backup (roadmap 17)
+        "settings.export_title": "Export & Backup",
+        "settings.export_desc": "Lade deine Daten als Dateien herunter (nur deine eigenen, "
+                                "ohne Passwörter/Secrets) — als Versicherung und für den Umzug.",
+        "settings.export_library_csv": "Bibliothek (CSV)",
+        "settings.export_library_json": "Bibliothek (JSON)",
+        "settings.export_history_csv": "Verlauf (CSV)",
+        "settings.export_settings_json": "Einstellungen (JSON)",
+        "settings.import_settings": "Einstellungen importieren",
+        "settings.import_confirm_title": "Einstellungen übernehmen?",
+        "settings.import_confirm_body": "{count} Feld(er) werden überschrieben.",
+        "settings.import_secrets_note": "Secrets (Passwörter, Token, Cookies) werden NICHT "
+                                        "importiert und müssen danach neu eingegeben werden.",
+        "settings.import_done": "{applied} übernommen, {skipped} übersprungen.",
+        "settings.import_error": "Import fehlgeschlagen: {error}",
+        "settings.import_button": "Übernehmen",
         "index.lyrics_label": "Liedtext (.lrc) laden",
         # Bibliothek (roadmap 03)
         "library.heading": "Bibliothek",
@@ -664,6 +680,22 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "settings.lyrics_desc": "When available, fetch synced lyrics from LRCLIB and drop a "
                                 ".lrc file next to each track for Navidrome to display. Tracks "
                                 "with no match are simply skipped.",
+        # Export & backup (roadmap 17)
+        "settings.export_title": "Export & backup",
+        "settings.export_desc": "Download your data as files (your own only, without "
+                                "passwords/secrets) — as insurance and for migration.",
+        "settings.export_library_csv": "Library (CSV)",
+        "settings.export_library_json": "Library (JSON)",
+        "settings.export_history_csv": "History (CSV)",
+        "settings.export_settings_json": "Settings (JSON)",
+        "settings.import_settings": "Import settings",
+        "settings.import_confirm_title": "Apply settings?",
+        "settings.import_confirm_body": "{count} field(s) will be overwritten.",
+        "settings.import_secrets_note": "Secrets (passwords, tokens, cookies) are NOT imported "
+                                        "and must be re-entered afterwards.",
+        "settings.import_done": "{applied} applied, {skipped} skipped.",
+        "settings.import_error": "Import failed: {error}",
+        "settings.import_button": "Apply",
         "index.lyrics_label": "Fetch lyrics (.lrc)",
         # Library (roadmap 03)
         "library.heading": "Library",
