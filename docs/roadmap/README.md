@@ -138,7 +138,7 @@ Track progress by checking items off here when the PR is merged:
 - [x] 03 Library browser
 - [x] 04 Duplicate finder & cleanup
 - [x] 05 Library health check
-- [ ] 06 SoundCloud support
+- [x] 06 SoundCloud support
 - [x] 07 In-app YouTube Music search
 - [ ] 08 Artist watch & discography gaps
 - [ ] 09 Configurable tagging rules
