@@ -269,3 +269,89 @@ def test_run_scan_sync_releases_slot_on_error(monkeypatch):
     except RuntimeError:
         pass
     assert not jobs.is_scan_running(7)           # slot released even when the scan raised
+
+
+# --- batch import (roadmap 12) ---------------------------------------------
+
+def test_run_batch_download_aggregates_counts_and_skips_failures(monkeypatch, tmp_path):
+    """One bad item is skipped (folded into failed), the rest deliver into one zip."""
+    from app import pipeline
+    from app.pipeline import Destination, Reporter, Result
+
+    seen = []
+
+    def fake_run_download(*, job_id, url, stage_dir, **kw):
+        seen.append(url)
+        if url == "bad":
+            raise RuntimeError("unavailable")
+        (stage_dir / f"{url}.mp3").write_bytes(b"x")   # stage a real file so zip/any-file passes
+        return Result(new_track_count=1, expected_count=1, failed_count=0,
+                      delivered=[("A", url, f"{url}.mp3")])
+
+    monkeypatch.setattr(pipeline, "run_download", fake_run_download)
+    calls = {"track": []}
+    rep = Reporter(on_phase=lambda p: None, on_meta=lambda a, b: None,
+                   on_track=lambda c, t: calls["track"].append((c, t)))
+
+    res = pipeline.run_batch_download(job_id="test-batch-agg", urls=["a", "bad", "c"],
+                                      genre="Rap", destination=Destination(type="browser"),
+                                      reporter=rep)
+
+    assert seen == ["a", "bad", "c"]
+    assert res.new_track_count == 2                 # two good items delivered
+    assert res.expected_count == 3 and res.failed_count == 1   # the raised item counts as failed
+    assert res.zip_path and res.zip_name == "Import.zip"
+    assert calls["track"][-1] == (3, 3)             # progress reached total
+    # `_delivery_warning` then surfaces "1 von 3".
+    assert _delivery_warning(res) == (_PARTIAL_KEY, 3, 1)
+
+
+@contextmanager
+def _noop():
+    yield
+
+
+def test_start_batch_writes_one_history_row_and_runs_inline(monkeypatch):
+    import json
+
+    import app.db
+    import app.models  # noqa: F401
+    from sqlalchemy.pool import StaticPool
+    from sqlmodel import Session, SQLModel, create_engine, select
+    from app.models import DownloadHistory, UserSettings
+    from app.pipeline import Result
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False},
+                           poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as s:
+        s.add(UserSettings(user_id=1))
+        s.commit()
+
+    @contextmanager
+    def scope():
+        sess = Session(engine)
+        try:
+            yield sess
+            sess.commit()
+        finally:
+            sess.close()
+
+    monkeypatch.setattr(app.db, "session_scope", scope)
+    monkeypatch.setattr(jobs, "session_scope", scope)
+    # Run the worker inline instead of on the pool, and stub the actual download.
+    monkeypatch.setattr(jobs._executor, "submit", lambda fn, *a: fn(*a))
+    monkeypatch.setattr(jobs, "run_batch_download",
+                        lambda **kw: Result(summary="Import.zip", new_track_count=2,
+                                            expected_count=2, failed_count=0))
+
+    items = ["https://music.youtube.com/watch?v=a", "https://music.youtube.com/watch?v=b"]
+    job_id = jobs.start_batch(user_id=1, items=items, genre="Rap", destination_type="browser")
+
+    with scope() as s:
+        row = s.get(DownloadHistory, job_id)
+        assert row.mode == "batch"
+        assert json.loads(row.batch_urls) == items          # retryable
+        assert row.phase == "done"
+    js = jobs.get_job(job_id)
+    assert js.mode == "batch" and js.total_tracks == 2 and js.failed_tracks == 0

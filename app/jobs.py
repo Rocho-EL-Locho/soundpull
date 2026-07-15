@@ -27,8 +27,9 @@ from app.fix_music_tags import TAG_OPTION_FIELDS, TagOptions
 from app.models import DownloadHistory, PlaylistSubscription, UserSettings
 from app.pipeline import (
     DEFAULT_AUDIO_FORMAT, Destination, Reporter, normalize_audio_format, run_artist_download,
-    run_download,
+    run_batch_download, run_download,
 )
+from app.sources import is_supported_url
 from app.security import decrypt_secret
 
 log = logging.getLogger("jobs")
@@ -360,6 +361,52 @@ def _run(job_id: str, url: str, genre: str, mode: str, destination: Destination,
             c, kind="download", url=url, error=err))
 
 
+def _run_batch(job_id: str, urls: list[str], genre: str, destination: Destination,
+               audio_format: str, tag_options: TagOptions, cookies_txt: str | None,
+               dedup: bool = False, fetch_lyrics: bool = False) -> None:
+    js = _registry[job_id]
+    reporter = _make_reporter(job_id, js)   # on_track drives the batch-level i/N bar
+    try:
+        # Dedup (issue #31): skip tracks already in the library — WebDAV only, same as `_run`.
+        on_server = None
+        if dedup and destination.type == "webdav":
+            with session_scope() as session:
+                paths = library_index.load_index_paths(session, js.user_id)
+            on_server = lambda a, t: library_index.track_key(t, a) in paths  # noqa: E731
+
+        result = run_batch_download(job_id=job_id, urls=urls, genre=genre,
+                                    destination=destination, reporter=reporter,
+                                    audio_format=audio_format, tag_options=tag_options,
+                                    cookies_txt=cookies_txt, on_server=on_server,
+                                    fetch_lyrics=fetch_lyrics)
+        indexed = True
+        if destination.type == "webdav" and result.delivered:
+            indexed = _record_delivered_safe(job_id, js.user_id, result.delivered)
+        warning, total, failed = _delivery_warning(result, indexed)
+        with _lock:
+            js.phase, js.finished_at = "done", _utcnow()
+            js.result_path = result.zip_path
+            js.result_name = result.zip_name
+            js.summary = result.summary
+            js.warning = warning
+            js.failed_tracks = failed
+            if total:
+                js.total_tracks = total
+        _persist(job_id, phase="done", finished_at=js.finished_at, warning=warning,
+                 artist=js.artist, album=js.album, failed_tracks=failed,
+                 current_track=js.current_track, total_tracks=js.total_tracks)
+        _log_event(js, f"done, {failed}/{total} missing" if failed else "done")
+    except Exception as exc:  # noqa: BLE001 - surface any failure to the user
+        log.exception("batch download %s failed", job_id)
+        err = _clean_error(exc)
+        with _lock:
+            js.phase, js.error, js.finished_at = "error", err, _utcnow()
+        _persist(job_id, phase="error", error=err, finished_at=js.finished_at)
+        _log_event(js, f"error: {err}")
+        _notify_safe(js.user_id, lambda c: notifications.notify_error(
+            c, kind="download", url=f"Batch-Import ({len(urls)})", error=err))
+
+
 def start_job(*, user_id: int, url: str, genre: str, mode: str, destination_type: str,
               audio_format: str = DEFAULT_AUDIO_FORMAT,
               tag_options: TagOptions | None = None, dedup: bool = False,
@@ -413,6 +460,58 @@ def start_job(*, user_id: int, url: str, genre: str, mode: str, destination_type
     else:
         _executor.submit(_run, job_id, url, genre, mode, destination, audio_format,
                          tag_options, cookies_txt, dedup, fetch_lyrics)
+    return job_id
+
+
+def start_batch(*, user_id: int, items: list[str], genre: str, destination_type: str,
+                audio_format: str = DEFAULT_AUDIO_FORMAT,
+                tag_options: TagOptions | None = None, dedup: bool = False,
+                fetch_lyrics: bool = False) -> str:
+    """Queue a batch import (roadmap 12): download `items` (single-track URLs) as ONE job.
+
+    Mirrors `start_job` but fans out into `mode="single"` downloads under one job id + one
+    `DownloadHistory` row (`mode="batch"`, `total_tracks=len(items)`), storing the URL list in
+    `batch_urls` so the row is retryable. Returns the job id; raises on bad config (no WebDAV target).
+    """
+    job_id = uuid.uuid4().hex
+    audio_format = normalize_audio_format(audio_format)
+    # Defense-in-depth: only download URLs a registered source handles (mirrors the single-download
+    # `is_supported_url` gate). Batch URLs come from our own search results today, but this keeps the
+    # batch path consistent and safe if a future caller (feature 13) feeds it arbitrary URLs.
+    items = [u for u in items if is_supported_url(u)]
+    if not items:
+        raise ValueError("Keine gültigen Titel-URLs für den Import.")
+    label = f"Batch-Import ({len(items)})"
+
+    with session_scope() as session:
+        us = session.exec(select(UserSettings).where(UserSettings.user_id == user_id)).first()
+        destination = Destination(type=destination_type)
+        if destination_type == "webdav":
+            if not us or not us.webdav_url:
+                raise ValueError("Kein WebDAV-Ziel im Profil hinterlegt.")
+            destination.webdav_url = us.webdav_url
+            destination.webdav_folder = us.webdav_folder
+            destination.webdav_username = us.webdav_username
+            destination.webdav_password = (
+                decrypt_secret(us.webdav_password_enc) if us.webdav_password_enc else None
+            )
+        cookies_txt = decrypt_secret(us.youtube_cookies_enc) if us and us.youtube_cookies_enc else None
+        if tag_options is None:
+            tag_options = tag_options_from_settings(us)
+        session.add(DownloadHistory(
+            id=job_id, user_id=user_id, url=label, genre=genre, mode="batch",
+            audio_format=audio_format, destination_type=destination_type, phase="queued",
+            batch_urls=json.dumps(items),
+        ))
+
+    js = JobState(id=job_id, user_id=user_id, url=label, genre=genre, mode="batch",
+                  destination_type=destination_type, audio_format=audio_format,
+                  tag_options=tag_options, total_tracks=len(items))
+    with _lock:
+        _registry[job_id] = js
+    _log_event(js, "queued")
+    _executor.submit(_run_batch, job_id, items, genre, destination, audio_format,
+                     tag_options, cookies_txt, dedup, fetch_lyrics)
     return job_id
 
 

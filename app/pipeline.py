@@ -1825,3 +1825,90 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
         shutil.rmtree(work_base, ignore_errors=True)
         if cookie_path:
             cookie_path.unlink(missing_ok=True)
+
+
+def run_batch_download(*, job_id: str, urls: list[str], genre: str, destination: Destination,
+                       reporter: Reporter, audio_format: str = DEFAULT_AUDIO_FORMAT,
+                       tag_options: fix_music_tags.TagOptions = fix_music_tags.TagOptions(),
+                       cookies_txt: str | None = None,
+                       on_server: Callable[[str, str], bool] | None = None,
+                       fetch_lyrics: bool = False) -> Result:
+    """Download a list of individual track URLs as ONE job (roadmap 12 batch import).
+
+    Structurally the artist run (`run_artist_download`) with a GIVEN url list instead of an
+    enumerated discography: each url is staged through the ordinary single path
+    (`run_download(mode="single", …)`) into ONE shared work dir — so the download + tag logic (and
+    its metadata parity) is reused verbatim — then the whole tree is delivered ONCE (WebDAV upload
+    or a single browser ZIP). `on_server` (dedup, issue #31) is passed through so an already-present
+    track is a cheap skip even if left checked. One failing item is logged and skipped, never
+    aborting the batch; progress is a completion count so the bar stays monotonic.
+    """
+    work_base = _WORK_ROOT / job_id
+    cookie_path = _write_cookie_file(job_id, cookies_txt)
+    source_spec = None  # let each single detect its own source (all YouTube today)
+    try:
+        work_base.mkdir(parents=True, exist_ok=True)
+        total = len(urls)
+        # Per-item reporter: forward the current track's artist/title to the card, but swallow phase
+        # (the orchestrator owns the macro phase) and the per-single 1/1 track bar (we drive the
+        # batch-level i/N bar from the loop below).
+        item_reporter = Reporter(on_phase=lambda phase: None, on_meta=reporter.on_meta,
+                                 on_track=lambda cur, tot: None)
+        delivered_all: list = []
+        new_count = expected_all = failed_all = 0
+        failed: list[str] = []
+        done = 0
+        reporter.on_phase("download")
+        reporter.on_track(0, total)   # publish the item total before the loop
+
+        for i, item in enumerate(urls, 1):
+            try:
+                sub = run_download(job_id=f"{job_id}.{i}", url=item, genre=genre, mode="single",
+                                   destination=destination, reporter=item_reporter,
+                                   audio_format=audio_format, tag_options=tag_options,
+                                   cookies_txt=cookies_txt, on_server=on_server,
+                                   stage_dir=work_base, deliver=False, fetch_lyrics=fetch_lyrics,
+                                   source=source_spec)
+                delivered_all += sub.delivered
+                new_count += sub.new_track_count
+                expected_all += sub.expected_count
+                failed_all += sub.failed_count
+            except Exception:  # noqa: BLE001 - one bad item must not abort the whole batch
+                log.exception("batch item failed: %s", item)
+                failed.append(item)
+            done += 1
+            reporter.on_track(done, total)
+
+        # A failed item may have left download artifacts behind; never ship those partials.
+        for tmp in (*work_base.rglob("*.part"), *work_base.rglob("*.ytdl")):
+            tmp.unlink(missing_ok=True)
+
+        if not any(p.is_file() for p in work_base.rglob("*")):
+            if failed and not delivered_all:
+                raise RuntimeError(f"Keine Titel konnten geladen werden ({len(failed)} fehlgeschlagen).")
+            return Result(summary="Keine neuen Titel", new_track_count=0)
+
+        # An item that raised outright (unavailable/blocked) is a failed track too — fold it into
+        # the expected/failed totals so the "k von N" partial-delivery warning counts it, not just
+        # the summary note (each batch item is exactly one track).
+        expected_total = expected_all + len(failed)
+        failed_total = failed_all + len(failed)
+        note = f" ({len(failed)} fehlgeschlagen)" if failed else ""
+        if destination.type == "webdav":
+            reporter.on_phase("upload")
+            upload_failed = _upload_tree(destination, work_base) or []
+            return Result(summary=f"WebDAV: {new_count} Titel{note}",
+                          delivered=delivered_all, new_track_count=new_count,
+                          expected_count=expected_total, failed_count=failed_total,
+                          upload_failed_count=len(upload_failed))
+
+        reporter.on_phase("packaging")
+        zip_path = _WORK_ROOT / f"{job_id}.zip"
+        _zip_dir(work_base, zip_path, "Import")
+        return Result(summary=f"Import.zip{note}", zip_path=str(zip_path), zip_name="Import.zip",
+                      delivered=delivered_all, new_track_count=new_count,
+                      expected_count=expected_total, failed_count=failed_total)
+    finally:
+        shutil.rmtree(work_base, ignore_errors=True)
+        if cookie_path:
+            cookie_path.unlink(missing_ok=True)
