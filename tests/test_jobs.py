@@ -285,7 +285,9 @@ def test_run_batch_download_aggregates_counts_and_skips_failures(monkeypatch, tm
         if url == "bad":
             raise RuntimeError("unavailable")
         (stage_dir / f"{url}.mp3").write_bytes(b"x")   # stage a real file so zip/any-file passes
-        return Result(new_track_count=1, expected_count=1, failed_count=0,
+        # A browser single reports expected_count=0 (no dedup match-filter) — the batch total must
+        # still come out as delivered+failed, not from expected_count.
+        return Result(new_track_count=1, expected_count=0, failed_count=0,
                       delivered=[("A", url, f"{url}.mp3")])
 
     monkeypatch.setattr(pipeline, "run_download", fake_run_download)

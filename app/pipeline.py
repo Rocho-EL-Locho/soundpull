@@ -1889,10 +1889,13 @@ def run_batch_download(*, job_id: str, urls: list[str], genre: str, destination:
             return Result(summary="Keine neuen Titel", new_track_count=0)
 
         # An item that raised outright (unavailable/blocked) is a failed track too — fold it into
-        # the expected/failed totals so the "k von N" partial-delivery warning counts it, not just
-        # the summary note (each batch item is exactly one track).
-        expected_total = expected_all + len(failed)
+        # the failed total so the "k von N" partial-delivery warning counts it, not just the summary
+        # note (each batch item is exactly one track). The TOTAL is delivered + failed = items
+        # actually attempted (dedup-skips excluded): a single-mode run only reports `expected_count`
+        # when dedup is active, so `expected_all` is 0 for a browser batch — derive it from
+        # `new_count` instead so the total is right for both destinations.
         failed_total = failed_all + len(failed)
+        expected_total = new_count + failed_total
         note = f" ({len(failed)} fehlgeschlagen)" if failed else ""
         if destination.type == "webdav":
             reporter.on_phase("upload")
