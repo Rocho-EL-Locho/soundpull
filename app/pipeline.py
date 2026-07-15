@@ -265,6 +265,20 @@ class Destination:
     webdav_password: str | None = None  # decrypted
 
 
+@dataclass(frozen=True)
+class PlaylistSpec:
+    """A source playlist to recreate as an `.m3u8` after a batch import (roadmap 13).
+
+    `tracks` is the FULL ordered source tracklist (artist, title); after the batch downloads the
+    selected URLs, the m3u references each track's file — freshly delivered or already on the server
+    — as a cross-folder relative path, preserving source order. `folder_id` (`import-<hash>`) makes
+    the delivery folder stable per source playlist. WebDAV only (references need library paths).
+    """
+    name: str
+    folder_id: str
+    tracks: list[tuple[str, str]]
+
+
 @dataclass
 class Result:
     summary: str = ""
@@ -1827,12 +1841,49 @@ def run_artist_download(*, job_id: str, url: str, genre: str, destination: Desti
             cookie_path.unlink(missing_ok=True)
 
 
+def _write_import_m3u(work_base: Path, spec: "PlaylistSpec", delivered: list,
+                      index_paths: dict) -> None:
+    """Write the recreated source playlist as `<name> [import-<hash>]/<name>.m3u8` (roadmap 13).
+
+    Each source track resolves to a library-relative `rel_path` — from what this run delivered (wins)
+    or, for a track already on the server, from the index — and becomes a cross-folder relative
+    reference (`posixpath.relpath`), so the playlist points at the real artist/album files with no
+    duplicated audio. Source order is preserved via a monotonic `index`. Tracks that resolve to
+    nothing (unmatched/failed) are simply absent. Writes nothing if no track resolves.
+    """
+    from app.library_index import track_key
+
+    resolved: dict = {}
+    for k, rel in (index_paths or {}).items():
+        if rel:
+            resolved[k] = rel
+    for artist, title, rel in delivered:      # a freshly-delivered copy wins over the index path
+        if rel:
+            resolved[track_key(title, artist)] = rel
+
+    folder_seg = _playlist_folder_name(spec.name, spec.folder_id)
+    entries: list[dict] = []
+    for i, (artist, title) in enumerate(spec.tracks):
+        rel = resolved.get(track_key(title, artist))
+        if not rel:
+            continue
+        entries.append({"index": i, "name": posixpath.relpath(rel, folder_seg),
+                        "title": title, "artist": artist, "dur": -1})
+    if not entries:
+        return
+    import_dir = work_base / folder_seg
+    import_dir.mkdir(parents=True, exist_ok=True)
+    _write_m3u_entries(import_dir, spec.name, entries)
+
+
 def run_batch_download(*, job_id: str, urls: list[str], genre: str, destination: Destination,
                        reporter: Reporter, audio_format: str = DEFAULT_AUDIO_FORMAT,
                        tag_options: fix_music_tags.TagOptions = fix_music_tags.TagOptions(),
                        cookies_txt: str | None = None,
                        on_server: Callable[[str, str], bool] | None = None,
-                       fetch_lyrics: bool = False) -> Result:
+                       fetch_lyrics: bool = False,
+                       playlist_spec: "PlaylistSpec | None" = None,
+                       index_paths: dict | None = None) -> Result:
     """Download a list of individual track URLs as ONE job (roadmap 12 batch import).
 
     Structurally the artist run (`run_artist_download`) with a GIVEN url list instead of an
@@ -1898,6 +1949,14 @@ def run_batch_download(*, job_id: str, urls: list[str], genre: str, destination:
         expected_total = new_count + failed_total
         note = f" ({len(failed)} fehlgeschlagen)" if failed else ""
         if destination.type == "webdav":
+            # Recreate the source playlist as an .m3u8 (roadmap 13) — staged into work_base so the
+            # single upload below ships it alongside the tracks. Best-effort: a failure here must
+            # not sink the delivered tracks.
+            if playlist_spec is not None:
+                try:
+                    _write_import_m3u(work_base, playlist_spec, delivered_all, index_paths or {})
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("import playlist recreation failed: %s", exc)
             reporter.on_phase("upload")
             upload_failed = _upload_tree(destination, work_base) or []
             return Result(summary=f"WebDAV: {new_count} Titel{note}",

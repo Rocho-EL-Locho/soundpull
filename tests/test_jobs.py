@@ -357,3 +357,34 @@ def test_start_batch_writes_one_history_row_and_runs_inline(monkeypatch):
         assert row.phase == "done"
     js = jobs.get_job(job_id)
     assert js.mode == "batch" and js.total_tracks == 2 and js.failed_tracks == 0
+
+
+def test_run_batch_download_recreates_playlist_on_webdav(monkeypatch, tmp_path):
+    """A playlist_spec triggers the import-m3u write on the WebDAV path (browser skips it)."""
+    from app import pipeline
+    from app.pipeline import Destination, PlaylistSpec, Reporter, Result
+
+    def fake_run_download(*, job_id, url, stage_dir, **kw):
+        (stage_dir / f"{url}.mp3").write_bytes(b"x")
+        return Result(new_track_count=1, expected_count=0, failed_count=0,
+                      delivered=[("Artist", url, f"Artist/Alb/{url}.mp3")])
+
+    monkeypatch.setattr(pipeline, "run_download", fake_run_download)
+    monkeypatch.setattr(pipeline, "_upload_tree", lambda dest, root: [])   # skip real WebDAV
+
+    recorded = {}
+    real_write = pipeline._write_import_m3u
+    def spy(work_base, spec, delivered, index_paths):
+        recorded["spec"] = spec
+        recorded["delivered"] = delivered
+        return real_write(work_base, spec, delivered, index_paths)
+    monkeypatch.setattr(pipeline, "_write_import_m3u", spy)
+
+    rep = Reporter(on_phase=lambda p: None, on_meta=lambda a, b: None, on_track=lambda c, t: None)
+    spec = PlaylistSpec(name="Mix", folder_id="import-deadbeef01",
+                        tracks=[("Artist", "a"), ("Artist", "b")])
+    pipeline.run_batch_download(job_id="test-batch-pl", urls=["a", "b"], genre="Rap",
+                                destination=Destination(type="webdav"), reporter=rep,
+                                playlist_spec=spec, index_paths={})
+    assert recorded["spec"].name == "Mix"
+    assert len(recorded["delivered"]) == 2

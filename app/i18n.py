@@ -413,6 +413,18 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "import.confirm_title": "Auswahl herunterladen?",
         "import.confirm_body": "{count} Titel werden als ein Auftrag geladen.",
         "import.started": "Batch-Import gestartet ({count} Titel).",
+        # Playlist-URL-Import (roadmap 13)
+        "import.tab_paste": "Liste einfügen",
+        "import.tab_url": "Playlist-URL",
+        "import.url_placeholder": "Spotify- oder Apple-Music-Playlist-/Album-Link …",
+        "import.url_hint": "Öffentliche Spotify- oder Apple-Music-Playlist bzw. -Album. "
+                           "Es werden nur Titel-Infos gelesen — kein Audio von dort.",
+        "import.url_hint_apple_only": "Öffentliche Apple-Music-Playlist bzw. -Album. "
+                                      "(Spotify ist auf dem Server nicht konfiguriert.)",
+        "import.url_button": "Playlist laden",
+        "import.fetch_error": "Playlist konnte nicht geladen werden: {error}",
+        "import.playlist_header": "„{name}“ — {count} Titel gefunden",
+        "import.recreate_label": "Als Playlist speichern (.m3u8)",
         # Playlist-Abos (issue #21)
         "subs.heading_new": "Neues Playlist-Abo",
         "subs.desc": "Eine Playlist in einem Intervall automatisch synchronisieren. "
@@ -875,6 +887,18 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "import.confirm_title": "Download selection?",
         "import.confirm_body": "{count} tracks will be downloaded as one job.",
         "import.started": "Batch import started ({count} tracks).",
+        # Playlist URL import (roadmap 13)
+        "import.tab_paste": "Paste list",
+        "import.tab_url": "Playlist URL",
+        "import.url_placeholder": "Spotify or Apple Music playlist/album link …",
+        "import.url_hint": "A public Spotify or Apple Music playlist or album. Only track metadata "
+                           "is read — no audio is fetched from there.",
+        "import.url_hint_apple_only": "A public Apple Music playlist or album. "
+                                      "(Spotify is not configured on the server.)",
+        "import.url_button": "Load playlist",
+        "import.fetch_error": "Could not load the playlist: {error}",
+        "import.playlist_header": "“{name}” — {count} tracks found",
+        "import.recreate_label": "Save as playlist (.m3u8)",
         # Playlist subscriptions (issue #21)
         "subs.heading_new": "New playlist subscription",
         "subs.desc": "Automatically sync a playlist on an interval. Each run downloads "

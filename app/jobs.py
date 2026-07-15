@@ -26,8 +26,8 @@ from app.db import session_scope
 from app.fix_music_tags import TAG_OPTION_FIELDS, TagOptions
 from app.models import DownloadHistory, PlaylistSubscription, UserSettings
 from app.pipeline import (
-    DEFAULT_AUDIO_FORMAT, Destination, Reporter, normalize_audio_format, run_artist_download,
-    run_batch_download, run_download,
+    DEFAULT_AUDIO_FORMAT, Destination, PlaylistSpec, Reporter, normalize_audio_format,
+    run_artist_download, run_batch_download, run_download,
 )
 from app.sources import is_supported_url
 from app.security import decrypt_secret
@@ -363,22 +363,27 @@ def _run(job_id: str, url: str, genre: str, mode: str, destination: Destination,
 
 def _run_batch(job_id: str, urls: list[str], genre: str, destination: Destination,
                audio_format: str, tag_options: TagOptions, cookies_txt: str | None,
-               dedup: bool = False, fetch_lyrics: bool = False) -> None:
+               dedup: bool = False, fetch_lyrics: bool = False,
+               playlist_spec: PlaylistSpec | None = None) -> None:
     js = _registry[job_id]
     reporter = _make_reporter(job_id, js)   # on_track drives the batch-level i/N bar
     try:
-        # Dedup (issue #31): skip tracks already in the library — WebDAV only, same as `_run`.
+        # Load the library index once (WebDAV only) when we need it — for the dedup skip (issue #31)
+        # and/or to reference already-on-server tracks in the recreated import playlist (roadmap 13).
         on_server = None
-        if dedup and destination.type == "webdav":
+        index_paths: dict | None = None
+        if destination.type == "webdav" and (dedup or playlist_spec is not None):
             with session_scope() as session:
-                paths = library_index.load_index_paths(session, js.user_id)
-            on_server = lambda a, t: library_index.track_key(t, a) in paths  # noqa: E731
+                index_paths = library_index.load_index_paths(session, js.user_id)
+            if dedup:
+                on_server = lambda a, t: library_index.track_key(t, a) in index_paths  # noqa: E731
 
         result = run_batch_download(job_id=job_id, urls=urls, genre=genre,
                                     destination=destination, reporter=reporter,
                                     audio_format=audio_format, tag_options=tag_options,
                                     cookies_txt=cookies_txt, on_server=on_server,
-                                    fetch_lyrics=fetch_lyrics)
+                                    fetch_lyrics=fetch_lyrics, playlist_spec=playlist_spec,
+                                    index_paths=index_paths)
         indexed = True
         if destination.type == "webdav" and result.delivered:
             indexed = _record_delivered_safe(job_id, js.user_id, result.delivered)
@@ -466,7 +471,7 @@ def start_job(*, user_id: int, url: str, genre: str, mode: str, destination_type
 def start_batch(*, user_id: int, items: list[str], genre: str, destination_type: str,
                 audio_format: str = DEFAULT_AUDIO_FORMAT,
                 tag_options: TagOptions | None = None, dedup: bool = False,
-                fetch_lyrics: bool = False) -> str:
+                fetch_lyrics: bool = False, playlist_spec: PlaylistSpec | None = None) -> str:
     """Queue a batch import (roadmap 12): download `items` (single-track URLs) as ONE job.
 
     Mirrors `start_job` but fans out into `mode="single"` downloads under one job id + one
@@ -511,7 +516,7 @@ def start_batch(*, user_id: int, items: list[str], genre: str, destination_type:
         _registry[job_id] = js
     _log_event(js, "queued")
     _executor.submit(_run_batch, job_id, items, genre, destination, audio_format,
-                     tag_options, cookies_txt, dedup, fetch_lyrics)
+                     tag_options, cookies_txt, dedup, fetch_lyrics, playlist_spec)
     return job_id
 
 

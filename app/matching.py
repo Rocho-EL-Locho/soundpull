@@ -232,13 +232,17 @@ def is_matching(user_id: int) -> bool:
 
 def start_match(user_id: int, text: str) -> bool:
     """Kick off background matching of a pasted list. False if one is already running."""
+    return start_match_lines(user_id, parse_lines(text))
+
+
+def start_match_lines(user_id: int, lines: list[ParsedLine]) -> bool:
+    """Kick off background matching of already-parsed lines (shared by the paste + playlist-URL
+    paths, roadmap 12/13). False if a run is already in progress for the user."""
     with _match_lock:
         st = _matches.get(user_id)
         if st is not None and not st.finished:
             return False
         _matches[user_id] = MatchState(phase="queued")
-
-    lines = parse_lines(text)
 
     def _set(**kw) -> None:
         with _match_lock:
