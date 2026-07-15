@@ -1,6 +1,6 @@
 [project]
 name = "soundpull"
-version = "0.16.0"
+version = "0.17.0"
 description = "Soundpull — multi-user web app to download YouTube Music as Navidrome-tagged MP3s"
 requires-python = ">=3.11"
 dependencies = [
@@ -28,6 +28,11 @@ dependencies = [
     "bgutil-ytdlp-pot-provider==1.3.1",
     "mutagen>=1.47",
     "webdav4>=0.10",
+    # In-app YouTube Music search (roadmap 07). Unofficial InnerTube API → pinned exactly
+    # for stability (a floating version can break with a YT/library change); it only builds
+    # search URLs and never touches the tag pipeline, so this pin is operational, not a
+    # parity concern. Import-isolated in app/search.py and every call fails soft.
+    "ytmusicapi==1.12.1",
 ]
 
 [project.optional-dependencies]

@@ -95,6 +95,16 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "index.unknown_error": "Unbekannter Fehler",
         "index.completed": "Abgeschlossen ✓",
         "index.download_zip": "ZIP herunterladen",
+        # In-app-Suche (roadmap 07)
+        "search.label": "YouTube Music durchsuchen",
+        "search.placeholder": "Song, Album, Interpret oder Playlist …",
+        "search.button": "Suchen",
+        "search.songs": "Songs",
+        "search.albums": "Alben",
+        "search.artists": "Interpreten",
+        "search.playlists": "Playlists",
+        "search.failed": "Suche fehlgeschlagen – bitte später erneut versuchen.",
+        "search.no_results": "Keine Treffer.",
         # job warnings (issue #38) — set as keys by the worker, resolved at render time
         "jobs.index_update_failed": "Upload erfolgreich, aber die Server-Index-Aktualisierung "
                                     "ist fehlgeschlagen – diese Titel könnten beim nächsten "
@@ -527,6 +537,16 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "index.unknown_error": "Unknown error",
         "index.completed": "Completed ✓",
         "index.download_zip": "Download ZIP",
+        # In-app search (roadmap 07)
+        "search.label": "Search YouTube Music",
+        "search.placeholder": "Song, album, artist or playlist …",
+        "search.button": "Search",
+        "search.songs": "Songs",
+        "search.albums": "Albums",
+        "search.artists": "Artists",
+        "search.playlists": "Playlists",
+        "search.failed": "Search failed — please try again later.",
+        "search.no_results": "No results.",
         # job warnings (issue #38) — set as keys by the worker, resolved at render time
         "jobs.index_update_failed": "Upload succeeded, but updating the server index failed — "
                                     "these tracks may be downloaded again on the next sync.",
