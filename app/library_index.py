@@ -413,6 +413,55 @@ def iter_library_files(client, base: str, *, max_depth: int = 8,
         yield full[len(prefix):] if prefix and full.startswith(prefix) else full
 
 
+def iter_library_dirs(client, base: str, *, max_depth: int = 8, errors: list | None = None):
+    """Yield ``(dir_rel, subdir_names, file_names)`` for every directory under `base` (roadmap 05).
+
+    Unlike `iter_library_files` (audio only) this reports a directory's FULL contents in ONE
+    listing — every file (audio, `.lrc`, images, junk) plus its immediate sub-directory names —
+    so the health check's cheap pass can detect missing sidecars, stray files, non-audio junk AND
+    empty folders (no files and no subdirs) in a single walk. Names are basenames (not full paths);
+    `dir_rel` is the directory's path relative to `base` (``""`` for the base itself).
+
+    Same error/skip semantics as `_walk_remote_files`: a failed *sub*-dir listing is logged +
+    appended to `errors` and skipped; a **root** failure propagates (issue #38). Cache/internal
+    subtrees (`_is_skippable_dir`) are pruned.
+    """
+    prefix = f"{base}/" if base else ""
+
+    def _walk(path: str, depth: int):
+        try:
+            entries = client.ls(path or "", detail=True)
+        except Exception as exc:  # noqa: BLE001 - a single unreadable dir must not abort the walk
+            if depth == 0:
+                raise
+            log.warning("health scan: listing %r failed: %s", path, exc)
+            if errors is not None:
+                errors.append((path, str(exc)))
+            return
+        subdirs: list[str] = []
+        files: list[str] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name", "")).rstrip("/")
+            if not name or name == path.rstrip("/"):
+                continue  # skip empties and the directory's self-entry
+            base_name = name.rsplit("/", 1)[-1]
+            if entry.get("type") == "directory":
+                subdirs.append(base_name)
+            else:
+                files.append(base_name)
+        dir_rel = path[len(prefix):] if prefix and path.startswith(prefix) else (
+            "" if path == base else path)
+        yield dir_rel, subdirs, files
+        for sub in subdirs:
+            child = f"{path}/{sub}" if path else sub
+            if depth < max_depth and not _is_skippable_dir(child):
+                yield from _walk(child, depth + 1)
+
+    yield from _walk(base, 0)
+
+
 def _walk_audio_with_lrc(client, path: str, depth: int, max_depth: int,
                          errors: list | None = None):
     """Like `_walk_remote_files`, but yields ``(audio_path, has_lrc)`` per audio file.
