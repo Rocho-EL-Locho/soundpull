@@ -324,7 +324,7 @@ def test_resolve_group_repairs_subscription_manifest(env):
     _add_audio(client, keeper)
     _add_audio(client, loser)
     _index(scope, keeper)
-    # The on-disk m3u the subscription owns (so _subscription_folder can match by name).
+    # The on-disk m3u the subscription owns (so the folder is matched by manifest content).
     client.files["lib/Late Night [PL9]/Late Night.m3u8"] = (
         "#EXTM3U\n../Burial/Archangel/01 - Archangel.mp3\n").encode("utf-8")
     manifest = [{"index": 1, "name": "../Burial/Archangel/01 - Archangel.mp3",
