@@ -45,6 +45,10 @@ class SourceSpec:
     cover_square_crop: bool                # thumbnails may be 16:9 → crop to square
     matches: Callable[[str], bool]         # True if this source handles the URL
     suggest_mode: Callable[[str], str | None]  # best-guess download mode from the URL
+    # Trust the uploader/channel as the performing artist (roadmap 06). SoundCloud has no
+    # structured artist credit (uploader IS the artist in the common case); YouTube must NOT
+    # trust it (label re-uploads), so this defaults False and only SoundCloud sets it True.
+    trust_uploader_as_artist: bool = False
 
 
 def _matches_youtube(raw: str) -> bool:
@@ -96,6 +100,69 @@ def _suggest_mode_youtube(raw: str) -> str | None:
     return None
 
 
+# SoundCloud hosts (roadmap 06). ``on.soundcloud.com`` is the share short-link.
+_SOUNDCLOUD_HOSTS = {
+    "soundcloud.com", "www.soundcloud.com", "m.soundcloud.com", "on.soundcloud.com",
+}
+
+# Profile-tab path segments that identify an ARTIST page (not a single track).
+_SC_ARTIST_TABS = {"tracks", "albums", "sets", "popular-tracks", "toptracks"}
+# Tabs we do not download in this iteration (a user's likes/reposts aren't their own catalogue).
+_SC_REJECTED_TABS = {"likes", "reposts", "comments", "following", "followers"}
+
+
+def _matches_soundcloud(raw: str) -> bool:
+    """True only for http(s) URLs on a known SoundCloud host."""
+    try:
+        parsed = urlparse((raw or "").strip())
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    return (parsed.hostname or "").lower() in _SOUNDCLOUD_HOSTS
+
+
+def _suggest_mode_soundcloud(raw: str) -> str | None:
+    """Best-guess download mode from a SoundCloud URL's shape (roadmap 06 spec table).
+
+    | URL shape                                   | mode      |
+    |---------------------------------------------|-----------|
+    | ``/<user>/sets/<slug>``                     | album     |
+    | ``/<user>/<track>``                         | single    |
+    | ``/<user>`` or ``/<user>/tracks|/albums|…`` | artist    |
+    | ``/<user>/likes`` , ``/<user>/reposts``     | None      |
+    | ``on.soundcloud.com/<short>`` , anything else | None    |
+
+    The ``on.soundcloud.com`` short link resolves to an arbitrary target, so its shape is
+    unknown from the URL → no suggestion (the user picks a mode).
+    """
+    try:
+        p = urlparse((raw or "").strip())
+    except ValueError:
+        return None
+    host = (p.hostname or "").lower()
+    if host == "on.soundcloud.com":
+        return None
+    segs = [s for s in (p.path or "").split("/") if s]
+    if not segs:
+        return None
+    tab = segs[1].lower() if len(segs) >= 2 else ""
+    if tab in _SC_REJECTED_TABS:
+        return None
+    if tab == "sets":
+        # /<user>/sets/<slug> is one set (album); /<user>/sets alone is the sets tab (artist).
+        return "album" if len(segs) >= 3 else "artist"
+    if len(segs) == 1 or tab in _SC_ARTIST_TABS:
+        return "artist"
+    if len(segs) == 2:
+        return "single"
+    # A private track share link carries a secret token as a third segment:
+    # /<user>/<track>/s-XXXXXXXX — still one track.
+    if len(segs) == 3 and segs[2].lower().startswith("s-"):
+        return "single"
+    return None
+
+
 YOUTUBE = SourceSpec(
     key="youtube",
     label="YouTube Music",
@@ -108,9 +175,25 @@ YOUTUBE = SourceSpec(
     suggest_mode=_suggest_mode_youtube,
 )
 
-# The registry. Feature 02 registers only YouTube, so runtime behaviour is unchanged;
-# feature 06 appends SoundCloud, etc. Detection walks it in order, first match wins.
-_REGISTRY: tuple[SourceSpec, ...] = (YOUTUBE,)
+SOUNDCLOUD = SourceSpec(
+    key="soundcloud",
+    label="SoundCloud",
+    # yt-dlp handles SoundCloud natively — no extractor-args, no PO tokens, no cookie
+    # plumbing. extractor_args=None makes _apply_source strip the youtube: pair for this source.
+    extractor_args=None,
+    supports_cookies=False,
+    supports_pot=False,
+    supports_artist=True,
+    cover_square_crop=True,
+    # SoundCloud has no structured artist credit tag — the uploader IS the artist in the
+    # common case, so artist-mode crediting trusts it (YouTube must not; see SourceSpec).
+    trust_uploader_as_artist=True,
+    matches=_matches_soundcloud,
+    suggest_mode=_suggest_mode_soundcloud,
+)
+
+# The registry. Detection walks it in order, first match wins.
+_REGISTRY: tuple[SourceSpec, ...] = (YOUTUBE, SOUNDCLOUD)
 
 
 def detect_source(url: str) -> SourceSpec | None:

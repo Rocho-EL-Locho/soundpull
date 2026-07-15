@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlparse
 
 import httpx
 import yt_dlp
@@ -33,6 +34,10 @@ from app.sources import (
     detect_source,
     is_supported_url,
 )
+
+# Canonical SoundCloud profile hosts (roadmap 06). ``on.soundcloud.com`` is a share short link,
+# never a profile base — a resolved base on that host means resolution failed (see enumerator).
+_SC_PROFILE_HOSTS = {"soundcloud.com", "www.soundcloud.com", "m.soundcloud.com"}
 
 log = logging.getLogger("pipeline")
 
@@ -437,6 +442,13 @@ def _probe_meta(url: str, is_album: bool, cookiefile: str | None = None,
         entry = entries[0] if entries else info
     artist = (entry or {}).get("artist") or (entry or {}).get("uploader")
     album = (entry or {}).get("album")
+    # A SoundCloud set carries no per-track `album` tag, so the set's own title names the album
+    # (roadmap 06). Gated on the SOURCE (not just `is_album`): a YouTube playlist downloaded in
+    # album mode may also have a tag-less first track, and there the old `album=None` →
+    # "Unbekannt Album" must stand — folding in the playlist title would change YouTube tag
+    # output and break the byte-identical parity invariant. Only SoundCloud takes this fallback.
+    if is_album and not album and src.key == "soundcloud" and info and info.get("entries"):
+        album = info.get("title")
     return artist, album
 
 
@@ -549,6 +561,9 @@ def enumerate_artist(url: str, cookiefile: str | None = None,
     _apply_pot_provider(opts, src)
     _apply_socket_timeout(opts)
 
+    if src.key == "soundcloud":
+        return _enumerate_artist_soundcloud(url, opts, limit)
+
     releases_url = url if url.rstrip("/").endswith("/releases") else None
     if releases_url is None:
         with yt_dlp.YoutubeDL({**opts, "playlistend": 1}) as ydl:
@@ -565,6 +580,64 @@ def enumerate_artist(url: str, cookiefile: str | None = None,
     for entry in (info.get("entries") or []):
         if entry and entry.get("url"):
             releases.append({"title": entry.get("title") or "Album", "url": entry["url"]})
+    if limit and limit > 0:
+        releases = releases[:limit]
+    return artist, releases
+
+
+def _sc_profile_base(url: str, probe: dict) -> str:
+    """Canonical ``soundcloud.com/<user>`` base for an artist URL (roadmap 06).
+
+    Prefers the profile URL yt-dlp resolves (`uploader_url`/`channel_url` — also handles an
+    ``on.soundcloud.com`` short link or a ``/tracks`` tab URL); falls back to stripping the
+    given URL's path down to its first segment.
+    """
+    base = (probe.get("uploader_url") or probe.get("channel_url") or "").rstrip("/")
+    if base:
+        return base
+    p = urlparse(url)
+    segs = [s for s in (p.path or "").split("/") if s]
+    return f"{p.scheme}://{p.netloc}/{segs[0]}" if segs else url.rstrip("/")
+
+
+def _enumerate_artist_soundcloud(url: str, opts: dict, limit: int) -> tuple[str, list[dict]]:
+    """Artist name + releases for a SoundCloud profile (roadmap 06).
+
+    SoundCloud has no ``/releases`` tab, so we flat-probe the profile's ``/albums`` (each entry is
+    a set → an album release) and ``/tracks`` (each posted track → a 1-track release, which
+    `run_artist_download` handles like a YouTube single). A track that also lives inside an album
+    can surface in both tabs; the download-time `_dedup_staged_tracks` drops the duplicate copy
+    (keeping the album version), so enumeration stays simple. Returns ``(artist, [{title,url}])``.
+    """
+    with yt_dlp.YoutubeDL({**opts, "playlistend": 1}) as ydl:
+        probe = ydl.extract_info(url, download=False) or {}
+    base = _sc_profile_base(url, probe)
+    artist = probe.get("uploader") or probe.get("channel") or _UNKNOWN_ARTIST
+
+    # Only probe tabs on a canonical profile host. If resolution failed (e.g. an unresolved
+    # on.soundcloud.com short link), the base is not a profile URL — probing `<base>/albums`
+    # would just 404 twice, so bail with an empty discography (the caller surfaces "no albums").
+    # Also re-validates the yt-dlp-resolved `uploader_url` before feeding it back to yt-dlp.
+    if (urlparse(base).hostname or "").lower() not in _SC_PROFILE_HOSTS:
+        log.warning("soundcloud enumerate: could not resolve a profile from %s (base=%s)", url, base)
+        return artist, []
+
+    releases: list[dict] = []
+    seen: set[str] = set()
+    for tab in ("albums", "tracks"):
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(f"{base}/{tab}", download=False) or {}
+        except Exception as exc:  # noqa: BLE001 - one dead tab must not abort enumeration
+            log.warning("soundcloud enumerate %s/%s failed: %s", base, tab, exc)
+            continue
+        if artist == _UNKNOWN_ARTIST:
+            artist = info.get("uploader") or info.get("channel") or artist
+        for entry in (info.get("entries") or []):
+            u = entry and entry.get("url")
+            if u and u not in seen:
+                seen.add(u)
+                releases.append({"title": entry.get("title") or "Track", "url": u})
     if limit and limit > 0:
         releases = releases[:limit]
     return artist, releases
@@ -587,6 +660,28 @@ def pick_square_cover(thumbnails: list[dict] | None) -> str | None:
         if w > any_size:
             any_best, any_size = u, w
     return signed_best or any_best
+
+
+# SoundCloud artwork URLs end in a size token, e.g. …-large.jpg, …-t300x300.jpg, …-original.jpg.
+_SC_ART_SUFFIX = re.compile(r"-(?:large|t\d+x\d+|crop|badge|small|tiny|mini|original)\.(jpe?g|png)$",
+                            re.IGNORECASE)
+
+
+def _pick_soundcloud_cover(thumbnails: list[dict] | None) -> str | None:
+    """Best square SoundCloud cover URL (roadmap 06).
+
+    SoundCloud artwork comes in fixed size variants that differ only by a trailing token
+    (`-large.jpg` ≈ 100px, `-t500x500.jpg` = 500px square, `-original.jpg` = full). All are
+    square, so we upgrade whichever variant yt-dlp surfaces to the reliable 500×500 one — that
+    fills Navidrome's cover slot without a blurred pad, and `_square_crop_jpeg` stays a no-op.
+    Falls back to the generic square picker when no SoundCloud token is recognised.
+    """
+    for t in thumbnails or []:
+        u = t.get("url") or ""
+        m = _SC_ART_SUFFIX.search(u)
+        if m:
+            return _SC_ART_SUFFIX.sub(f"-t500x500.{m.group(1)}", u)
+    return pick_square_cover(thumbnails)
 
 
 def _download_cover(url: str) -> bytes | None:
@@ -643,7 +738,9 @@ def _fetch_cover(url: str, is_album: bool, dest: Path, cookiefile: str | None = 
     except Exception as exc:  # cover is best-effort; embedded thumbnail remains
         log.warning("cover probe failed: %s", exc)
         return None
-    cover_url = pick_square_cover((data or {}).get("thumbnails"))
+    thumbnails = (data or {}).get("thumbnails")
+    cover_url = (_pick_soundcloud_cover(thumbnails) if src.key == "soundcloud"
+                 else pick_square_cover(thumbnails))
     if not cover_url:
         return None
     data_bytes = _download_cover(cover_url)
@@ -774,7 +871,7 @@ def _build_playlist_manifest(existing: list[dict] | None, new_entries: list[dict
     return _merge_manifest(existing, combined) if is_sync else combined
 
 
-def _artist_credit_text(info_dict: dict) -> str:
+def _artist_credit_text(info_dict: dict, trust_uploader: bool = False) -> str:
     """Lower-cased blob of a track's real *credit* tags (issue #56).
 
     Uses ONLY the tag fields that name a performer — `artists`/`artist`/`creators`/`creator`/
@@ -788,13 +885,20 @@ def _artist_credit_text(info_dict: dict) -> str:
 
     A cleanly-tagged own release always carries a real `artist`/`artists` tag, so this blob is
     populated for the tracks we want and empty for the broken ones we don't.
+
+    `trust_uploader` (roadmap 06) flips the `channel`/`uploader` rule for sources that have NO
+    structured artist credit and whose uploader IS the artist (SoundCloud): there the uploader is
+    a legitimate credit. YouTube keeps the default (False) so its behaviour is byte-identical.
     """
     parts: list[str] = []
     for key in ("artists", "creators"):
         val = info_dict.get(key)
         if isinstance(val, list):
             parts += [str(x) for x in val if x]
-    for key in ("artist", "creator", "album_artist"):
+    credit_keys = ("artist", "creator", "album_artist")
+    if trust_uploader:
+        credit_keys += ("uploader", "channel")
+    for key in credit_keys:
         val = info_dict.get(key)
         if val:
             parts.append(str(val))
@@ -806,7 +910,7 @@ def _norm_name(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip()).casefold()
 
 
-def _credits_artist(info_dict: dict, artist: str) -> bool:
+def _credits_artist(info_dict: dict, artist: str, trust_uploader: bool = False) -> bool:
     """True if `artist` is a credited performer of the track (issue #56).
 
     Word-boundary match against `_artist_credit_text`, so "BCee" matches "BCee, Charlotte
@@ -814,11 +918,15 @@ def _credits_artist(info_dict: dict, artist: str) -> bool:
     contains it. A track with NO real credit tag (`artist=None` etc. — the broken video-name
     uploads the `/releases` tab mixes in) yields an empty blob and is therefore NOT credited →
     skipped. A blank target never filters (returns True) so a run with no known artist is a no-op.
+
+    `trust_uploader` (roadmap 06) widens the credit blob to the uploader/channel for sources that
+    lack a structured artist tag (SoundCloud). YouTube passes False → unchanged.
     """
     target = _norm_name(artist)
     if not target:
         return True
-    return re.search(rf"(?<!\w){re.escape(target)}(?!\w)", _artist_credit_text(info_dict)) is not None
+    blob = _artist_credit_text(info_dict, trust_uploader=trust_uploader)
+    return re.search(rf"(?<!\w){re.escape(target)}(?!\w)", blob) is not None
 
 
 # Trailing non-title suffixes a label upload's video name carries (dropped when repairing).
@@ -1109,10 +1217,34 @@ def _dedup_staged_tracks(work_base: Path) -> int:
     return removed
 
 
+def _is_preview(info_dict: dict) -> bool:
+    """Best-effort: True for a SoundCloud Go+ *preview* clip, not the full track (roadmap 06).
+
+    A subscription-only track the account can't stream in full is served as a ~30 s snippet:
+    yt-dlp then reports the real length in `full_duration` while `duration` is the clip length.
+    A normal free track (and every YouTube track) has `full_duration` absent/None, so it's only
+    ever set for a gated track — we therefore flag ANY gap beyond a small rounding epsilon (1.5 s),
+    which also catches a preview of a short track (e.g. 30 s clip of a 32 s song) that a
+    percentage threshold would miss. Absent/equal `full_duration` → False; the predicate defaults
+    to False so a full download is never mistaken for a preview.
+    """
+    full, dur = info_dict.get("full_duration"), info_dict.get("duration")
+    try:
+        full = float(full) if full is not None else None
+        dur = float(dur) if dur is not None else None
+    except (TypeError, ValueError):
+        return False
+    if not full or not dur or full <= 0 or dur <= 0:
+        return False
+    return full - dur > 1.5
+
+
 def _make_match_filter(on_server: Callable[[str, str], bool] | None = None,
                        on_skip: Callable[[int | None, str, str], None] | None = None,
                        own_artist: str | None = None,
-                       on_seen: Callable[[str], None] | None = None):
+                       on_seen: Callable[[str], None] | None = None,
+                       trust_uploader: bool = False,
+                       on_preview: Callable[[str], None] | None = None):
     """yt-dlp match_filter: skip tracks we don't want to download (issue #21/#31/#56).
 
     yt-dlp extracts each entry's full metadata (artist/track) BEFORE downloading the
@@ -1136,6 +1268,10 @@ def _make_match_filter(on_server: Callable[[str, str], bool] | None = None,
       such skip — so the pipeline can reference the already-present copy in a playlist's
       .m3u8. yt-dlp has merged a stable 1-based `playlist_index` into the info_dict by this
       point, even for skipped entries.
+
+    `trust_uploader` widens the credit check to the uploader/channel (roadmap 06, SoundCloud);
+    YouTube passes False → unchanged. `on_preview`, when set, is invoked with the id of a
+    SoundCloud Go+ preview clip, which is then skipped (see `_is_preview`); YouTube passes None.
     """
     def _filter(info_dict: dict, incomplete: bool = False) -> str | None:
         if incomplete or info_dict.get("_type") in ("playlist", "multi_video"):
@@ -1148,7 +1284,7 @@ def _make_match_filter(on_server: Callable[[str, str], bool] | None = None,
         # artist; if not even repairable, it's foreign → drop. `repaired` stays None for a
         # credited (clean) track, so its authoritative tags aren't second-guessed here.
         repaired = None
-        if own_artist and not _credits_artist(info_dict, own_artist):
+        if own_artist and not _credits_artist(info_dict, own_artist, trust_uploader=trust_uploader):
             repaired = _repair_broken_title(title, own_artist)
             if repaired is None:
                 return f"nicht vom Künstler {own_artist}: {artist or '?'} - {title}".strip()
@@ -1168,6 +1304,17 @@ def _make_match_filter(on_server: Callable[[str, str], bool] | None = None,
             if on_skip is not None:
                 on_skip(info_dict.get("playlist_index"), d_artist, d_title)
             return f"schon auf dem Server: {d_artist} - {d_title}".strip()
+        # A SoundCloud Go+ preview clip (roadmap 06) can never be downloaded in full. Checked
+        # AFTER the credit + on-server filters, so a foreign upload (not our artist) or an
+        # already-present track is dropped/skipped FIRST and never inflates the preview count —
+        # only a genuinely-new, in-scope track that is preview-gated is recorded. It's recorded
+        # (so it surfaces in the partial-delivery count) and skipped, but NOT marked expected
+        # (else the download-retry loop would burn every pass re-attempting an impossible track).
+        if on_preview is not None and _is_preview(info_dict):
+            vid = info_dict.get("id")
+            if vid:
+                on_preview(str(vid))
+            return f"nur Vorschau (SoundCloud Go+): {artist or '?'} - {title}".strip()
         # This entry passed every skip check → yt-dlp will (attempt to) download it. Record
         # its id as EXPECTED so the caller can detect tracks that later fail at the download
         # stage (silently skipped by ignoreerrors='only_download') and retry / surface them.
@@ -1419,7 +1566,12 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
             # path segment. With a known `album_name` (artist mode) the album folder is
             # likewise a literal segment — so tag-less singles get distinct per-release
             # folders instead of collapsing into one `%(album)s`→"NA" directory.
-            if is_album and album_name:
+            # SoundCloud (roadmap 06) is the same case for a DIRECT set download: its tracks
+            # carry no per-track `album` tag, so `%(album)s` would resolve to "NA" and file the
+            # whole set under Artist/NA/ — force the resolved set title (from `_probe_meta`) as the
+            # folder instead. YouTube keeps `%(album)s` → byte-identical (its tracks always tag it).
+            force_album_folder = bool(album_name) or source_spec.key == "soundcloud"
+            if is_album and force_album_folder:
                 subfolder = _safe_segment(album)
             else:
                 subfolder = "%(album)s" if is_album else "Singles"
@@ -1472,9 +1624,16 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
         is_multi = not is_single  # album / playlist / artist span many tracks; single is one
         expected_ids: set[str] = set()   # entries that passed the filter → should download
         finished_ids: set[str] = set()   # entries whose media download actually completed
-        if is_multi or on_server is not None or own_artist:
+        preview_ids: set[str] = set()    # SoundCloud Go+ previews skipped (roadmap 06)
+        trust_uploader = source_spec.trust_uploader_as_artist
+        # SoundCloud serves Go+ tracks as short previews; detect + skip them (all modes, incl. a
+        # bare single) so a 30 s clip is never delivered as if it were the full track.
+        detect_preview = source_spec.key == "soundcloud"
+        if is_multi or on_server is not None or own_artist or detect_preview:
             opts["match_filter"] = _make_match_filter(
-                on_server, on_skip=_on_skip, own_artist=own_artist, on_seen=expected_ids.add)
+                on_server, on_skip=_on_skip, own_artist=own_artist, on_seen=expected_ids.add,
+                trust_uploader=trust_uploader,
+                on_preview=(preview_ids.add if detect_preview else None))
 
         finished_dirs: Counter[str] = Counter()
 
@@ -1500,9 +1659,13 @@ def run_download(*, job_id: str, url: str, genre: str, mode: str,
         reporter.on_phase("download")
         _download_with_retries(opts, url, is_multi=is_multi, job_id=job_id,
                                expected_ids=expected_ids, finished_ids=finished_ids)
-        # Tracks that passed the filter but never completed, even after retries (throttle/403).
-        failed_ids = expected_ids - finished_ids
-        expected_count, failed_count = len(expected_ids), len(failed_ids)
+        # Tracks that passed the filter but never completed, even after retries (throttle/403),
+        # plus SoundCloud Go+ previews that can't be downloaded (roadmap 06). Previews are kept
+        # OUT of expected_ids (so the retry loop doesn't chase them) but counted in both totals so
+        # the partial-delivery warning reads "N von M" over every track the release actually has.
+        failed_ids = (expected_ids - finished_ids) | preview_ids
+        expected_count = len(expected_ids | preview_ids)
+        failed_count = len(failed_ids)
         if failed_count:
             log.warning("download %s: %d/%d track(s) failed after retries: %s",
                         job_id, failed_count, expected_count,
