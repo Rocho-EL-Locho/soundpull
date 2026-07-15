@@ -7,6 +7,7 @@ registry entry, and a non-YouTube source derives its own yt-dlp flags.
 import app.sources as sources
 from app.pipeline import _ALBUM_FLAGS, _apply_source
 from app.sources import (
+    SOUNDCLOUD,
     SourceSpec,
     YOUTUBE,
     detect_source,
@@ -30,15 +31,26 @@ def test_detect_source_accepts_youtube_hosts():
 def test_detect_source_rejects_unknown_and_garbage():
     # Unknown host, substring-only lookalike, wrong scheme, garbage → None, never an exception.
     for url in (
-        "https://soundcloud.com/artist/track",
-        "https://youtube.com.evil.com/x",   # not a real youtube host
-        "https://evil.com/youtube.com",     # substring only
-        "file:///etc/passwd",               # wrong scheme
+        "https://youtube.com.evil.com/x",       # not a real youtube host
+        "https://soundcloud.com.evil.com/x",    # not a real soundcloud host
+        "https://evil.com/youtube.com",         # substring only
+        "file:///etc/passwd",                   # wrong scheme
         "not a url at all",
         "",
     ):
         assert detect_source(url) is None, url
         assert not is_supported_url(url)
+
+
+def test_detect_source_accepts_soundcloud_hosts():
+    for url in (
+        "https://soundcloud.com/artist/track",
+        "https://www.soundcloud.com/artist/sets/album",
+        "https://m.soundcloud.com/artist",
+        "https://on.soundcloud.com/abc123",
+    ):
+        assert detect_source(url) is SOUNDCLOUD, url
+    assert is_supported_url("https://soundcloud.com/artist/track")
 
 
 def test_suggest_mode_youtube_table():
@@ -62,9 +74,32 @@ def test_suggest_mode_youtube_table():
         assert suggest_mode(url) == expected, url
 
 
+def test_suggest_mode_soundcloud_table():
+    cases = {
+        # a set → album (the /sets/ path segment carries a slug)
+        "https://soundcloud.com/artist/sets/my-album": "album",
+        # a plain track (exactly two path segments) → single
+        "https://soundcloud.com/artist/my-track": "single",
+        # a private track share link carries a secret token as a third segment → still single
+        "https://soundcloud.com/artist/my-track/s-AbC12345": "single",
+        # a bare profile, or a profile tab → artist
+        "https://soundcloud.com/artist": "artist",
+        "https://soundcloud.com/artist/tracks": "artist",
+        "https://soundcloud.com/artist/albums": "artist",
+        "https://soundcloud.com/artist/sets": "artist",        # sets tab (no slug), not one album
+        # likes / reposts aren't downloaded in this iteration → no suggestion
+        "https://soundcloud.com/artist/likes": None,
+        "https://soundcloud.com/artist/reposts": None,
+        # the share short link resolves to an unknown target → no suggestion
+        "https://on.soundcloud.com/abc123": None,
+    }
+    for url, expected in cases.items():
+        assert suggest_mode(url) == expected, url
+
+
 def test_suggest_mode_unknown_host_is_none():
     # An unknown host has no source, so there is no mode to suggest.
-    assert suggest_mode("https://soundcloud.com/artist/sets/x") is None
+    assert suggest_mode("https://bandcamp.com/artist/track") is None
 
 
 def test_adding_a_source_is_just_a_registry_entry(monkeypatch):
@@ -93,6 +128,15 @@ def test_adding_a_source_is_just_a_registry_entry(monkeypatch):
     assert "dummy:variant=test" in flags
     # exactly one --extractor-args pair remains (the replacement, not both)
     assert flags.count("--extractor-args") == 1
+
+
+def test_apply_source_soundcloud_drops_youtube_extractor_args():
+    """SoundCloud (extractor_args=None) derives a flag list with no youtube: args (parity-safe)."""
+    flags = _apply_source(_ALBUM_FLAGS, SOUNDCLOUD)
+    assert "--extractor-args" not in flags
+    assert "youtube:player_client=android_vr,mweb" not in flags
+    # The rest of the frozen flag list is untouched (only the extractor-args pair is removed).
+    assert "--audio-format" in flags and "mp3" in flags
 
 
 def test_apply_source_drops_extractor_args_when_source_has_none(monkeypatch):
