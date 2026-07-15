@@ -6,6 +6,7 @@ dialog showing full metadata plus the job's event timeline (``DownloadHistory.lo
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timedelta
 
@@ -17,7 +18,7 @@ from nicegui import ui
 from app.auth import get_current_user
 from app.db import session_scope
 from app.i18n import t
-from app.jobs import start_job
+from app.jobs import start_batch, start_job
 from app.models import DownloadHistory, UserSettings
 from app.pipeline import audio_format_short
 
@@ -186,9 +187,28 @@ def history_content() -> None:
             if row is None or row.user_id != uid:
                 return
             us = session.exec(select(UserSettings).where(UserSettings.user_id == uid)).first()
+            # A batch (roadmap 12) has no single re-runnable URL — re-run the stored item list via
+            # start_batch. Dedup skips already-present tracks on WebDAV, so a retry only re-pulls
+            # what's missing. Everything else re-runs through start_job with the row's scalars.
+            # A corrupt `batch_urls` (tampered/legacy row) must not crash the click — treat as empty.
+            batch_items = None
+            if row.mode == "batch":
+                try:
+                    batch_items = json.loads(row.batch_urls) if row.batch_urls else []
+                except (ValueError, TypeError):
+                    batch_items = []
             opts = retry_options(row, us)  # plain scalars → safe after the session closes
         try:
-            start_job(user_id=uid, **opts)
+            if batch_items is not None:
+                if not batch_items:
+                    ui.notify(t("history.notify_retry_failed"), type="negative")
+                    return
+                start_batch(user_id=uid, items=batch_items, genre=opts["genre"],
+                            destination_type=opts["destination_type"],
+                            audio_format=opts["audio_format"], dedup=opts["dedup"],
+                            fetch_lyrics=opts["fetch_lyrics"])
+            else:
+                start_job(user_id=uid, **opts)
         except ValueError:  # e.g. WebDAV destination but no target configured
             ui.notify(t("history.notify_retry_no_dest"), type="warning")
             return
@@ -274,7 +294,8 @@ def history_content() -> None:
         with ui.row().classes("w-full gap-3 items-end flex-wrap"):
             _all = t("history.filter_all")
             ui.select({"": _all, "album": t("common.album"), "single": t("common.single"),
-                       "playlist": t("common.playlist"), "artist": t("common.artist")},
+                       "playlist": t("common.playlist"), "artist": t("common.artist"),
+                       "batch": t("common.batch")},
                       value="", label=t("index.mode_label"),
                       on_change=lambda e: _set(mode=e.value)) \
                 .props("outlined dense dark").classes("flex-1 min-w-32")

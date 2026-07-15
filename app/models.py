@@ -158,6 +158,11 @@ class DownloadHistory(SQLModel, table=True):
     # off the request thread, so it has no session language). Shown in the detail dialog.
     log: str | None = None
 
+    # Batch import (roadmap 12): the JSON list of track URLs a `mode="batch"` job fanned out over,
+    # stored so the row is retryable (a batch has no single re-runnable URL). None for every other
+    # mode. Additive column → auto-migrated by `reconcile_columns` on an existing DB.
+    batch_urls: str | None = None
+
     created_at: datetime = Field(default_factory=_utcnow, index=True)
     finished_at: datetime | None = None
 

@@ -185,6 +185,35 @@ def search_music(query: str, limit: int = 5) -> list[SearchResult]:
     return results
 
 
+def search_songs(query: str, limit: int = 5) -> list[SearchResult]:
+    """Search ONLY songs — one InnerTube call per query (roadmap 12 batch matching).
+
+    `search_music` fans out over four filters; the batch importer matches ~200 lines and only
+    needs songs, so this collapses to a single `songs` call to avoid 4× the API traffic. Same
+    fail-soft contract: a malformed item is skipped; a client-init or call failure raises
+    `SearchError`. Each result's `url` is a canonical `watch?v=…` URL the pipeline accepts.
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    try:
+        yt = _client()
+        raw = yt.search(q, filter="songs", limit=limit)
+    except Exception as exc:  # noqa: BLE001 - fail soft; never leak a stack to the UI
+        log.info("song search for %r failed: %s", q, exc)
+        raise SearchError(str(exc)[:200]) from exc
+    out: list[SearchResult] = []
+    for item in (raw or [])[:limit]:
+        try:
+            r = _normalize(item, "song")
+        except Exception as exc:  # noqa: BLE001 - skip a malformed item, keep the rest
+            log.info("skipping malformed song result: %s", exc)
+            continue
+        if r is not None:
+            out.append(r)
+    return out
+
+
 def resolve_album_url(browse_id: str) -> str:
     """Resolve an album `browseId` (MPREb_…) to its downloadable OLAK5uy_ playlist URL (on click)."""
     try:

@@ -29,8 +29,10 @@ class FakeYT:
         self._per_kind = per_kind or {}
         self._album = album or {}
         self._raises = raises
+        self.calls = []   # (query, filter) per search — asserts songs-only makes ONE call
 
     def search(self, query, filter=None, limit=5):  # noqa: A002 - mirror ytmusicapi signature
+        self.calls.append((query, filter))
         if self._raises:
             raise self._raises
         return self._per_kind.get(filter, [])
@@ -163,3 +165,27 @@ def test_every_built_url_is_supported_and_suggests_matching_mode(monkeypatch):
         assert r.url is not None
         assert is_supported_url(r.url), r.url
         assert suggest_mode(r.url) == expected[r.kind], (r.kind, r.url)
+
+
+# --- songs-only search (roadmap 12 batch matching) -------------------------
+
+def test_search_songs_makes_one_songs_call(monkeypatch):
+    fake = FakeYT(per_kind={"songs": [_SONG]})
+    _use(fake, monkeypatch)
+    results = search.search_songs("wonderwall", limit=3)
+    assert [r.kind for r in results] == ["song"]
+    assert results[0].url == "https://music.youtube.com/watch?v=ZrOKjDZOtkA"
+    assert fake.calls == [("wonderwall", "songs")]   # exactly ONE call, songs filter only
+
+
+def test_search_songs_empty_query_short_circuits(monkeypatch):
+    fake = FakeYT(raises=RuntimeError("should not be called"))
+    _use(fake, monkeypatch)
+    assert search.search_songs("  ") == []
+    assert fake.calls == []
+
+
+def test_search_songs_fails_soft(monkeypatch):
+    _use(FakeYT(raises=ValueError("down")), monkeypatch)
+    with pytest.raises(search.SearchError):
+        search.search_songs("x")
