@@ -136,8 +136,8 @@ Track progress by checking items off here when the PR is merged:
 - [x] 01 WebDAV file operations + trash
 - [x] 02 Multi-source architecture
 - [x] 03 Library browser
-- [ ] 04 Duplicate finder & cleanup
-- [ ] 05 Library health check
+- [x] 04 Duplicate finder & cleanup
+- [x] 05 Library health check
 - [ ] 06 SoundCloud support
 - [ ] 07 In-app YouTube Music search
 - [ ] 08 Artist watch & discography gaps
@@ -149,7 +149,7 @@ Track progress by checking items off here when the PR is merged:
 - [ ] 14 Track selection before download
 - [ ] 15 Job queue control (cancel / reorder)
 - [ ] 16 ReplayGain tagging (opt-in)
-- [ ] 17 Library export & backup
+- [x] 17 Library export & backup
 - [ ] 18 PWA + share target
 - [ ] 19 Navidrome integration
 - [ ] 20 REST API + API keys
