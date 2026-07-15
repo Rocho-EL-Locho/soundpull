@@ -87,6 +87,16 @@ class Settings(BaseSettings):
     # each user configures their own notification endpoint.
     notify_allowed_hosts: str = ""
 
+    # Spotify playlist import (roadmap 13). Optional server-level app credentials
+    # (client-credentials flow — no user OAuth). When unset, the Spotify import option is
+    # hidden and only Apple Music (key-free) works. Only track METADATA is read — never audio.
+    spotify_client_id: str | None = None
+    spotify_client_secret: str | None = None
+
+    @property
+    def spotify_configured(self) -> bool:
+        return bool(self.spotify_client_id and self.spotify_client_secret)
+
     @property
     def oidc_configured(self) -> bool:
         return bool(self.oidc_discovery_url and self.oidc_client_id and self.oidc_client_secret)

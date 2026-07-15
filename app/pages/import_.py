@@ -1,26 +1,31 @@
-"""Batch import page (roadmap 12): paste a track list → match → review → download as one job.
+"""Batch import page (roadmap 12 + 13): paste a track list OR a Spotify/Apple playlist URL → match
+→ review → download as one job (+ optional playlist recreation).
 
-Paste ``Artist - Title`` lines (or a simple CSV), match each against YouTube Music
-(`app.matching`, which composes feature 07's search), review the matches in a table (pre-checked by
-confidence, library-duplicates pre-unchecked), then download the confirmed rows as ONE batch job
-(`jobs.start_batch`). Matching runs in a background registry polled by `ui.timer` — the UI never
-blocks and leaving the page cancels. No pipeline/tag code here.
+Two tabs feed the SAME match/review pipeline: **Paste list** (12) parses ``Artist - Title`` lines /
+CSV; **Playlist URL** (13) reads a public Spotify or Apple Music playlist's track list
+(`app.playlist_import`, metadata only — no DRM'd audio). Both build `ParsedLine`s → `matching`
+(feature 07 search) → a review table → `jobs.start_batch` as ONE batch job. For a URL import to
+WebDAV, the source playlist can be recreated as an `.m3u8` (cross-folder references, no duplicated
+audio). Matching runs in a background registry polled by `ui.timer`. No pipeline/tag code here.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
+from dataclasses import replace
 
-from nicegui import ui
+from nicegui import run, ui
 from sqlmodel import select
 
-from app import jobs, matching
+from app import jobs, matching, playlist_import
 from app.auth import get_current_user
+from app.config import settings
 from app.db import session_scope
 from app.genres import DEFAULT_GENRE
 from app.i18n import audio_format_labels, genre_options, t
 from app.jobs import tag_options_from_settings
 from app.models import UserSettings
-from app.pipeline import normalize_audio_format
+from app.pipeline import PlaylistSpec, normalize_audio_format
 
 log = logging.getLogger("import_page")
 
@@ -54,24 +59,49 @@ def import_content() -> None:
 
     # `matches` holds the finished match run; `selected`/`choice` are keyed by the stable row id
     # (the match's index), NOT list position of a filtered view.
-    state: dict = {"matches": None, "last_finished": True, "selected": {}, "choice": {}}
+    # `playlist` holds the ImportedPlaylist for a URL import (None for a pasted list) → enables
+    # optional m3u recreation and preserves the source track order for the PlaylistSpec.
+    state: dict = {"matches": None, "last_finished": True, "selected": {}, "choice": {},
+                   "playlist": None}
 
     # --- match lifecycle -----------------------------------------------------------------
+    def _run_match(lines: list, playlist=None) -> bool:
+        if not any(p.ok for p in lines):
+            ui.notify(t("import.nothing_to_match"), type="warning")
+            return False
+        if not matching.start_match_lines(uid, lines):
+            ui.notify(t("import.busy"), type="warning")
+            return False
+        state["playlist"] = playlist
+        state["matches"] = None
+        state["last_finished"] = False
+        render_body.refresh()
+        return True
+
     def _start_match() -> None:
         text = paste.value or ""
         non_empty = [ln for ln in text.splitlines() if ln.strip()]
         if len(non_empty) > matching.MAX_LINES:
             ui.notify(t("import.too_many_lines", max=matching.MAX_LINES), type="warning")
             return
-        if not any(p.ok for p in matching.parse_lines(text)):
-            ui.notify(t("import.nothing_to_match"), type="warning")
+        _run_match(matching.parse_lines(text))
+
+    async def _fetch_url() -> None:
+        url = (url_in.value or "").strip()
+        if not url:
             return
-        if not matching.start_match(uid, text):
-            ui.notify(t("import.busy"), type="warning")
+        try:
+            pl = await run.io_bound(playlist_import.fetch_playlist, url)
+        except Exception as exc:  # noqa: BLE001 - fail soft; show the (short) reason
+            ui.notify(t("import.fetch_error", error=str(exc)[:160]), type="warning")
             return
-        state["matches"] = None
-        state["last_finished"] = False
-        render_body.refresh()
+        if len(pl.tracks) > matching.MAX_LINES:
+            pl = replace(pl, tracks=pl.tracks[:matching.MAX_LINES])   # cap; keep match ⇄ m3u in sync
+            ui.notify(t("import.too_many_lines", max=matching.MAX_LINES), type="warning")
+        lines = [matching.ParsedLine(raw=f"{tr.artist} – {tr.title}", artist=tr.artist,
+                                     title=tr.title) for tr in pl.tracks]
+        if _run_match(lines, playlist=pl):
+            ui.notify(t("import.playlist_header", name=pl.name, count=len(pl.tracks)), type="info")
 
     def _poll() -> None:
         st = matching.get_match_state(uid)
@@ -110,11 +140,21 @@ def import_content() -> None:
 
             def confirm() -> None:
                 dialog.close()
+                # Recreate the source playlist as an .m3u8 (WebDAV only) when this was a URL import
+                # and the box is checked — carry the FULL ordered tracklist so already-on-server
+                # tracks are referenced too.
+                spec = None
+                pl = state["playlist"]
+                if (pl is not None and recreate_sw.value and dest_sel.value == "webdav"):
+                    folder_id = "import-" + hashlib.sha1(
+                        f"{pl.source}:{pl.source_id}".encode()).hexdigest()[:12]
+                    spec = PlaylistSpec(name=pl.name, folder_id=folder_id,
+                                        tracks=[(tr.artist, tr.title) for tr in pl.tracks])
                 try:
                     jobs.start_batch(user_id=uid, items=chosen, genre=genre_sel.value,
                                      destination_type=dest_sel.value, audio_format=audio_sel.value,
                                      dedup=bool(dedup_sw.value) and dest_sel.value == "webdav",
-                                     fetch_lyrics=bool(lyrics_sw.value))
+                                     fetch_lyrics=bool(lyrics_sw.value), playlist_spec=spec)
                 except Exception as exc:  # noqa: BLE001 - surface config/validation errors
                     ui.notify(str(exc), type="negative")
                     return
@@ -186,29 +226,44 @@ def import_content() -> None:
                     ui.label(f"{m.line.raw}  —  {reason}").classes(
                         "text-xs text-white/50 break-all py-0.5")
 
-    # --- header + paste + options (outside the refreshable) ------------------------------
+    # --- header + input tabs + options (outside the refreshable) -------------------------
     with ui.card().classes("glass w-full rounded-2xl p-6 gap-4"):
         with ui.row().classes("items-center gap-3"):
             ui.icon("playlist_add", size="26px").classes("accent-text")
             ui.label(t("import.heading")).classes("text-xl font-semibold accent-text")
         ui.label(t("import.intro")).classes("text-xs text-white/50")
 
-        paste = ui.textarea(placeholder=t("import.placeholder")) \
-            .props("outlined dense dark autogrow").classes("w-full font-mono text-sm")
+        with ui.tabs().props("dense").classes("w-full") as tabs:
+            tab_paste = ui.tab("paste", label=t("import.tab_paste"))
+            tab_url = ui.tab("url", label=t("import.tab_url"))
+        with ui.tab_panels(tabs, value=tab_paste).classes("w-full"):
+            with ui.tab_panel(tab_paste).classes("p-0 pt-2"):
+                paste = ui.textarea(placeholder=t("import.placeholder")) \
+                    .props("outlined dense dark autogrow").classes("w-full font-mono text-sm")
 
-        @ui.refreshable
-        def render_count() -> None:
-            parsed = matching.parse_lines(paste.value or "")
-            ok = sum(1 for p in parsed if p.ok)
-            bad = len(parsed) - ok
-            if parsed:
-                ui.label(t("import.parsed_count", ok=ok, skipped=bad)).classes(
-                    "text-xs text-white/50")
+                @ui.refreshable
+                def render_count() -> None:
+                    parsed = matching.parse_lines(paste.value or "")
+                    ok = sum(1 for p in parsed if p.ok)
+                    if parsed:
+                        ui.label(t("import.parsed_count", ok=ok, skipped=len(parsed) - ok)).classes(
+                            "text-xs text-white/50")
 
-        paste.on_value_change(lambda: render_count.refresh())
-        render_count()
+                paste.on_value_change(lambda: render_count.refresh())
+                render_count()
+                ui.button(t("import.match_button"), icon="search", on_click=_start_match) \
+                    .props("unelevated").classes("accent-grad text-white hover-glow self-start px-6")
+            with ui.tab_panel(tab_url).classes("p-0 pt-2 gap-2"):
+                url_in = ui.input(placeholder=t("import.url_placeholder")) \
+                    .props("outlined dense dark clearable").classes("w-full")
+                url_in.on("keydown.enter", lambda: _fetch_url())
+                hint = "import.url_hint" if settings.spotify_configured \
+                    else "import.url_hint_apple_only"
+                ui.label(t(hint)).classes("text-xs text-white/40")
+                ui.button(t("import.url_button"), icon="cloud_download", on_click=_fetch_url) \
+                    .props("unelevated").classes("accent-grad text-white hover-glow self-start px-6")
 
-        # Download options (default from the user's saved settings).
+        # Download options (shared by both tabs; defaults from the user's saved settings).
         with ui.row().classes("w-full gap-4 items-start flex-wrap"):
             with ui.column().classes("gap-1.5 flex-1 min-w-32"):
                 ui.label(t("index.genre_label")).classes("text-xs text-white/50")
@@ -228,9 +283,11 @@ def import_content() -> None:
                 .props("dense color=primary").classes("text-sm")
             lyrics_sw = ui.switch(t("index.lyrics_label"), value=d_lyrics) \
                 .props("dense color=primary").classes("text-sm")
-
-        ui.button(t("import.match_button"), icon="search", on_click=_start_match) \
-            .props("unelevated").classes("accent-grad text-white hover-glow self-start px-6")
+            # Recreate the imported playlist as an .m3u8 — WebDAV only (references need library paths).
+            recreate_sw = ui.switch(t("import.recreate_label"), value=True) \
+                .props("dense color=primary").classes("text-sm")
+            recreate_sw.set_visibility(d_dest == "webdav")
+            dest_sel.on_value_change(lambda e: recreate_sw.set_visibility(e.value == "webdav"))
 
     render_body()
     ui.timer(1.5, _poll)
