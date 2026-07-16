@@ -85,6 +85,9 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "index.genre_label": "Genre",
         "index.mode_label": "Modus",
         "index.audio_label": "Qualität / Format",
+        "index.bandcamp_hint": "Bandcamp streamt frei nur ~128 kbit/s MP3 (verlustfrei ist nur "
+                               "kaufbar). Für ehrliche Qualität „Original“ wählen — remuxt statt "
+                               "auf Fake-320 hochzurechnen.",
         "index.dest_label": "Ziel",
         "index.start_button": "Download starten",
         "index.active_heading": "Aktive Downloads",
@@ -566,6 +569,9 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "index.genre_label": "Genre",
         "index.mode_label": "Mode",
         "index.audio_label": "Quality / format",
+        "index.bandcamp_hint": "Bandcamp free streams are only ~128 kbps MP3 (lossless is "
+                               "purchase-only). Pick “Original” for honest quality — it remuxes "
+                               "instead of upscaling to a fake 320.",
         "index.dest_label": "Destination",
         "index.start_button": "Start download",
         "index.active_heading": "Active downloads",
