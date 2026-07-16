@@ -38,6 +38,7 @@ _WORDMARK = (
 # Sidebar entries: (i18n key, route, active-key, Material icon).
 _NAV_ITEMS = [
     ("nav.download", "/", "download", "download"),
+    ("nav.search", "/search", "search", "search"),
     ("nav.library", "/library", "library", "library_music"),
     ("nav.duplicates", "/duplicates", "duplicates", "content_copy"),
     ("nav.health", "/health", "health", "health_and_safety"),
@@ -249,8 +250,8 @@ def _build_header(drawer) -> None:
                 ):
                     ui.label((name or "?")[:1].upper())
                 ui.label(name).classes("text-sm text-white/75")
-            ui.button(icon="logout", on_click=lambda: ui.navigate.to("/logout")) \
-                .props("flat round dense").classes("text-white/60").tooltip(t("nav.logout"))
+            icon_button(icon="logout", on_click=lambda: ui.navigate.to("/logout")) \
+                .tooltip(t("nav.logout"))
 
 
 def _build_sidebar(active: str):
@@ -273,8 +274,7 @@ def _build_sidebar(active: str):
             # this is the only always-reachable way to collapse the sidebar without a
             # touch swipe.
             with ui.row().classes("w-full").style("justify-content:flex-end; margin-bottom:2px"):
-                ui.button(icon="close", on_click=_close).props("flat round dense") \
-                    .classes("text-white/60").tooltip(t("nav.close_menu"))
+                icon_button(icon="close", on_click=_close).tooltip(t("nav.close_menu"))
             for key, target, active_key, icon in _NAV_ITEMS:
                 link = _sidebar_item(key, target, active_key, icon, active)
                 nav_items.append((link, active_key))
@@ -300,6 +300,38 @@ def _build_footer() -> None:
                 with ui.link(target=url, new_tab=True).classes("sp-footer-link"):
                     ui.icon(icon, size="18px")
                     ui.label(label)
+
+
+def primary_button(text: str = "", *, icon: str | None = None, on_click=None):
+    """The main call-to-action: a flat teal→violet gradient pill with a hover glow.
+
+    Returns the button so a caller can chain contextual tweaks — ``.props("dense")`` for an
+    inline/row button, ``.classes("self-end")`` for alignment, ``.tooltip(...)``. Every
+    primary action in the app goes through here so they can't drift apart again."""
+    return ui.button(text, icon=icon, on_click=on_click) \
+        .props("unelevated no-caps").classes("accent-grad text-white hover-glow rounded-lg px-4")
+
+
+def secondary_button(text: str = "", *, icon: str | None = None, on_click=None):
+    """A secondary action: outlined, no fill (scans, exports, list-level actions)."""
+    return ui.button(text, icon=icon, on_click=on_click) \
+        .props("outline no-caps").classes("text-white/90 rounded-lg")
+
+
+def ghost_button(text: str = "", *, icon: str | None = None, on_click=None):
+    """A tertiary / cancel action: flat text, no border, muted colour.
+
+    ``color=None`` drops Quasar's default ``color=primary`` (whose ``.text-primary`` would
+    otherwise win over the Tailwind class), so the label and icon reliably render in the
+    muted grey below — a cancel/secondary action shouldn't wear the accent colour."""
+    return ui.button(text, icon=icon, on_click=on_click, color=None) \
+        .props("flat no-caps").classes("text-white/70")
+
+
+def icon_button(*, icon: str, on_click=None):
+    """A round, borderless icon-only button (toolbar / inline row actions)."""
+    return ui.button(icon=icon, on_click=on_click, color=None) \
+        .props("flat round dense").classes("text-white/60")
 
 
 def tag_option_switches(values) -> dict:

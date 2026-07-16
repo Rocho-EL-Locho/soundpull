@@ -17,8 +17,11 @@ from sqlmodel import select
 from app import health
 from app.auth import get_current_user
 from app.db import session_scope
-from app.i18n import t
+from app.genres import DEFAULT_GENRE
+from app.i18n import genre_options, t
 from app.models import UserSettings
+from app.theme import ghost_button, primary_button
+from app.theme import ghost_button, icon_button, primary_button, secondary_button
 
 log = logging.getLogger("health_page")
 
@@ -45,6 +48,7 @@ def health_content() -> None:
         uid = user.id
         us = session.exec(select(UserSettings).where(UserSettings.user_id == uid)).first()
         has_webdav = bool(us and us.webdav_url)
+        d_genre = us.default_genre if us else DEFAULT_GENRE
 
     state: dict = {"report": health.load_report(uid), "last_finished": True}
 
@@ -90,11 +94,16 @@ def health_content() -> None:
                             if not (f.check_id == check_id and f.rel_path == rel_path)]
 
     async def _do_cheap_fix(finding) -> None:
+        # A persistent spinner so the user sees the fix is running (some cheap fixes — a folder
+        # lyrics backfill — still take a few seconds), dismissed when it finishes.
+        note = ui.notification(t("health.fixing"), type="ongoing", spinner=True, timeout=None)
         try:
             res = await run.io_bound(health.fix_finding, uid, finding.check_id, finding.rel_path)
         except Exception as exc:  # noqa: BLE001
             ui.notify(t("health.fix_error", error=exc), type="negative")
             return
+        finally:
+            note.dismiss()
         if not res.ok:
             ui.notify(t("health.fix_error", error=res.error or "?"), type="negative")
             return
@@ -103,14 +112,19 @@ def health_content() -> None:
         ui.notify(t("health.fixed"), type="positive")
         render_body.refresh()
 
-    async def _do_deep_fix(finding) -> None:
+    async def _do_deep_fix(finding, genre: str | None = None) -> None:
         album = finding.rel_path if finding.check_id == "year_split" \
             else posixpath.dirname(finding.rel_path)
+        # Deep fixes download the whole album + re-upload, which can take a while — always show
+        # a spinner so the click has visible feedback (user report: "no feedback when fixing").
+        note = ui.notification(t("health.fixing"), type="ongoing", spinner=True, timeout=None)
         try:
-            res = await run.io_bound(health.fix_album, uid, album, {finding.check_id})
+            res = await run.io_bound(health.fix_album, uid, album, {finding.check_id}, genre)
         except Exception as exc:  # noqa: BLE001
             ui.notify(t("health.fix_error", error=exc), type="negative")
             return
+        finally:
+            note.dismiss()
         if not res.ok:
             ui.notify(t("health.fix_error", error=res.error or "?"), type="negative")
             return
@@ -123,10 +137,16 @@ def health_content() -> None:
         ui.notify(t("health.fixed"), type="positive")
         render_body.refresh()
 
-    def _confirm_then(finding, action) -> None:
-        """Trash fixes get a confirm dialog; additive fixes run straight away."""
+    async def _confirm_then(finding, action) -> None:
+        """Trash fixes get a confirm dialog; additive fixes run straight away.
+
+        NOTE: this MUST be async and ``await action(finding)`` — the fix functions are
+        coroutines, so the old sync ``action(finding)`` created an un-awaited coroutine that
+        never ran, so additive fixes (genre/cover/year/lyrics) silently did nothing (user
+        report: "no feedback when fixing").
+        """
         if finding.check_id not in _TRASH_CHECKS:
-            action(finding)
+            await action(finding)
             return
         dialog = ui.dialog()
         with dialog, ui.card().classes("glass w-full max-w-sm rounded-2xl p-4 gap-2"):
@@ -138,10 +158,36 @@ def health_content() -> None:
                 await action(finding)
 
             with ui.row().classes("w-full justify-end gap-2 pt-2"):
-                ui.button(t("settings.cancel"), on_click=dialog.close).props("flat")
-                ui.button(t("health.fix"), icon="cleaning_services",
-                          on_click=confirm).classes("accent-grad text-white")
+                ghost_button(t("settings.cancel"), on_click=dialog.close)
+                primary_button(t("health.fix"), icon="cleaning_services", on_click=confirm)
         dialog.open()
+
+    def _pick_genre_then_fix(finding) -> None:
+        """H7 genre fix: let the user pick WHICH genre to write instead of silently using the
+        saved default (user request)."""
+        dialog = ui.dialog()
+        with dialog, ui.card().classes("glass w-full max-w-sm rounded-2xl p-4 gap-2"):
+            ui.label(t("health.choose_genre")).classes("font-semibold")
+            ui.label(finding.detail or finding.rel_path).classes(
+                "text-xs text-white/50 break-all")
+            sel = ui.select(genre_options(), value=d_genre) \
+                .props("outlined dense dark").classes("w-full")
+
+            async def confirm() -> None:
+                dialog.close()
+                await _do_deep_fix(finding, genre=sel.value)
+
+            with ui.row().classes("w-full justify-end gap-2 pt-2"):
+                ghost_button(t("settings.cancel"), on_click=dialog.close)
+                primary_button(t("health.fix"), icon="build", on_click=confirm)
+        dialog.open()
+
+    def _fix_click(finding, action) -> None:
+        """Route a fix click: genre gets a picker, everything else the confirm/run path."""
+        if finding.check_id == "genre_missing":
+            _pick_genre_then_fix(finding)
+        else:
+            return _confirm_then(finding, action)  # coroutine → NiceGUI awaits it
 
     # --- rendering -----------------------------------------------------------------------
     def _check_card(check_id: str, findings: list, is_deep: bool) -> None:
@@ -158,10 +204,9 @@ def health_content() -> None:
                         ui.label(f.detail or f.rel_path).classes(
                             "text-xs text-white/60 truncate flex-1 min-w-0").tooltip(f.rel_path)
                         if f.fixable:
-                            ui.button(icon="build",
-                                      on_click=lambda fi=f: _confirm_then(fi, action)) \
-                                .props("flat dense round size=sm").classes("text-white/70 shrink-0") \
-                                .tooltip(t("health.fix"))
+                            icon_button(icon="build",
+                                        on_click=lambda fi=f: _fix_click(fi, action)) \
+                                .props("size=sm").classes("shrink-0").tooltip(t("health.fix"))
 
     @ui.refreshable
     def render_body() -> None:
@@ -205,11 +250,10 @@ def health_content() -> None:
         with ui.row().classes("w-full items-center justify-between flex-wrap gap-2"):
             ui.label(t("health.heading")).classes("text-xl font-semibold accent-text")
             with ui.row().classes("items-center gap-2"):
-                ui.button(t("health.run_cheap"), icon="search",
-                          on_click=lambda: _start("cheap")).props("outline").classes("text-white/90")
-                ui.button(t("health.run_deep"), icon="travel_explore",
-                          on_click=lambda: _start("deep_batch")).props("outline") \
-                    .classes("text-white/90")
+                secondary_button(t("health.run_cheap"), icon="search",
+                                 on_click=lambda: _start("cheap"))
+                secondary_button(t("health.run_deep"), icon="travel_explore",
+                                 on_click=lambda: _start("deep_batch"))
         ui.label(t("health.intro")).classes("text-xs text-white/50")
 
     render_body()

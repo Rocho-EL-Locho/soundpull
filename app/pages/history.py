@@ -21,6 +21,7 @@ from app.i18n import t
 from app.jobs import start_batch, start_job
 from app.models import DownloadHistory, UserSettings
 from app.pipeline import audio_format_short
+from app.theme import ghost_button, primary_button
 
 log = logging.getLogger("pages.history")
 
@@ -168,18 +169,15 @@ def history_content() -> None:
                 ui.label(t(it["warning"], failed=it["failed"], total=it["total"])).classes(
                     "text-amber-400 text-xs")
             with ui.row().classes("items-center gap-2 pt-1"):
-                ui.button(t("history.action_details"), icon="info",
-                          on_click=lambda d=it: _details(d)) \
-                    .props("flat dense").classes("text-white/70")
+                ghost_button(t("history.action_details"), icon="info",
+                             on_click=lambda d=it: _details(d)).props("dense")
                 # Retry/delete only on a finished job: retrying a running one starts a duplicate
                 # download, and deleting it drops the row its worker is still writing to.
                 if it["phase"] in _TERMINAL_PHASES:
-                    ui.button(t("history.action_retry"), icon="replay",
-                              on_click=lambda i=it["id"]: _retry(i)) \
-                        .props("unelevated dense").classes("accent-grad text-white")
-                    ui.button(t("history.action_delete"), icon="delete",
-                              on_click=lambda i=it["id"]: _delete(i)) \
-                        .props("flat dense").classes("text-white/70")
+                    primary_button(t("history.action_retry"), icon="replay",
+                                   on_click=lambda i=it["id"]: _retry(i)).props("dense")
+                    ghost_button(t("history.action_delete"), icon="delete",
+                                 on_click=lambda i=it["id"]: _delete(i)).props("dense")
 
     def _retry(rid: str) -> None:
         with session_scope() as session:
@@ -235,9 +233,8 @@ def history_content() -> None:
                 render_list.refresh()
 
             with ui.row().classes("w-full justify-end gap-2 pt-2"):
-                ui.button(t("settings.cancel"), on_click=dialog.close).props("flat")
-                ui.button(t("history.confirm_delete_yes"), icon="delete", on_click=confirm) \
-                    .classes("accent-grad text-white")
+                ghost_button(t("settings.cancel"), on_click=dialog.close)
+                primary_button(t("history.confirm_delete_yes"), icon="delete", on_click=confirm)
         dialog.open()
 
     def _details(it: dict) -> None:
@@ -282,7 +279,7 @@ def history_content() -> None:
             else:
                 ui.label(t("history.detail_no_log")).classes("text-white/40 text-xs")
             with ui.row().classes("w-full justify-end gap-2 pt-2"):
-                ui.button(t("settings.cancel"), on_click=dialog.close).props("flat")
+                ghost_button(t("settings.cancel"), on_click=dialog.close)
         dialog.open()
 
     ui.label(t("history.heading")).classes("text-xl font-semibold accent-text")

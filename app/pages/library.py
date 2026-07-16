@@ -23,6 +23,7 @@ from app.db import session_scope
 from app.i18n import t
 from app.models import UserSettings
 from app.pages._shared import run_library_task
+from app.theme import ghost_button, icon_button, primary_button, secondary_button
 
 log = logging.getLogger("library")
 
@@ -149,9 +150,8 @@ def library_content() -> None:
                 render_browser.refresh()
 
             with ui.row().classes("w-full justify-end gap-2 pt-2"):
-                ui.button(t("settings.cancel"), on_click=dialog.close).props("flat")
-                ui.button(t("library.delete_yes"), icon="delete", on_click=confirm) \
-                    .classes("accent-grad text-white")
+                ghost_button(t("settings.cancel"), on_click=dialog.close)
+                primary_button(t("library.delete_yes"), icon="delete", on_click=confirm)
         dialog.open()
 
     def _confirm_trash_album(album) -> None:
@@ -174,9 +174,8 @@ def library_content() -> None:
                 render_browser.refresh()
 
             with ui.row().classes("w-full justify-end gap-2 pt-2"):
-                ui.button(t("settings.cancel"), on_click=dialog.close).props("flat")
-                ui.button(t("library.delete_yes"), icon="delete", on_click=confirm) \
-                    .classes("accent-grad text-white")
+                ghost_button(t("settings.cancel"), on_click=dialog.close)
+                primary_button(t("library.delete_yes"), icon="delete", on_click=confirm)
         dialog.open()
 
     # --- selection -----------------------------------------------------------------------
@@ -265,12 +264,10 @@ def library_content() -> None:
             # Album-level actions: delete folder, backfill lyrics, open in Navidrome (albums
             # only — a playlist folder has no Navidrome album to point at).
             with ui.row().classes("items-center gap-1 flex-wrap px-1 pb-1"):
-                ui.button(t("library.delete_album"), icon="delete",
-                          on_click=lambda al=album: _confirm_trash_album(al)) \
-                    .props("flat dense no-caps").classes("text-white/70")
-                ui.button(t("library.backfill_album"), icon="lyrics",
-                          on_click=lambda al=album: _backfill_album(al)) \
-                    .props("flat dense no-caps").classes("text-white/70")
+                ghost_button(t("library.delete_album"), icon="delete",
+                             on_click=lambda al=album: _confirm_trash_album(al)).props("dense")
+                ghost_button(t("library.backfill_album"), icon="lyrics",
+                             on_click=lambda al=album: _backfill_album(al)).props("dense")
                 nav_url = _navidrome_album_url(navidrome, album.name) \
                     if state["kind"] == "artist" else ""
                 if nav_url:  # only for a valid http(s) base (guards a javascript: self-XSS)
@@ -280,10 +277,9 @@ def library_content() -> None:
                 with ui.row().classes("w-full flex-nowrap items-center justify-between "
                                       "gap-2 px-1"):
                     ui.label(track.title).classes("text-sm text-white/85 truncate flex-1 min-w-0")
-                    ui.button(icon="delete",
-                              on_click=lambda tr=track: _confirm_trash_track(tr)) \
-                        .props("flat dense round size=sm").classes("text-white/50 shrink-0") \
-                        .tooltip(t("library.delete_track"))
+                    icon_button(icon="delete",
+                                on_click=lambda tr=track: _confirm_trash_track(tr)) \
+                        .props("size=sm").classes("shrink-0").tooltip(t("library.delete_track"))
 
     # --- render --------------------------------------------------------------------------
     @ui.refreshable
@@ -302,8 +298,7 @@ def library_content() -> None:
                 ui.label(t("library.empty")).classes("text-white/60")
                 if not has_webdav:
                     ui.label(t("library.empty_no_webdav")).classes("text-amber-300 text-sm")
-                ui.button(t("library.empty_scan"), icon="cloud_sync", on_click=rescan) \
-                    .props("outline").classes("text-white/90")
+                secondary_button(t("library.empty_scan"), icon="cloud_sync", on_click=rescan)
             return
         view = library_index.filter_tree(tree, state["search"])
         with ui.element("div").classes("w-full flex flex-col md:flex-row gap-4 items-start"):
@@ -320,8 +315,7 @@ def library_content() -> None:
     with ui.card().classes("glass w-full rounded-2xl p-6 gap-3"):
         with ui.row().classes("w-full items-center justify-between flex-wrap gap-2"):
             ui.label(t("library.heading")).classes("text-xl font-semibold accent-text")
-            ui.button(t("library.rescan"), icon="cloud_sync", on_click=rescan) \
-                .props("outline").classes("text-white/90")
+            secondary_button(t("library.rescan"), icon="cloud_sync", on_click=rescan)
         render_stats()
         ui.input(t("library.search"),
                  on_change=lambda e: _on_search(e.value)) \

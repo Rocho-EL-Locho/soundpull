@@ -134,7 +134,9 @@ def _normalize(item: dict, kind: str) -> Optional[SearchResult]:
         if not browse:
             return None
         name = str(item.get("artist") or item.get("title") or "").strip()
-        return SearchResult("artist", name, "", artist_url(browse), None, thumb)
+        # Keep the channel/browse id (not just the URL) so the browse page can drill into the
+        # artist via get_artist(browse_id).
+        return SearchResult("artist", name, "", artist_url(browse), browse, thumb)
     if kind == "playlist":
         list_id = item.get("playlistId") or item.get("browseId")
         if not list_id:
@@ -228,3 +230,94 @@ def resolve_album_url(browse_id: str) -> str:
     except Exception as exc:  # noqa: BLE001 - fail soft
         log.info("album resolve failed for %r: %s", browse_id, exc)
         raise SearchError(str(exc)[:200]) from exc
+
+
+# --- Browse / drill-down (roadmap: dedicated search page) --------------------
+
+@dataclass(frozen=True)
+class ArtistDetail:
+    """An artist's page: their albums, singles and top songs (for the browse view)."""
+    name: str
+    thumbnail: Optional[str]
+    albums: list[SearchResult]
+    singles: list[SearchResult]
+    songs: list[SearchResult]
+
+
+@dataclass(frozen=True)
+class AlbumDetail:
+    """One album's page: cover + downloadable playlist URL + its track list."""
+    title: str
+    artist: str
+    thumbnail: Optional[str]
+    url: Optional[str]              # album playlist URL (download the whole album), if resolvable
+    tracks: list[SearchResult]     # each a "song" SearchResult with a watch URL
+
+
+def _album_like(item: dict, kind: str) -> Optional[SearchResult]:
+    """Normalize an album/single item from `get_artist` (it carries `audioPlaylistId`, unlike a
+    search result's `playlistId`), preferring the direct playlist id so no on-click resolve is
+    needed; falls back to the `browseId` for a later `resolve_album_url`."""
+    if not isinstance(item, dict):
+        return None
+    pid = item.get("audioPlaylistId") or item.get("playlistId")
+    browse = item.get("browseId")
+    if not pid and not browse:
+        return None
+    return SearchResult(kind, str(item.get("title") or "").strip(), _first_artist(item),
+                        album_url(pid) if pid else None, browse, _thumbnail(item))
+
+
+def get_artist(browse_id: str) -> ArtistDetail:
+    """Fetch an artist's albums / singles / top songs for the browse page (fail-soft like search)."""
+    try:
+        yt = _client()
+        a = yt.get_artist(browse_id) or {}
+    except Exception as exc:  # noqa: BLE001 - fail soft; never leak a stack to the UI
+        log.info("get_artist failed for %r: %s", browse_id, exc)
+        raise SearchError(str(exc)[:200]) from exc
+
+    def _section(key: str, kind: str, mapper) -> list[SearchResult]:
+        sec = a.get(key)
+        items = sec.get("results") if isinstance(sec, dict) else (sec if isinstance(sec, list) else [])
+        out: list[SearchResult] = []
+        for it in items or []:
+            try:
+                r = mapper(it, kind)
+            except Exception as exc:  # noqa: BLE001 - skip a malformed item
+                log.info("skipping malformed artist %s item: %s", kind, exc)
+                continue
+            if r is not None:
+                out.append(r)
+        return out
+
+    return ArtistDetail(
+        name=str(a.get("name") or "").strip(),
+        thumbnail=_thumbnail(a),
+        albums=_section("albums", "album", _album_like),
+        singles=_section("singles", "album", _album_like),
+        songs=_section("songs", "song", _normalize),
+    )
+
+
+def get_album_detail(browse_id: str) -> AlbumDetail:
+    """Fetch one album's cover, downloadable URL and track list for the browse page."""
+    try:
+        yt = _client()
+        album = yt.get_album(browse_id) or {}
+    except Exception as exc:  # noqa: BLE001 - fail soft
+        log.info("get_album_detail failed for %r: %s", browse_id, exc)
+        raise SearchError(str(exc)[:200]) from exc
+    pid = album.get("audioPlaylistId")
+    tracks: list[SearchResult] = []
+    for t in album.get("tracks") or []:
+        if not isinstance(t, dict):
+            continue
+        vid = t.get("videoId")
+        if not vid:
+            continue
+        tracks.append(SearchResult("song", str(t.get("title") or "").strip(),
+                                   _first_artist(t), song_url(vid), None, _thumbnail(t)))
+    return AlbumDetail(title=str(album.get("title") or "").strip(), artist=_first_artist(album),
+                       thumbnail=_thumbnail(album), url=album_url(pid) if pid else None,
+                       tracks=tracks)

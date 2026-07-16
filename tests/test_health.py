@@ -210,6 +210,16 @@ def test_decode_error_flags_corrupt_only(tmp_path):
     assert health._decode_error(bad) is not None
 
 
+def test_is_cover_noise_classifies_image_lines():
+    # Image/cover-stream lines (a mislabeled JPEG-as-PNG cover) are NOT audio corruption.
+    assert health._is_cover_noise("[png @ 0x55] Invalid PNG signature 0xFFD8FFE000104A46.")
+    assert health._is_cover_noise("[mjpeg @ 0x1] error")
+    assert health._is_cover_noise("vist#0:1/png @ 0x2")
+    # A real audio-decode error is kept.
+    assert not health._is_cover_noise("[mp3float @ 0x9] Header missing")
+    assert not health._is_cover_noise("[mp3 @ 0x9] Error while decoding stream")
+
+
 @needs_ffmpeg
 def test_detect_album_finds_year_split_and_missing_tags(tmp_path):
     a, b = tmp_path / "a.mp3", tmp_path / "b.mp3"
@@ -265,6 +275,28 @@ def test_cheap_run_persists_and_reloads(env):
     with scope() as s:
         assert s.exec(select(HealthReport).where(HealthReport.user_id == 1)).first()
     assert {f.check_id for f in health.load_report(1).cheap} == ids
+
+
+def test_load_report_prunes_stale_cover_false_positives(env):
+    # A pre-fix report flagged a mislabeled-cover track as corrupt_audio. On load those bogus
+    # findings are dropped (they can't self-clear — the deep check skips checked albums), while a
+    # genuine audio-decode finding is kept.
+    report = health.Report(
+        created_at=health._now_iso(),
+        deep=[
+            health.Finding("corrupt_audio", "A/x.mp3",
+                           detail="[png @ 0x1] Invalid PNG signature 0xFFD8FFE0"),
+            health.Finding("corrupt_audio", "A/y.mp3", detail="[mp3float @ 0x2] Header missing"),
+            health.Finding("cover_missing", "A/z.mp3", detail="z.mp3", fixable=True),
+        ],
+        checked_albums=["A"],
+    )
+    health._persist(1, report)
+
+    loaded = health.load_report(1)
+    corrupt = [f for f in loaded.deep if f.check_id == "corrupt_audio"]
+    assert [f.rel_path for f in corrupt] == ["A/y.mp3"]        # only the real one kept
+    assert any(f.check_id == "cover_missing" for f in loaded.deep)  # other checks untouched
 
 
 def test_deep_batch_is_resumable_and_bounded(env):

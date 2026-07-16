@@ -3,9 +3,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from nicegui import run, ui
+from nicegui import ui
 
-from app import search
 from app.auth import get_current_user
 from app.db import session_scope
 from app.fix_music_tags import TagOptions
@@ -13,8 +12,15 @@ from app.genres import DEFAULT_GENRE
 from app.i18n import audio_format_labels, genre_options, t
 from app.jobs import JobState, get_user_jobs, start_job, tag_options_from_settings
 from app.pipeline import is_supported_url, normalize_audio_format
-from app.sources import detect_source, suggest_mode
-from app.theme import tag_option_switches
+from app.sources import detect_source, source_labels, suggest_mode
+from app.theme import primary_button, tag_option_switches
+
+
+def _needs_cookie(err: str | None) -> bool:
+    """Heuristic: does this download error mean YouTube wants a cookie (bot-check / age gate)?"""
+    e = (err or "").lower()
+    return ("sign in to confirm" in e or "not a bot" in e
+            or "--cookies" in e or "confirm your age" in e)
 
 
 def _phase_order(js: JobState) -> list[str]:
@@ -68,13 +74,17 @@ def _job_card(js: JobState, delivered: set[str]) -> None:
 
         if js.phase == "error":
             ui.label(js.error or t("index.unknown_error")).classes("text-red-400 text-sm")
+            if _needs_cookie(js.error):
+                with ui.row().classes("items-start gap-1"):
+                    ui.icon("cookie", size="16px").classes("text-amber-300 mt-0.5")
+                    ui.label(t("index.cookie_needed")).classes("text-amber-300 text-xs flex-1")
         elif js.phase == "done":
             with ui.row().classes("items-center gap-3"):
                 ui.label(t("index.completed")).classes("text-emerald-400 text-sm")
                 if js.result_path:
-                    ui.button(t("index.download_zip"), icon="download",
-                              on_click=lambda p=js.result_path, n=js.result_name: ui.download.file(p, n)) \
-                        .props("unelevated dense").classes("accent-grad text-white")
+                    primary_button(t("index.download_zip"), icon="download",
+                                   on_click=lambda p=js.result_path, n=js.result_name:
+                                   ui.download.file(p, n)).props("dense")
                 elif js.destination_type == "webdav" and js.summary:
                     ui.label(js.summary).classes("text-xs text-white/50")
             if js.warning:  # index update failed (#38), or a partial delivery (throttle/403)
@@ -132,18 +142,25 @@ def index_content(url: str = "") -> None:
     ui.label(t("index.subtitle")).classes("text-white/50 text-sm")
 
     with ui.card().classes("glass w-full rounded-2xl p-7 gap-5"):
-        # In-app YouTube Music search (roadmap 07): sits ABOVE the URL field. Built into this
-        # placeholder at the END of the card so its click handlers can reference url_in / mode_tgl /
-        # start_btn (defined further down). Fails soft — a search error never touches the form.
-        search_slot = ui.column().classes("w-full gap-2")
-
-        # URL — external label + link-prefixed input (no floating label).
+        # URL — external label + link-prefixed input (no floating label). A source hint spells
+        # out that more than YouTube Music is accepted (SoundCloud / Bandcamp) — built from the
+        # source registry so it stays correct when a source is added. In-app SEARCH lives on its
+        # own page (/search) now, so this page is purely paste-a-link.
         with ui.column().classes("w-full gap-1.5"):
             _field_label(t("index.url_label"))
-            url_in = ui.input(value=url, placeholder="https://music.youtube.com/...") \
+            url_in = ui.input(value=url,
+                              placeholder="https://music.youtube.com/… · soundcloud.com/… · "
+                                          "…bandcamp.com/…") \
                 .props("outlined dense dark").classes("w-full")
             with url_in.add_slot("prepend"):
                 ui.icon("link").classes("text-white/40")
+            ui.label(t("index.url_hint", sources=", ".join(source_labels()))) \
+                .classes("text-xs text-white/40")
+
+        # Everything below tunes HOW the chosen item downloads — grouped under one heading so
+        # the "what to download" block above reads as a separate, primary decision.
+        ui.label(t("index.options_label")) \
+            .classes("text-xs uppercase tracking-widest text-white/45 pt-2")
 
         # Genre + audio format, side by side.
         with ui.row().classes("w-full gap-4 items-start"):
@@ -282,91 +299,8 @@ def index_content(url: str = "") -> None:
             except Exception as exc:  # noqa: BLE001 - show config/validation errors
                 ui.notify(str(exc), type="negative")
 
-        start_btn = ui.button(t("index.start_button"), icon="download", on_click=start) \
-            .props("unelevated").classes("accent-grad text-white hover-glow self-end px-6")
-
-        # --- Search section (built into the top placeholder now that the form widgets exist) ---
-        _MODE_FOR_KIND = {"song": "single", "album": "album",
-                          "playlist": "playlist", "artist": "artist"}
-        search_state: dict = {"results": []}
-
-        def _fill_from_result(r: search.SearchResult, url: str) -> None:
-            # Set the mode as an EXPLICIT choice (latch manual) so the URL's auto-suggestion
-            # (feature 02) can't override it; then set the URL (its handler early-returns on manual).
-            mode_state["manual"] = True
-            mode_tgl.set_value(_MODE_FOR_KIND.get(r.kind, "album"))
-            url_in.value = url
-            search_state["results"] = []
-            render_results.refresh()
-            start_btn.run_method("focus")
-
-        async def _pick(r: search.SearchResult) -> None:
-            url = r.url
-            if url is None:  # an album whose OLAK5uy_ id wasn't in the search payload
-                try:
-                    url = await run.io_bound(search.resolve_album_url, r.browse_id)
-                except Exception:  # noqa: BLE001 - fail soft
-                    ui.notify(t("search.failed"), type="warning")
-                    return
-            _fill_from_result(r, url)
-
-        _KIND_GROUPS = (("song", "search.songs"), ("album", "search.albums"),
-                        ("artist", "search.artists"), ("playlist", "search.playlists"))
-
-        @ui.refreshable
-        def render_results() -> None:
-            results = search_state["results"]
-            if not results:
-                return
-            with ui.column().classes("w-full gap-3"):
-                for kind, label_key in _KIND_GROUPS:
-                    group = [r for r in results if r.kind == kind]
-                    if not group:
-                        continue
-                    ui.label(t(label_key)).classes(
-                        "text-xs uppercase tracking-widest text-white/50")
-                    with ui.row().classes("w-full flex-wrap gap-2"):
-                        for r in group:
-                            _result_card(r)
-
-        def _result_card(r: search.SearchResult) -> None:
-            card = ui.element("div").classes(
-                "sp-dest-card cursor-pointer flex items-center gap-3 !w-auto max-w-full") \
-                .on("click", lambda rr=r: _pick(rr))
-            with card:
-                if r.thumbnail:
-                    ui.image(r.thumbnail).classes("w-10 h-10 rounded object-cover shrink-0")
-                else:
-                    ui.icon("music_note", size="24px").classes("text-white/40 shrink-0")
-                with ui.column().classes("gap-0 min-w-0"):
-                    ui.label(r.title or "…").classes("sp-dest-title truncate")
-                    if r.artist:
-                        ui.label(r.artist).classes("text-xs text-white/50 truncate")
-
-        async def _do_search() -> None:
-            q = (search_in.value or "").strip()
-            if not q:
-                return
-            try:
-                results = await run.io_bound(search.search_music, q)
-            except Exception:  # noqa: BLE001 - SearchError or anything else → soft warning
-                ui.notify(t("search.failed"), type="warning")
-                return
-            search_state["results"] = results
-            render_results.refresh()
-            if not results:
-                ui.notify(t("search.no_results"), type="info")
-
-        with search_slot:
-            with ui.column().classes("w-full gap-1.5"):
-                _field_label(t("search.label"))
-                with ui.row().classes("w-full gap-2 items-center flex-nowrap"):
-                    search_in = ui.input(placeholder=t("search.placeholder")) \
-                        .props("outlined dense dark clearable").classes("flex-1 min-w-0")
-                    search_in.on("keydown.enter", lambda: _do_search())
-                    ui.button(t("search.button"), icon="search", on_click=_do_search) \
-                        .props("unelevated dense").classes("accent-grad text-white shrink-0")
-            render_results()
+        primary_button(t("index.start_button"), icon="download", on_click=start) \
+            .classes("self-end px-6")
 
     ui.label(t("index.active_heading")).classes("text-xs uppercase tracking-widest text-white/50 mt-2")
     render_jobs()

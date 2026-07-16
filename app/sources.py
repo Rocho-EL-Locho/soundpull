@@ -257,6 +257,12 @@ BANDCAMP = SourceSpec(
 _REGISTRY: tuple[SourceSpec, ...] = (YOUTUBE, SOUNDCLOUD, BANDCAMP)
 
 
+def source_labels() -> list[str]:
+    """Human labels of every supported source, in registry order (UI hint — stays in sync
+    with the registry so adding a source updates the download page automatically)."""
+    return [spec.label for spec in _REGISTRY]
+
+
 def detect_source(url: str) -> SourceSpec | None:
     """Return the SourceSpec that handles ``url``, or None for an unknown/invalid host."""
     for spec in _REGISTRY:

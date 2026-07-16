@@ -23,6 +23,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     "de": {
         # nav / app shell
         "nav.download": "Download",
+        "nav.search": "Suchen",
         "nav.library": "Bibliothek",
         "nav.duplicates": "Duplikate",
         "nav.health": "Zustand",
@@ -80,8 +81,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "phase.error": "Fehler",
         # download page
         "index.heading_new": "Neuer Download",
-        "index.subtitle": "Füge einen YouTube-Music-Link ein und lade ihn getaggt herunter.",
-        "index.url_label": "YouTube-Music-Link",
+        "index.subtitle": "Link von YouTube Music, SoundCloud oder Bandcamp einfügen "
+                          "und getaggt herunterladen.",
+        "index.url_label": "Musik-Link",
+        "index.url_hint": "Unterstützt: {sources}",
+        "index.or": "oder",
+        "index.options_label": "Optionen",
         "index.genre_label": "Genre",
         "index.mode_label": "Modus",
         "index.audio_label": "Qualität / Format",
@@ -110,6 +115,24 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "search.playlists": "Playlists",
         "search.failed": "Suche fehlgeschlagen – bitte später erneut versuchen.",
         "search.no_results": "Keine Treffer.",
+        "search.more": "Mehr Ergebnisse",
+        "search.cookie_hint": "Manche Titel (z. B. altersbeschränkt) lassen sich nur mit "
+                              "hinterlegtem YouTube-Cookie laden – siehe Einstellungen → Erweitert.",
+        # dedicated search / browse page
+        "discover.title": "Suchen",
+        "discover.subtitle": "YouTube Music durchsuchen – auf einen Interpreten oder ein Album "
+                             "klicken, um zu stöbern, und mit deinen Standardwerten laden.",
+        "discover.empty_prompt": "Suche nach Songs, Alben, Interpreten oder Playlists.",
+        "discover.back": "Zurück",
+        "discover.download": "Herunterladen",
+        "discover.download_album": "Album herunterladen",
+        "discover.download_all": "Ganze Diskografie laden",
+        "discover.singles": "Singles & EPs",
+        "discover.loading": "Wird geladen …",
+        "discover.started": "Download gestartet: {title}",
+        "discover.open_error": "Konnte nicht geöffnet werden – bitte später erneut versuchen.",
+        "index.cookie_needed": "Dieser Titel braucht einen YouTube-Cookie "
+                               "(Einstellungen → Erweitert).",
         # job warnings (issue #38) — set as keys by the worker, resolved at render time
         "jobs.index_update_failed": "Upload erfolgreich, aber die Server-Index-Aktualisierung "
                                     "ist fehlgeschlagen – diese Titel könnten beim nächsten "
@@ -161,6 +184,17 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "history.detail_log": "Verlauf / Log",
         "history.detail_no_log": "Kein Log verfügbar.",
         # settings page
+        "settings.title": "Einstellungen",
+        "settings.subtitle": "Standardwerte, Speicherziel und alles rund um deine Bibliothek.",
+        "settings.tab_general": "Allgemein",
+        "settings.tab_storage": "Speicherziel",
+        "settings.tab_library": "Bibliothek",
+        "settings.tab_notify": "Benachrichtigungen",
+        "settings.tab_advanced": "Erweitert",
+        "settings.section_defaults": "Was beim Download passiert",
+        "settings.section_metadata": "Metadaten & Liedtexte",
+        "settings.section_maintenance": "Wartung & Pflege",
+        "settings.unsaved_hint": "Änderungen werden erst mit „Speichern“ übernommen.",
         "settings.profile_heading": "Profil & Standardwerte",
         "settings.default_genre": "Standard-Genre",
         "settings.default_mode": "Standard-Modus",
@@ -336,6 +370,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "duplicates.resolve": "Aufräumen",
         "duplicates.resolved": "{count} Titel in den Papierkorb verschoben.",
         "duplicates.resolve_error": "Aufräumen fehlgeschlagen: {error}",
+        "duplicates.resolve_failed": "{count} Titel konnten nicht entfernt werden: {error}",
+        "duplicates.started": "Analyse gestartet – das kann einen Moment dauern.",
         "duplicates.confirm_title": "Diese Duplikate aufräumen?",
         "duplicates.confirm_keep": "Behalten: {path}",
         "duplicates.will_trash": "{count} Kopie(n) in den Papierkorb:",
@@ -368,7 +404,9 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "health.deep_progress": "{count} Alben tief geprüft",
         "health.fix": "Beheben",
         "health.fixed": "Behoben.",
+        "health.fixing": "Wird behoben …",
         "health.fix_error": "Beheben fehlgeschlagen: {error}",
+        "health.choose_genre": "Welches Genre soll geschrieben werden?",
         "health.confirm_trash": "Diese Datei in den Papierkorb verschieben?",
         "health.check.lyrics_missing": "Fehlende Liedtexte (.lrc)",
         "health.check.stray_file": "Verwaiste Dateien",
@@ -507,6 +545,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     "en": {
         # nav / app shell
         "nav.download": "Download",
+        "nav.search": "Search",
         "nav.library": "Library",
         "nav.duplicates": "Duplicates",
         "nav.health": "Health",
@@ -564,8 +603,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "phase.error": "Error",
         # download page
         "index.heading_new": "New download",
-        "index.subtitle": "Paste a YouTube Music link and download it fully tagged.",
-        "index.url_label": "YouTube Music link",
+        "index.subtitle": "Paste a link from YouTube Music, SoundCloud or Bandcamp and "
+                          "download it fully tagged.",
+        "index.url_label": "Music link",
+        "index.url_hint": "Supported: {sources}",
+        "index.or": "or",
+        "index.options_label": "Options",
         "index.genre_label": "Genre",
         "index.mode_label": "Mode",
         "index.audio_label": "Quality / format",
@@ -594,6 +637,23 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "search.playlists": "Playlists",
         "search.failed": "Search failed — please try again later.",
         "search.no_results": "No results.",
+        "search.more": "More results",
+        "search.cookie_hint": "Some tracks (e.g. age-restricted) only download with a stored "
+                              "YouTube cookie — see Settings → Advanced.",
+        # dedicated search / browse page
+        "discover.title": "Search",
+        "discover.subtitle": "Search YouTube Music — click an artist or album to browse, and "
+                             "download with your saved defaults.",
+        "discover.empty_prompt": "Search for songs, albums, artists or playlists.",
+        "discover.back": "Back",
+        "discover.download": "Download",
+        "discover.download_album": "Download album",
+        "discover.download_all": "Download full discography",
+        "discover.singles": "Singles & EPs",
+        "discover.loading": "Loading …",
+        "discover.started": "Download started: {title}",
+        "discover.open_error": "Couldn't open — please try again later.",
+        "index.cookie_needed": "This track needs a YouTube cookie (Settings → Advanced).",
         # job warnings (issue #38) — set as keys by the worker, resolved at render time
         "jobs.index_update_failed": "Upload succeeded, but updating the server index failed — "
                                     "these tracks may be downloaded again on the next sync.",
@@ -644,6 +704,17 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "history.detail_log": "Timeline / log",
         "history.detail_no_log": "No log available.",
         # settings page
+        "settings.title": "Settings",
+        "settings.subtitle": "Defaults, storage target and everything around your library.",
+        "settings.tab_general": "General",
+        "settings.tab_storage": "Storage",
+        "settings.tab_library": "Library",
+        "settings.tab_notify": "Notifications",
+        "settings.tab_advanced": "Advanced",
+        "settings.section_defaults": "What happens on download",
+        "settings.section_metadata": "Metadata & lyrics",
+        "settings.section_maintenance": "Upkeep & maintenance",
+        "settings.unsaved_hint": "Changes take effect once you hit Save.",
         "settings.profile_heading": "Profile & defaults",
         "settings.default_genre": "Default genre",
         "settings.default_mode": "Default mode",
@@ -815,6 +886,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "duplicates.resolve": "Clean up",
         "duplicates.resolved": "Moved {count} track(s) to the trash.",
         "duplicates.resolve_error": "Cleanup failed: {error}",
+        "duplicates.resolve_failed": "{count} track(s) could not be removed: {error}",
+        "duplicates.started": "Analysis started — this can take a moment.",
         "duplicates.confirm_title": "Clean up these duplicates?",
         "duplicates.confirm_keep": "Keeping: {path}",
         "duplicates.will_trash": "{count} copy/copies to the trash:",
@@ -846,7 +919,9 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "health.deep_progress": "{count} albums deep-checked",
         "health.fix": "Fix",
         "health.fixed": "Fixed.",
+        "health.fixing": "Fixing …",
         "health.fix_error": "Fix failed: {error}",
+        "health.choose_genre": "Which genre should be written?",
         "health.confirm_trash": "Move this file to the trash?",
         "health.check.lyrics_missing": "Missing lyrics (.lrc)",
         "health.check.stray_file": "Stray files",
