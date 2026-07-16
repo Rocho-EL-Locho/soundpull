@@ -35,7 +35,7 @@ from typing import Callable, Optional
 from sqlmodel import select
 
 from app import library_index, library_ops
-from app.library_index import _artist_title_from_path, _norm, track_key
+from app.library_index import _artist_title_from_path, _clean_title, _norm
 from app.pipeline import _strip_title_noise
 
 log = logging.getLogger("duplicates")
@@ -163,6 +163,32 @@ def _neg_lex(s: str) -> list[int]:
     return [-ord(c) for c in s]
 
 
+def _dup_key(rel: str, title: str) -> tuple[str, str, str]:
+    """Duplicate-match key: ``(artist, album, title)`` all normalised (roadmap 04 tightening).
+
+    A track only counts as a duplicate of another when **artist, album AND title** match — the
+    old ``(artist, title)`` key flagged different albums' generic tracks ("01. Intro", "Skit")
+    as duplicates. Album/artist come from the path folders (no per-file download): the immediate
+    parent is the album folder — which in a flat ``Artist - Album/Track`` library also carries
+    the artist — and the grandparent (if present) is the artist folder of a nested
+    ``Artist/Album/Track`` layout. `title` is the already index-prefix-stripped stem.
+    """
+    parts = [p for p in rel.split("/") if p]
+    album_folder = parts[-2] if len(parts) >= 2 else ""
+    artist_folder = parts[-3] if len(parts) >= 3 else ""
+    return _norm(artist_folder), _norm(album_folder), _norm(_clean_title(title))
+
+
+def _display_artist(rel: str, artist: str) -> str:
+    """A human artist for a group heading. Uses the path artist when present (nested layout),
+    else the part before ' - ' in a flat ``Artist - Album`` album folder, else the folder name."""
+    if artist:
+        return artist
+    parts = [p for p in rel.split("/") if p]
+    folder = parts[-2] if len(parts) >= 2 else ""
+    return folder.split(" - ", 1)[0].strip() if " - " in folder else folder
+
+
 def analyze(user_id: int, progress: Optional[Callable[[str], None]] = None) -> Report:
     """Walk the user's WebDAV library and build the exact + probable duplicate report.
 
@@ -189,7 +215,7 @@ def analyze(user_id: int, progress: Optional[Callable[[str], None]] = None) -> R
         progress("scanning")
 
     # One pass: collect every audio file with its (key, folder) and per-folder counts.
-    files: list[tuple[tuple[str, str], str, str, str]] = []  # (key, rel, artist, title)
+    files: list[tuple[tuple[str, str, str], str, str, str]] = []  # (key, rel, artist, title)
     folder_counts: dict[str, int] = {}
     errors: list = []
     for rel in library_index.iter_library_files(client, base, errors=errors):
@@ -201,7 +227,7 @@ def analyze(user_id: int, progress: Optional[Callable[[str], None]] = None) -> R
         artist, title = _artist_title_from_path(parts)
         if not title:
             continue
-        files.append((track_key(title, artist), rel, artist, title))
+        files.append((_dup_key(rel, title), rel, _display_artist(rel, artist), title))
 
     if errors:
         log.warning("duplicate analysis: %d directory listing(s) failed — report may be partial",
@@ -223,15 +249,15 @@ def _path_info(rel: str, folder_counts: dict[str, int]) -> PathInfo:
                     is_playlist_folder=_is_playlist_folder(folder))
 
 
-def _build_report(files: list[tuple[tuple[str, str], str, str, str]],
+def _build_report(files: list[tuple[tuple[str, str, str], str, str, str]],
                   folder_counts: dict[str, int]) -> Report:
     """Pure grouping over collected files — split out so it is unit-testable without WebDAV."""
-    by_key: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
+    by_key: dict[tuple[str, str, str], list[tuple[str, str, str]]] = {}
     for key, rel, artist, title in files:
         by_key.setdefault(key, []).append((rel, artist, title))
 
     exact: list[Group] = []
-    singles: list[tuple[tuple[str, str], str, str, str]] = []  # remaining 1-copy tracks
+    singles: list[tuple[tuple[str, str, str], str, str, str]] = []  # remaining 1-copy tracks
     for key, copies in by_key.items():
         if len(copies) >= 2:
             exact.append(_make_group("exact", copies, folder_counts))
@@ -239,10 +265,12 @@ def _build_report(files: list[tuple[tuple[str, str], str, str, str]],
             rel, artist, title = copies[0]
             singles.append((key, rel, artist, title))
 
-    # Probable tier: over the singles only, collapse titles that differ only by release noise.
-    by_noise: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
+    # Probable tier: over the singles only, collapse titles that differ only by release noise —
+    # but still WITHIN the same artist+album (key[0], key[1]) so it can't re-introduce the
+    # cross-album false positives the album-aware exact key just removed.
+    by_noise: dict[tuple[str, str, str], list[tuple[str, str, str]]] = {}
     for key, rel, artist, title in singles:
-        noise_key = (key[0], _norm(_strip_title_noise(title)))
+        noise_key = (key[0], key[1], _norm(_strip_title_noise(title)))
         by_noise.setdefault(noise_key, []).append((rel, artist, title))
     probable: list[Group] = []
     for noise_key, copies in by_noise.items():
@@ -342,6 +370,8 @@ class ResolveResult:
     trashed: list[str] = field(default_factory=list)      # rel_paths moved to trash
     m3u_repaired: list[str] = field(default_factory=list)  # rel_paths of rewritten .m3u8 files
     manifests_repaired: int = 0                            # subscription manifests updated
+    resolved: list[str] = field(default_factory=list)      # rel_paths no longer present (trashed OR already gone)
+    failed: list[tuple[str, str]] = field(default_factory=list)  # (rel_path, error) that couldn't be removed
 
 
 def _repoint(name: str, folder_rel: str, removed: set[str], keeper_rel: str) -> Optional[str]:
@@ -520,6 +550,8 @@ def resolve_group(user_id: int, keeper_rel: str, remove_rels: list[str]) -> Reso
     """
     from app.db import session_scope
 
+    from webdav4.client import ResourceNotFound
+
     result = ResolveResult()
     removed: set[str] = set()
     for rel in remove_rels:
@@ -528,9 +560,21 @@ def resolve_group(user_id: int, keeper_rel: str, remove_rels: list[str]) -> Reso
         try:
             library_ops.trash_track(user_id, rel)
             result.trashed.append(rel)
+            result.resolved.append(rel)
             removed.add(rel)
+        except ResourceNotFound:
+            # Stale report entry: the file is already gone. Treat it as resolved so the group
+            # can be pruned (and its index row cleaned up), rather than a silent "0 trashed".
+            log.info("duplicate resolve: %r already gone — treating as resolved", rel)
+            result.resolved.append(rel)
+            removed.add(rel)
+            try:
+                library_ops._remove_from_index(user_id, rel)
+            except Exception as exc:  # noqa: BLE001 - index cleanup is best-effort
+                log.warning("duplicate resolve: index cleanup for %r failed: %s", rel, exc)
         except Exception as exc:  # noqa: BLE001 - surface via the caller; keep going
             log.warning("duplicate resolve: trashing %r failed: %s", rel, exc)
+            result.failed.append((rel, str(exc)))
 
     # Ensure the key row points at the keeper (re-inserts it if a trashed copy was the indexed one).
     parts = [p for p in keeper_rel.split("/") if p]

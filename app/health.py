@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import posixpath
+import re
 import shutil
 import subprocess
 import tempfile
@@ -354,21 +355,49 @@ def _embed_cover(path: Path, jpeg: bytes) -> None:
         a.save()
 
 
+# An ffmpeg stderr line about an embedded COVER (image) stream, not the audio. A very common
+# case is a cover whose bytes are JPEG but whose declared MIME is image/png (or vice versa):
+# ffmpeg logs "[png @ …] Invalid PNG signature 0xFFD8FFE0…" while probing the input even though
+# the audio decodes perfectly (returncode 0). That is NOT audio corruption — such lines must be
+# ignored, or every track with a mislabeled cover is falsely flagged as "corrupt audio".
+_COVER_NOISE_RE = re.compile(
+    r"\[(?:png|mjpeg|mjpg|jpeg|jpg|image2|bmp|gif|webp)\b|invalid png signature|invalid jpeg|"
+    r"vist#|\bVideo:\b|attached picture|cover", re.IGNORECASE)
+
+
+def _is_cover_noise(line: str) -> bool:
+    """True for an ffmpeg stderr line that is about an embedded cover/image stream, not audio."""
+    return bool(_COVER_NOISE_RE.search(line))
+
+
 def _decode_error(path: Path) -> Optional[str]:
-    """Run an ffmpeg decode-only pass; return the first error line if the file is corrupt, else None."""
+    """Run an ffmpeg decode-only pass over the AUDIO stream; return the first REAL audio error
+    line if the audio is corrupt, else None.
+
+    Two guards against false positives from a bad embedded cover (user report — a mislabeled
+    JPEG/PNG cover was reported as a corrupt audio file):
+    - ``-map 0:a?`` decodes only the audio stream(s), never the cover;
+    - image/cover-stream stderr lines (`_is_cover_noise`) are filtered out, and the track is
+      flagged only when a genuine audio-decode error remains. ffmpeg still probes the cover on
+      input and logs its error to stderr with returncode 0, so filtering — not just ``-map`` —
+      is what actually removes the false positive.
+    """
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         return None  # can't verify without ffmpeg → don't flag
     try:
         proc = subprocess.run(
-            [ffmpeg, "-v", "error", "-i", str(path), "-f", "null", "-"],
+            [ffmpeg, "-v", "error", "-i", str(path), "-map", "0:a?", "-f", "null", "-"],
             capture_output=True, timeout=120)
     except Exception as exc:  # noqa: BLE001
         log.warning("health: ffmpeg decode check failed to run on %r: %s", path.name, exc)
         return None
-    stderr = proc.stderr.decode("utf-8", "replace").strip()
-    if proc.returncode != 0 or stderr:
-        return (stderr.splitlines()[0] if stderr else f"ffmpeg exit {proc.returncode}")
+    real = [ln.strip() for ln in proc.stderr.decode("utf-8", "replace").splitlines()
+            if ln.strip() and not _is_cover_noise(ln)]
+    if real:
+        return real[0]
+    # returncode alone (with only cover-noise on stderr) is NOT treated as corruption — a bad
+    # cover can make ffmpeg exit non-zero while the audio is fine.
     return None
 
 
@@ -431,10 +460,15 @@ def deep_check_batch(user_id: int, *, limit: int = 25,
     client, base, _ = _load(user_id)
     report = load_report(user_id) or Report(created_at=_now_iso())
     checked = set(report.checked_albums)
-    todo = [a for a in _list_albums(client, base) if a not in checked][:limit]
-    total = len(todo)
+    all_albums = _list_albums(client, base)
+    library_total = len(all_albums)          # every album in the library
+    already = len(checked)                    # already deep-checked in prior runs
+    todo = [a for a in all_albums if a not in checked][:limit]
+    # Progress is reported as (cumulative albums checked, whole-library total) so a follow-up
+    # run visibly CONTINUES from where the last one stopped instead of appearing to restart at
+    # 0 (user report: a second deep scan "starts over"). It doesn't — this makes that visible.
     if progress:
-        progress(0, total)
+        progress(already, library_total)
     for i, album in enumerate(todo, start=1):
         work = _staging_dir()
         try:
@@ -450,7 +484,7 @@ def deep_check_batch(user_id: int, *, limit: int = 25,
             report.checked_albums.append(album)
         _persist(user_id, report)   # incremental → progress survives a crash mid-batch
         if progress:
-            progress(i, total)
+            progress(already + i, library_total)
     return report
 
 
@@ -492,11 +526,14 @@ def _trash_empty_folder(user_id: int, folder_rel: str) -> None:
         webdav_util.delete_path(client, _join(base, webdav_util.resolve_rel(folder_rel)))
 
 
-def fix_album(user_id: int, album_prefix: str, fix_ids: set[str]) -> FixResult:
+def fix_album(user_id: int, album_prefix: str, fix_ids: set[str],
+              genre: Optional[str] = None) -> FixResult:
     """Apply the requested DEEP fixes (H5 year / H6 cover / H7 genre) to one album.
 
     Downloads the album once, applies only the fixes in `fix_ids`, re-uploads ONLY the changed
     files, and returns the rel_paths that were repaired (so the page prunes them). Best-effort.
+    `genre` — the genre to write for H7 (the user's explicit choice); falls back to the saved
+    default when not given.
     """
     try:
         client, base, us = _load(user_id)
@@ -514,7 +551,7 @@ def fix_album(user_id: int, album_prefix: str, fix_ids: set[str]) -> FixResult:
         if "cover_missing" in fix_ids:
             changed |= _fix_cover(client, base, album_prefix, work, staged)
         if "genre_missing" in fix_ids:
-            changed |= _fix_genre(staged, us["default_genre"])
+            changed |= _fix_genre(staged, (genre or us["default_genre"]))
 
         from app.pipeline import _upload_with_retry
         for rel, local in staged:
@@ -714,6 +751,13 @@ def load_report(user_id: int) -> Optional[Report]:
                         detail=d.get("detail", ""), fixable=d.get("fixable", False))
                 for d in (items or [])]
 
+    # Self-heal stale false positives: earlier versions flagged tracks with a mislabeled embedded
+    # cover as "corrupt_audio" (the cover's image-decode error leaked into the audio check). Those
+    # findings are provably bogus, and re-running the deep check SKIPS already-checked albums, so
+    # they'd never clear on their own — drop them on load.
+    deep = [f for f in _findings(data.get("deep"))
+            if not (f.check_id == "corrupt_audio" and _is_cover_noise(f.detail))]
+
     return Report(created_at=created_iso, cheap=_findings(data.get("cheap")),
-                  deep=_findings(data.get("deep")), checked_albums=data.get("checked_albums", []),
+                  deep=deep, checked_albums=data.get("checked_albums", []),
                   cheap_run_at=data.get("cheap_run_at"))

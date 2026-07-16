@@ -11,6 +11,7 @@ from app.i18n import audio_format_labels, genre_options, t
 from app.jobs import running_sync_phase, start_sync
 from app.models import PlaylistSubscription, UserSettings
 from app.pipeline import is_supported_url, normalize_audio_format
+from app.theme import ghost_button, primary_button
 
 # Interval select: option key → hours. Single source of truth for the dropdown.
 _INTERVALS = {"6h": 6, "12h": 12, "daily": 24, "weekly": 168}
@@ -98,12 +99,10 @@ def subscriptions_content() -> None:
                 # translates the former and returns the latter unchanged (issue #38).
                 ui.label(t(error)).classes("text-red-400 text-xs")
             with ui.row().classes("items-center gap-2"):
-                ui.button(t("subs.sync_now"), icon="sync",
-                          on_click=lambda i=sid: _sync_now(i)) \
-                    .props("unelevated dense").classes("accent-grad text-white")
-                ui.button(t("subs.delete"), icon="delete",
-                          on_click=lambda i=sid: _delete(i)) \
-                    .props("flat dense").classes("text-white/70")
+                primary_button(t("subs.sync_now"), icon="sync",
+                               on_click=lambda i=sid: _sync_now(i)).props("dense")
+                ghost_button(t("subs.delete"), icon="delete",
+                             on_click=lambda i=sid: _delete(i)).props("dense")
 
     def _toggle(sid: int, value: bool) -> None:
         with session_scope() as session:
@@ -173,8 +172,8 @@ def subscriptions_content() -> None:
             url_in.value = ""
             render_list.refresh()
 
-        ui.button(t("subs.create_button"), icon="add", on_click=create) \
-            .props("unelevated").classes("accent-grad text-white hover-glow self-end px-6")
+        primary_button(t("subs.create_button"), icon="add", on_click=create) \
+            .classes("self-end px-6")
 
     ui.label(t("subs.list_heading")).classes("text-xs uppercase tracking-widest text-white/50 mt-2")
     render_list()

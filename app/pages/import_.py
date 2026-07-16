@@ -26,6 +26,7 @@ from app.i18n import audio_format_labels, genre_options, t
 from app.jobs import tag_options_from_settings
 from app.models import UserSettings
 from app.pipeline import PlaylistSpec, normalize_audio_format
+from app.theme import ghost_button, primary_button
 
 log = logging.getLogger("import_page")
 
@@ -162,9 +163,8 @@ def import_content() -> None:
                 ui.navigate.to("/")   # the index page picks the new job up via its jobs poll
 
             with ui.row().classes("w-full justify-end gap-2 pt-2"):
-                ui.button(t("settings.cancel"), on_click=dialog.close).props("flat")
-                ui.button(t("import.download_button"), icon="download",
-                          on_click=confirm).classes("accent-grad text-white")
+                ghost_button(t("settings.cancel"), on_click=dialog.close)
+                primary_button(t("import.download_button"), icon="download", on_click=confirm)
         dialog.open()
 
     # --- review rows ---------------------------------------------------------------------
@@ -213,8 +213,8 @@ def import_content() -> None:
                 with ui.row().classes("w-full items-center justify-between flex-wrap gap-2"):
                     ui.label(t("import.matched_heading", count=len(matched))).classes(
                         "text-sm uppercase tracking-widest text-white/50")
-                    ui.button(t("import.download_button"), icon="download", on_click=_download) \
-                        .props("unelevated").classes("accent-grad text-white")
+                    primary_button(t("import.download_button"), icon="download",
+                                   on_click=_download)
                 for rid, m in matched:
                     _match_row(rid, m)
 
@@ -251,8 +251,8 @@ def import_content() -> None:
 
                 paste.on_value_change(lambda: render_count.refresh())
                 render_count()
-                ui.button(t("import.match_button"), icon="search", on_click=_start_match) \
-                    .props("unelevated").classes("accent-grad text-white hover-glow self-start px-6")
+                primary_button(t("import.match_button"), icon="search", on_click=_start_match) \
+                    .classes("self-start px-6")
             with ui.tab_panel(tab_url).classes("p-0 pt-2 gap-2"):
                 url_in = ui.input(placeholder=t("import.url_placeholder")) \
                     .props("outlined dense dark clearable").classes("w-full")
@@ -260,8 +260,8 @@ def import_content() -> None:
                 hint = "import.url_hint" if settings.spotify_configured \
                     else "import.url_hint_apple_only"
                 ui.label(t(hint)).classes("text-xs text-white/40")
-                ui.button(t("import.url_button"), icon="cloud_download", on_click=_fetch_url) \
-                    .props("unelevated").classes("accent-grad text-white hover-glow self-start px-6")
+                primary_button(t("import.url_button"), icon="cloud_download", on_click=_fetch_url) \
+                    .classes("self-start px-6")
 
         # Download options (shared by both tabs; defaults from the user's saved settings).
         with ui.row().classes("w-full gap-4 items-start flex-wrap"):

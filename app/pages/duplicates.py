@@ -19,6 +19,7 @@ from app.auth import get_current_user
 from app.db import session_scope
 from app.i18n import t
 from app.models import UserSettings
+from app.theme import ghost_button, primary_button, secondary_button
 
 log = logging.getLogger("duplicates_page")
 
@@ -63,6 +64,7 @@ def duplicates_content() -> None:
         if not duplicates.start_analysis(uid):
             ui.notify(t("duplicates.busy"), type="warning")
             return
+        ui.notify(t("duplicates.started"), type="positive")
         state["last_finished"] = False
         render_body.refresh()
 
@@ -94,19 +96,22 @@ def duplicates_content() -> None:
     async def _do_resolve(groups_with_ids: list[tuple[str, object]]) -> None:
         """Trash the non-keepers of each (gid, group) off-thread, then drop the fully-cleaned
         groups from the view and re-persist the pruned report so a reload stays in sync."""
-        def _work() -> tuple[int, set]:
+        def _work() -> tuple[int, set, list]:
             trashed = 0
             resolved: set = set()
+            failures: list = []
             for gid, group in groups_with_ids:
                 keeper = _keeper_for(gid, group)
                 remove = [p.rel_path for p in group.paths if p.rel_path != keeper]
                 res = duplicates.resolve_group(uid, keeper, remove)
                 trashed += len(res.trashed)
-                if len(res.trashed) == len(remove):  # every non-keeper actually gone
+                failures.extend(res.failed)
+                # A group is done when every non-keeper is gone (trashed OR already missing).
+                if len(res.resolved) == len(remove):
                     resolved.add(gid)
-            return trashed, resolved
+            return trashed, resolved, failures
         try:
-            trashed, resolved_ids = await run.io_bound(_work)
+            trashed, resolved_ids, failures = await run.io_bound(_work)
         except Exception as exc:  # noqa: BLE001
             ui.notify(t("duplicates.resolve_error", error=exc), type="negative")
             return
@@ -123,7 +128,13 @@ def duplicates_content() -> None:
                 await run.io_bound(duplicates.save_report, uid, report)
             except Exception as exc:  # noqa: BLE001 - persistence is best-effort; UI already updated
                 log.warning("could not persist pruned duplicate report: %s", exc)
-        ui.notify(t("duplicates.resolved", count=trashed), type="positive")
+        if failures:
+            # Surface why copies couldn't be removed instead of a misleading "0 moved".
+            first = failures[0][1]
+            ui.notify(t("duplicates.resolve_failed", count=len(failures), error=first),
+                      type="negative")
+        else:
+            ui.notify(t("duplicates.resolved", count=trashed), type="positive")
         render_body.refresh()
 
     def _confirm_resolve(gid: str, group) -> None:
@@ -145,9 +156,9 @@ def duplicates_content() -> None:
                 await _do_resolve([(gid, group)])
 
             with ui.row().classes("w-full justify-end gap-2 pt-2"):
-                ui.button(t("settings.cancel"), on_click=dialog.close).props("flat")
-                ui.button(t("duplicates.resolve"), icon="cleaning_services",
-                          on_click=confirm).classes("accent-grad text-white")
+                ghost_button(t("settings.cancel"), on_click=dialog.close)
+                primary_button(t("duplicates.resolve"), icon="cleaning_services",
+                               on_click=confirm)
         dialog.open()
 
     def _confirm_bulk(exact_with_ids: list[tuple[str, object]]) -> None:
@@ -164,9 +175,8 @@ def duplicates_content() -> None:
                 await _do_resolve(exact_with_ids)
 
             with ui.row().classes("w-full justify-end gap-2 pt-2"):
-                ui.button(t("settings.cancel"), on_click=dialog.close).props("flat")
-                ui.button(t("duplicates.accept_all"), icon="done_all",
-                          on_click=confirm).classes("accent-grad text-white")
+                ghost_button(t("settings.cancel"), on_click=dialog.close)
+                primary_button(t("duplicates.accept_all"), icon="done_all", on_click=confirm)
         dialog.open()
 
     # --- group card ----------------------------------------------------------------------
@@ -176,9 +186,9 @@ def duplicates_content() -> None:
                 head = f"{group.artist} – {group.title}" if group.artist else group.title
                 ui.label(head).classes("font-semibold truncate flex-1 min-w-0")
                 if group.tier == "exact":
-                    ui.button(t("duplicates.resolve"), icon="cleaning_services",
-                              on_click=lambda g=group, i=gid: _confirm_resolve(i, g)) \
-                        .props("outline dense").classes("text-white/90 shrink-0")
+                    secondary_button(t("duplicates.resolve"), icon="cleaning_services",
+                                     on_click=lambda g=group, i=gid: _confirm_resolve(i, g)) \
+                        .props("dense").classes("shrink-0")
             options = {p.rel_path: p.rel_path for p in group.paths}
             radio = ui.radio(options, value=_keeper_for(gid, group),
                              on_change=lambda e, i=gid: state["keepers"].__setitem__(i, e.value)) \
@@ -229,9 +239,8 @@ def duplicates_content() -> None:
             ui.label(t("duplicates.exact_heading", count=len(exact_ids))).classes(
                 "text-sm uppercase tracking-widest text-white/50")
             if exact_ids:
-                ui.button(t("duplicates.accept_all"), icon="done_all",
-                          on_click=lambda: _confirm_bulk(exact_ids)) \
-                    .props("outline dense").classes("text-white/90")
+                secondary_button(t("duplicates.accept_all"), icon="done_all",
+                                 on_click=lambda: _confirm_bulk(exact_ids)).props("dense")
         if not exact_ids:
             ui.label(t("duplicates.none_exact")).classes("text-white/40 text-sm")
         for gid, group in exact_ids:
@@ -250,8 +259,7 @@ def duplicates_content() -> None:
     with ui.card().classes("glass w-full rounded-2xl p-6 gap-3"):
         with ui.row().classes("w-full items-center justify-between flex-wrap gap-2"):
             ui.label(t("duplicates.heading")).classes("text-xl font-semibold accent-text")
-            ui.button(t("duplicates.analyze"), icon="search", on_click=analyze) \
-                .props("outline").classes("text-white/90")
+            secondary_button(t("duplicates.analyze"), icon="search", on_click=analyze)
         ui.label(t("duplicates.intro")).classes("text-xs text-white/50")
 
     render_body()

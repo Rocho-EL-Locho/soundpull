@@ -17,31 +17,48 @@ from sqlmodel import Session, SQLModel, create_engine, select
 import app.db
 import app.webdav_util
 from app import duplicates, library_ops
-from app.duplicates import PathInfo, _build_report, _is_playlist_folder, _keeper, rewrite_m3u
-from app.library_index import track_key
+from app.duplicates import (PathInfo, _build_report, _dup_key, _is_playlist_folder,
+                            _keeper, rewrite_m3u)
 from app.models import DuplicateReport, PlaylistSubscription, ServerTrack, UserSettings
 
 
 # --- pure grouping ---------------------------------------------------------
 
 def _f(rel, artist, title):
-    return (track_key(title, artist), rel, artist, title)
+    # The duplicate key is derived from the PATH (artist+album folders) + title, so a copy is
+    # only a duplicate when artist, album AND title match (not just title+artist).
+    return (_dup_key(rel, title), rel, artist, title)
 
 
 def test_exact_group_found_singles_untouched():
+    # A genuine duplicate under the album-aware rule: the SAME album (artist+album+title all
+    # equal) present at two paths. A different album with the same title is NOT a duplicate.
     files = [
         _f("Burial/Untrue/05 - Archangel.mp3", "Burial", "Archangel"),
-        _f("Burial/Archangel/01 - Archangel.mp3", "Burial", "Archangel"),
+        _f("Backup/Burial/Untrue/05 - Archangel.mp3", "Burial", "Archangel"),
         _f("Foo/Bar/01 - Unique.mp3", "Foo", "Unique"),
     ]
-    counts = {"Burial/Untrue": 13, "Burial/Archangel": 1, "Foo/Bar": 5}
+    counts = {"Burial/Untrue": 13, "Backup/Burial/Untrue": 13, "Foo/Bar": 5}
     report = _build_report(files, counts)
     assert len(report.exact) == 1
     assert len(report.probable) == 0
     g = report.exact[0]
     assert (g.artist, g.title) == ("Burial", "Archangel")
     assert {p.rel_path for p in g.paths} == {
-        "Burial/Untrue/05 - Archangel.mp3", "Burial/Archangel/01 - Archangel.mp3"}
+        "Burial/Untrue/05 - Archangel.mp3", "Backup/Burial/Untrue/05 - Archangel.mp3"}
+
+
+def test_same_title_different_album_is_not_a_duplicate():
+    # Regression (user report): two DIFFERENT tracks that share a generic title ("01. Intro")
+    # in different albums must NOT be flagged — album is part of the key now.
+    files = [
+        _f("PA Sports - Life is Pain/01. Intro.mp3", "PA Sports", "01. Intro"),
+        _f("PA Sports - Machtwechsel II/01. Intro.mp3", "PA Sports", "01. Intro"),
+    ]
+    counts = {"PA Sports - Life is Pain": 12, "PA Sports - Machtwechsel II": 14}
+    report = _build_report(files, counts)
+    assert report.exact == []
+    assert report.probable == []
 
 
 def test_keeper_prefers_biggest_album_over_playlist():
@@ -72,11 +89,13 @@ def test_keeper_tiebreak_shorter_then_lexicographic():
 
 
 def test_probable_tier_from_noise_only():
+    # Noise-variant of the same track WITHIN one album (same artist+album, title differs only
+    # by "(Official Video)") → probable, not exact.
     files = [
         _f("X/Album/01 - Song.mp3", "X", "Song"),
-        _f("X/Single/01 - Song (Official Video).mp3", "X", "Song (Official Video)"),
+        _f("X/Album/09 - Song (Official Video).mp3", "X", "Song (Official Video)"),
     ]
-    counts = {"X/Album": 10, "X/Single": 1}
+    counts = {"X/Album": 10}
     report = _build_report(files, counts)
     assert len(report.exact) == 0          # different exact keys → not exact
     assert len(report.probable) == 1
@@ -86,12 +105,13 @@ def test_probable_tier_from_noise_only():
 
 
 def test_feat_variants_collapse_into_exact_key():
-    # track_key already strips "(feat. …)" and takes the primary artist — a regression guard.
+    # _dup_key strips "(feat. …)" from the title — a "(feat. B)" copy in the same album collapses
+    # onto the clean title, so the two are one exact group (regression guard).
     files = [
         _f("A/Album/01 - Song.mp3", "A", "Song"),
-        _f("A/Single/01 - Song (feat. B).mp3", "A / B", "Song (feat. B)"),
+        _f("A/Album/05 - Song (feat. B).mp3", "A / B", "Song (feat. B)"),
     ]
-    counts = {"A/Album": 8, "A/Single": 1}
+    counts = {"A/Album": 8}
     report = _build_report(files, counts)
     assert len(report.exact) == 1
     assert len(report.probable) == 0
@@ -248,14 +268,15 @@ def _index(scope, rel):
 
 def test_analyze_finds_exact_group_and_persists(env):
     client, scope = env
+    # Same album (Burial/Untrue) present at two paths → an album-aware exact duplicate.
     _add_audio(client, "Burial/Untrue/05 - Archangel.mp3")
-    _add_audio(client, "Burial/Archangel/01 - Archangel.mp3")
+    _add_audio(client, "Backup/Burial/Untrue/05 - Archangel.mp3")
 
     report = duplicates.analyze(1)
 
     assert len(report.exact) == 1
     g = report.exact[0]
-    assert g.suggested_keeper == "Burial/Untrue/05 - Archangel.mp3"  # biggest album wins
+    assert g.suggested_keeper == "Burial/Untrue/05 - Archangel.mp3"  # shorter path wins the tie
     # Persisted (one row per user) and reloadable.
     with scope() as s:
         assert s.exec(select(DuplicateReport).where(DuplicateReport.user_id == 1)).first()
